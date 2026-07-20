@@ -112,11 +112,14 @@ enum ContactState {
 
 struct CameraPreview {
     camera: String,
+    frame_index: u64,
     state: ModalImageState,
 }
 
 struct FullPreview {
     camera: String,
+    frame_index: u64,
+    show_frame: bool,
     state: ModalImageState,
     zoom: f32,
     pan: Vec2,

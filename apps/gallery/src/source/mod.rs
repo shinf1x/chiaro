@@ -5,7 +5,7 @@
 //! memory and never materialized as temporary previews.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -18,11 +18,11 @@ use std::{
 };
 
 use chiaro::lri::{
-    CaptureMetadata, PreviewImage, ReferencePayloadRead, complete_lelr_prefix_len,
-    decode_reference_preview, decode_reference_preview_bytes, inspect_capture,
-    inspect_capture_metadata_blocks, inspect_capture_prefix, inspect_lelr_block_header,
-    reference_camera_payload_read, reference_preview_color_ready, try_decode_camera_preview_prefix,
-    try_decode_reference_preview_prefix,
+    CaptureMetadata, PreviewImage, ReferencePayloadRead, camera_frame_preview_color_ready,
+    complete_lelr_prefix_len, decode_reference_preview, decode_reference_preview_bytes,
+    inspect_capture, inspect_capture_metadata_blocks, inspect_capture_prefix,
+    inspect_lelr_block_header, reference_camera_payload_read, reference_preview_color_ready,
+    try_decode_camera_frame_preview_prefix, try_decode_reference_preview_prefix,
 };
 use eframe::egui;
 use futures::executor::block_on;
@@ -126,6 +126,7 @@ pub enum DeviceItemEvent {
 
 pub struct CapturePreviewUpdate {
     pub reference_camera: String,
+    pub frame_index: u64,
     pub preview: PreviewImage,
 }
 

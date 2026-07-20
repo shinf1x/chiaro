@@ -49,28 +49,36 @@ impl GalleryApp {
                                 .cameras
                                 .into_iter()
                                 .map(|camera| {
-                                    if let Some(position) = progressive
-                                        .iter()
-                                        .position(|existing| existing.camera == camera.camera)
+                                    if let Some(position) =
+                                        progressive.iter().position(|existing| {
+                                            existing.camera == camera.camera
+                                                && existing.frame_index == camera.frame_index
+                                        })
                                     {
                                         progressive.remove(position)
                                     } else {
                                         CameraPreview {
                                             camera: camera.camera,
+                                            frame_index: camera.frame_index,
                                             state: ModalImageState::Pending,
                                         }
                                     }
                                 })
                                 .collect::<Vec<_>>();
                             for camera in &cameras {
+                                if !matches!(camera.state, ModalImageState::Pending) {
+                                    continue;
+                                }
                                 self.loader.load_camera(
                                     self.generation,
                                     PreviewKey::Contact {
                                         modal,
                                         camera: camera.camera.clone(),
+                                        frame_index: camera.frame_index,
                                     },
                                     capture.data.clone(),
                                     camera.camera.clone(),
+                                    camera.frame_index,
                                     520,
                                 );
                             }
@@ -80,7 +88,9 @@ impl GalleryApp {
                                 data: capture.data,
                                 metadata: capture.summary.metadata,
                             };
-                            if matches!(&sheet.state, ContactState::Ready { cameras, .. } if cameras.is_empty())
+                            if matches!(&sheet.state, ContactState::Ready { cameras, .. } if cameras
+                                .iter()
+                                .all(|camera| !matches!(camera.state, ModalImageState::Pending)))
                             {
                                 self.loader.set_modal_loading(false);
                             }
@@ -114,6 +124,7 @@ impl GalleryApp {
                 LoadedEvent::CapturePreview {
                     modal,
                     reference_camera,
+                    frame_index,
                     preview,
                 } => {
                     let Some(ContactState::Loading {
@@ -129,19 +140,30 @@ impl GalleryApp {
                         continue;
                     };
                     *current_reference = Some(reference_camera);
-                    if cameras.iter().any(|camera| camera.camera == preview.camera) {
+                    let camera = preview.camera.clone();
+                    let state = modal_state(
+                        ctx,
+                        format!("contact-stream-{modal}-{camera}-{frame_index}"),
+                        Ok(preview),
+                    );
+                    if let Some(existing) = cameras.iter_mut().find(|existing| {
+                        existing.camera == camera && existing.frame_index == frame_index
+                    }) {
+                        // A later calibration block can upgrade a progressively
+                        // decoded RAW card without waiting for the full capture.
+                        existing.state = state;
                         continue;
                     }
-                    let camera = preview.camera.clone();
                     cameras.push(CameraPreview {
                         camera: camera.clone(),
-                        state: modal_state(
-                            ctx,
-                            format!("contact-stream-{modal}-{camera}"),
-                            Ok(preview),
-                        ),
+                        frame_index,
+                        state,
                     });
-                    cameras.sort_by(|left, right| left.camera.cmp(&right.camera));
+                    cameras.sort_by(|left, right| {
+                        left.camera
+                            .cmp(&right.camera)
+                            .then(left.frame_index.cmp(&right.frame_index))
+                    });
                 }
                 LoadedEvent::DeviceDone(result) => {
                     let Some(key) = self.indexing_tab.clone() else {
@@ -299,7 +321,11 @@ impl GalleryApp {
                     Err(error) => ItemState::Failed(error),
                 };
             }
-            PreviewKey::Contact { modal, camera } => {
+            PreviewKey::Contact {
+                modal,
+                camera,
+                frame_index,
+            } => {
                 let all_finished = {
                     let Some(sheet) = self
                         .contact_sheet
@@ -311,10 +337,17 @@ impl GalleryApp {
                     let ContactState::Ready { cameras, .. } = &mut sheet.state else {
                         return;
                     };
-                    let Some(card) = cameras.iter_mut().find(|card| card.camera == camera) else {
+                    let Some(card) = cameras
+                        .iter_mut()
+                        .find(|card| card.camera == camera && card.frame_index == frame_index)
+                    else {
                         return;
                     };
-                    card.state = modal_state(ctx, format!("contact-{modal}-{camera}"), result);
+                    card.state = modal_state(
+                        ctx,
+                        format!("contact-{modal}-{camera}-{frame_index}"),
+                        result,
+                    );
                     cameras
                         .iter()
                         .all(|camera| !matches!(camera.state, ModalImageState::Pending))
@@ -323,17 +356,22 @@ impl GalleryApp {
                     self.loader.set_modal_loading(false);
                 }
             }
-            PreviewKey::Full { modal, camera } => {
+            PreviewKey::Full {
+                modal,
+                camera,
+                frame_index,
+            } => {
                 let Some(full) = self
                     .contact_sheet
                     .as_mut()
                     .filter(|sheet| sheet.id == modal)
                     .and_then(|sheet| sheet.full.as_mut())
-                    .filter(|full| full.camera == camera)
+                    .filter(|full| full.camera == camera && full.frame_index == frame_index)
                 else {
                     return;
                 };
-                full.state = modal_state(ctx, format!("full-{modal}-{camera}"), result);
+                full.state =
+                    modal_state(ctx, format!("full-{modal}-{camera}-{frame_index}"), result);
                 self.loader.set_modal_loading(false);
             }
         }

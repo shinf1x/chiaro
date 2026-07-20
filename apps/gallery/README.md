@@ -62,9 +62,10 @@ their own right-side gutter instead of overlapping image cards.
 
 The app scans the selected directory itself (not subdirectories). It supports
 both `RAW_PACKED_10BPP` surfaces and the L16 night-mode `RAW_BAYER_JPEG` layouts:
-four interleaved Bayer JPEG planes or one full-resolution mono JPEG. Captures
-with repeated night frames use frame zero for the gallery and contact sheet. An
-unsupported or damaged capture remains as an error card; hover it for details.
+four interleaved Bayer JPEG planes or one full-resolution mono JPEG. The contact
+sheet shows every frame in a repeated night capture and labels each frame under
+its physical camera. An unsupported or damaged capture remains as an error
+card; hover it for details.
 
 ## Known bugs
 

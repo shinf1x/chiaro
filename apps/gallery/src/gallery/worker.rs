@@ -106,11 +106,12 @@ pub(super) fn worker(
                 key,
                 data,
                 camera,
+                frame_index,
                 max_edge,
             } => WorkerResult::Preview {
                 generation,
                 key,
-                result: decode_camera(&data, &camera, max_edge),
+                result: decode_camera(&data, &camera, frame_index, max_edge),
             },
             Task::OpenCapture {
                 generation,
@@ -135,6 +136,7 @@ pub(super) fn worker(
                             generation,
                             modal,
                             reference_camera: update.reference_camera,
+                            frame_index: update.frame_index,
                             preview: update.preview,
                         });
                         progress_ctx.request_repaint();
@@ -239,7 +241,7 @@ fn decode_preview_source(
 fn load_capture(
     source: CaptureLocator,
     on_progress: impl FnMut(u64, u64),
-    on_preview: impl FnMut(CapturePreviewUpdate),
+    on_preview: impl FnMut(CapturePreviewUpdate) + Send,
     should_continue: impl FnMut() -> bool,
 ) -> Result<LoadedCapture, String> {
     let data = read_capture_with_updates(&source, on_progress, on_preview, should_continue)?;
@@ -280,11 +282,16 @@ fn modal_is_active(active: &Mutex<HashSet<u64>>, modal: u64) -> bool {
 fn decode_camera(
     data: &CaptureData,
     camera: &str,
+    frame_index: u64,
     max_edge: usize,
 ) -> Result<PreviewImage, String> {
     match data {
-        CaptureData::Local(path) => decode_camera_preview(path, camera, max_edge),
-        CaptureData::Memory(bytes) => decode_camera_preview_bytes(bytes, camera, max_edge),
+        CaptureData::Local(path) => {
+            decode_camera_frame_preview(path, camera, frame_index, max_edge)
+        }
+        CaptureData::Memory(bytes) => {
+            decode_camera_frame_preview_bytes(bytes, camera, frame_index, max_edge)
+        }
     }
     .map_err(|error| error.to_string())
 }

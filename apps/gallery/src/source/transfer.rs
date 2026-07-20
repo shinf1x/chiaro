@@ -1,9 +1,12 @@
 use super::*;
 
+const LELR_HEADER_BYTES: usize = 32;
+const CONTACT_TRANSFER_WINDOW: u32 = 16 * 1024 * 1024;
+
 pub fn read_capture_with_updates(
     locator: &CaptureLocator,
     on_progress: impl FnMut(u64, u64),
-    on_preview: impl FnMut(CapturePreviewUpdate),
+    on_preview: impl FnMut(CapturePreviewUpdate) + Send,
     should_continue: impl FnMut() -> bool,
 ) -> Result<CaptureData, String> {
     match locator {
@@ -84,78 +87,133 @@ fn download_object_with_progress(
 fn download_capture_with_updates(
     object: &RemoteObject,
     mut on_progress: impl FnMut(u64, u64),
-    mut on_preview: impl FnMut(CapturePreviewUpdate),
+    mut on_preview: impl FnMut(CapturePreviewUpdate) + Send,
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<Vec<u8>, String> {
-    block_on(async {
-        on_progress(0, object.size);
-        let mut download = object
-            .storage
-            .download(object.handle, ByteRange::Full)
-            .await
-            .map_err(|error| format!("Could not start download of {}: {error}", object.name))?;
-        let capacity = usize::try_from(download.size()).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut emitted = HashSet::new();
-        let mut inspected_prefix = 0usize;
-        while should_continue() {
-            let Some(chunk) = download.next_chunk().await else {
-                return Ok(bytes);
-            };
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    let _ = download.cancel(DEFAULT_CANCEL_TIMEOUT).await;
-                    return Err(format!("Could not download {}: {error}", object.name));
-                }
-            };
-            bytes.extend_from_slice(&chunk);
-            on_progress(bytes.len() as u64, object.size);
-            let complete_prefix = match complete_lelr_prefix_len(&bytes) {
-                Ok(complete_prefix) => complete_prefix,
-                Err(error) => {
-                    let _ = download.cancel(DEFAULT_CANCEL_TIMEOUT).await;
-                    return Err(error.to_string());
-                }
-            };
-            if complete_prefix == inspected_prefix {
-                continue;
+    let decoding = AtomicBool::new(true);
+    thread::scope(|scope| {
+        let decoder_active = &decoding;
+        let (chunk_sender, chunk_receiver) = mpsc::channel::<Vec<u8>>();
+        let capacity = usize::try_from(object.size).unwrap_or(0);
+        let decoder = scope.spawn(move || {
+            decode_capture_windows(chunk_receiver, decoder_active, capacity, &mut on_preview)
+        });
+
+        let transfer = block_on(async {
+            on_progress(0, object.size);
+            let mut download = object
+                .storage
+                .download_windowed(object.handle, ByteRange::Full, CONTACT_TRANSFER_WINDOW)
+                .await
+                .map_err(|error| format!("Could not start download of {}: {error}", object.name))?;
+            let mut transferred = 0u64;
+            while should_continue() {
+                let Some(chunk) = download.next_window().await else {
+                    return Ok(());
+                };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        return Err(format!("Could not download {}: {error}", object.name));
+                    }
+                };
+                transferred += chunk.len() as u64;
+                on_progress(transferred, object.size);
+                // The completed window moves into the decoder queue without an
+                // extra transfer-thread copy. The USB loop immediately requests
+                // the next window and never waits for parsing or demosaicing. A
+                // 16 MiB window is the measured L16 throughput knee while keeping
+                // transaction restarts infrequent.
+                chunk_sender
+                    .send(chunk)
+                    .map_err(|_| "contact preview decoder stopped".to_owned())?;
             }
-            inspected_prefix = complete_prefix;
-            let prefix = &bytes[..complete_prefix];
-            let summary = match inspect_capture_prefix(prefix) {
-                Ok(summary) => summary,
-                Err(error) => {
-                    let _ = download.cancel(DEFAULT_CANCEL_TIMEOUT).await;
-                    return Err(error.to_string());
-                }
+            Err(CANCELLED_LOAD.to_owned())
+        });
+
+        if transfer.is_err() {
+            decoding.store(false, Ordering::Release);
+        }
+        drop(chunk_sender);
+        let decoded = decoder
+            .join()
+            .map_err(|_| "contact preview decoder panicked".to_owned())?;
+        match (transfer, decoded) {
+            (_, Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+            (Ok(()), Ok(bytes)) => Ok(bytes),
+        }
+    })
+}
+
+fn decode_capture_windows(
+    chunk_receiver: mpsc::Receiver<Vec<u8>>,
+    active: &AtomicBool,
+    capacity: usize,
+    on_preview: &mut impl FnMut(CapturePreviewUpdate),
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(capacity);
+    // RAW payloads commonly precede calibration blocks. Track whether each
+    // early card has already been replaced by its color-corrected version.
+    let mut emitted = HashMap::new();
+    let mut complete_prefix = 0usize;
+    while active.load(Ordering::Acquire) {
+        let Ok(chunk) = chunk_receiver.recv() else {
+            break;
+        };
+        bytes.extend_from_slice(&chunk);
+        loop {
+            let Some(header_end) = complete_prefix.checked_add(LELR_HEADER_BYTES) else {
+                return Err("LRI block offset overflow".to_owned());
             };
-            if let Some(summary) = summary {
-                for camera in summary.cameras {
-                    if emitted.contains(&camera.camera) {
-                        continue;
-                    }
-                    let preview =
-                        match try_decode_camera_preview_prefix(prefix, &camera.camera, 520) {
-                            Ok(preview) => preview,
-                            Err(error) => {
-                                let _ = download.cancel(DEFAULT_CANCEL_TIMEOUT).await;
-                                return Err(error.to_string());
-                            }
-                        };
-                    if let Some(preview) = preview {
-                        emitted.insert(camera.camera.clone());
-                        on_preview(CapturePreviewUpdate {
-                            reference_camera: summary.reference_camera.clone(),
-                            preview,
-                        });
-                    }
+            if bytes.len() < header_end {
+                break;
+            }
+            let descriptor =
+                inspect_lelr_block_header(&bytes[complete_prefix..header_end], complete_prefix)
+                    .map_err(|error| error.to_string())?;
+            let block_end = descriptor.block_range().end;
+            if bytes.len() < block_end {
+                break;
+            }
+            complete_prefix = block_end;
+            let prefix = &bytes[..complete_prefix];
+            let Some(summary) =
+                inspect_capture_prefix(prefix).map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            for camera in summary.cameras {
+                let identity = (camera.camera.clone(), camera.frame_index);
+                if emitted.get(&identity) == Some(&true) {
+                    continue;
+                }
+                let color_ready =
+                    camera_frame_preview_color_ready(prefix, &camera.camera, camera.frame_index)
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or(false);
+                if emitted.get(&identity) == Some(&false) && !color_ready {
+                    continue;
+                }
+                if let Some(preview) = try_decode_camera_frame_preview_prefix(
+                    prefix,
+                    &camera.camera,
+                    camera.frame_index,
+                    520,
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    emitted.insert(identity, color_ready);
+                    on_preview(CapturePreviewUpdate {
+                        reference_camera: summary.reference_camera.clone(),
+                        frame_index: camera.frame_index,
+                        preview,
+                    });
                 }
             }
         }
-        let _ = download.cancel(DEFAULT_CANCEL_TIMEOUT).await;
-        Err(CANCELLED_LOAD.to_owned())
-    })
+    }
+    Ok(bytes)
 }
 
 fn download_reference_preview(

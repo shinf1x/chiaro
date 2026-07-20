@@ -9,8 +9,8 @@ use std::{
 };
 
 use chiaro::lri::{
-    CaptureMetadata, CaptureSummary, PreviewImage, decode_camera_preview,
-    decode_camera_preview_bytes, inspect_capture, inspect_capture_bytes,
+    CaptureMetadata, CaptureSummary, PreviewImage, decode_camera_frame_preview,
+    decode_camera_frame_preview_bytes, inspect_capture, inspect_capture_bytes,
 };
 use eframe::egui;
 
@@ -63,6 +63,7 @@ enum Task {
         key: PreviewKey,
         data: CaptureData,
         camera: String,
+        frame_index: u64,
         max_edge: usize,
     },
     OpenCapture {
@@ -107,6 +108,7 @@ enum WorkerResult {
         generation: u64,
         modal: u64,
         reference_camera: String,
+        frame_index: u64,
         preview: PreviewImage,
     },
     DeviceDone {
@@ -153,9 +155,20 @@ impl WorkerResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreviewKey {
-    Gallery { id: u64, revision: u64 },
-    Contact { modal: u64, camera: String },
-    Full { modal: u64, camera: String },
+    Gallery {
+        id: u64,
+        revision: u64,
+    },
+    Contact {
+        modal: u64,
+        camera: String,
+        frame_index: u64,
+    },
+    Full {
+        modal: u64,
+        camera: String,
+        frame_index: u64,
+    },
 }
 
 pub struct LoadedCapture {
@@ -188,6 +201,7 @@ pub enum LoadedEvent {
     CapturePreview {
         modal: u64,
         reference_camera: String,
+        frame_index: u64,
         preview: PreviewImage,
     },
     DeviceDone(Result<(), String>),
@@ -453,6 +467,7 @@ impl PreviewLoader {
         key: PreviewKey,
         data: CaptureData,
         camera: String,
+        frame_index: u64,
         max_edge: usize,
     ) {
         self.gallery_queue
@@ -463,6 +478,7 @@ impl PreviewLoader {
             key,
             data,
             camera,
+            frame_index,
             max_edge,
         });
     }
@@ -500,11 +516,13 @@ impl PreviewLoader {
                 WorkerResult::CapturePreview {
                     modal,
                     reference_camera,
+                    frame_index,
                     preview,
                     ..
                 } => LoadedEvent::CapturePreview {
                     modal,
                     reference_camera,
+                    frame_index,
                     preview,
                 },
                 WorkerResult::DeviceDone { result, .. } => LoadedEvent::DeviceDone(result),

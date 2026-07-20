@@ -12,6 +12,7 @@ Useful APIs include:
 
 - `lri::inspect_capture` and `lri::inspect_capture_bytes`;
 - `lri::decode_reference_preview` and `lri::decode_camera_preview`;
+- `lri::decode_camera_frame_preview` for repeated night-mode frames;
 - `lri::inspect_lelr_block_header` for sparse transports;
 - `lri::parse_raw_layout` for processing applications.
 

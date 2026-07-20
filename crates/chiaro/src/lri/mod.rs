@@ -62,6 +62,7 @@ pub struct PreviewImage {
 #[derive(Clone, Debug)]
 pub struct CameraSummary {
     pub camera: String,
+    pub frame_index: u64,
     pub dimensions: [usize; 2],
 }
 
@@ -543,10 +544,30 @@ pub fn reference_preview_color_ready(data: &[u8]) -> Result<Option<bool>, LriErr
     else {
         return Ok(None);
     };
-    Ok(Some(
-        !valid_bayer(module.bayer_red)
-            || preferred_color_calibration(&capture, reference).is_some(),
-    ))
+    Ok(Some(camera_preview_color_ready(
+        &capture, reference, module,
+    )))
+}
+
+/// Whether one camera frame in a streamed prefix has its color profile, or is
+/// mono and needs no profile. Progressive consumers can use this to replace an
+/// early uncalibrated preview when a later LELR block supplies the profile.
+pub fn camera_frame_preview_color_ready(
+    data: &[u8],
+    camera: &str,
+    frame_index: u64,
+) -> Result<Option<bool>, LriError> {
+    let camera_id =
+        camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
+    let capture = parse_capture_prefix(data)?;
+    let Some(module) = capture.modules.iter().find(|module| {
+        module.enabled && module.camera == camera_id && module.frame_index == frame_index
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(camera_preview_color_ready(
+        &capture, camera_id, module,
+    )))
 }
 
 fn capture_summary(capture: &Capture) -> Result<CaptureSummary, LriError> {
@@ -561,11 +582,19 @@ fn capture_summary(capture: &Capture) -> Result<CaptureSummary, LriError> {
         })
         .map(|module| CameraSummary {
             camera: camera_name(module.camera),
+            frame_index: module.frame_index,
             dimensions: [module.width, module.height],
         })
         .collect::<Vec<_>>();
-    cameras.sort_by_key(|camera| camera_index(&camera.camera).unwrap_or(u64::MAX));
-    cameras.dedup_by(|left, right| left.camera == right.camera);
+    cameras.sort_by_key(|camera| {
+        (
+            camera_index(&camera.camera).unwrap_or(u64::MAX),
+            camera.frame_index,
+        )
+    });
+    cameras.dedup_by(|left, right| {
+        left.camera == right.camera && left.frame_index == right.frame_index
+    });
     Ok(CaptureSummary {
         reference_camera: camera_name(reference),
         cameras,
@@ -611,7 +640,7 @@ pub fn decode_reference_preview(path: &Path, max_edge: usize) -> Result<PreviewI
     let camera = capture
         .reference_camera
         .ok_or(LriError::MissingReferenceCamera)?;
-    decode_from_capture(&data, &capture, camera, max_edge, true)
+    decode_from_capture(&data, &capture, camera, None, max_edge, true)
 }
 
 /// Decode the reference camera from an LRI already held in memory.
@@ -623,7 +652,7 @@ pub fn decode_reference_preview_bytes(
     let camera = capture
         .reference_camera
         .ok_or(LriError::MissingReferenceCamera)?;
-    decode_from_capture(data, &capture, camera, max_edge, true)
+    decode_from_capture(data, &capture, camera, None, max_edge, true)
 }
 
 /// Try to decode the reference camera from a prefix of an LRI stream.
@@ -646,7 +675,7 @@ pub fn try_decode_reference_preview_prefix(
     {
         return Ok(None);
     }
-    decode_from_capture(data, &capture, camera, max_edge, true).map(Some)
+    decode_from_capture(data, &capture, camera, None, max_edge, true).map(Some)
 }
 
 /// Try to decode a camera from the complete LELR blocks in a streamed prefix.
@@ -665,7 +694,34 @@ pub fn try_decode_camera_preview_prefix(
     {
         return Ok(None);
     }
-    decode_from_capture(data, &capture, camera_id, max_edge, false).map(Some)
+    decode_from_capture(data, &capture, camera_id, None, max_edge, false).map(Some)
+}
+
+/// Try to decode one exact camera frame from the complete LELR blocks in a
+/// streamed prefix.
+pub fn try_decode_camera_frame_preview_prefix(
+    data: &[u8],
+    camera: &str,
+    frame_index: u64,
+    max_edge: usize,
+) -> Result<Option<PreviewImage>, LriError> {
+    let camera_id =
+        camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
+    let capture = parse_capture_prefix(data)?;
+    if !capture.modules.iter().any(|module| {
+        module.enabled && module.camera == camera_id && module.frame_index == frame_index
+    }) {
+        return Ok(None);
+    }
+    decode_from_capture(
+        data,
+        &capture,
+        camera_id,
+        Some(frame_index),
+        max_edge,
+        false,
+    )
+    .map(Some)
 }
 
 pub fn decode_camera_preview(
@@ -676,7 +732,27 @@ pub fn decode_camera_preview(
     let camera_id =
         camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
     let (data, capture) = open_capture(path)?;
-    decode_from_capture(&data, &capture, camera_id, max_edge, false)
+    decode_from_capture(&data, &capture, camera_id, None, max_edge, false)
+}
+
+/// Decode one exact frame from a physical camera in an LRI file.
+pub fn decode_camera_frame_preview(
+    path: &Path,
+    camera: &str,
+    frame_index: u64,
+    max_edge: usize,
+) -> Result<PreviewImage, LriError> {
+    let camera_id =
+        camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
+    let (data, capture) = open_capture(path)?;
+    decode_from_capture(
+        &data,
+        &capture,
+        camera_id,
+        Some(frame_index),
+        max_edge,
+        false,
+    )
 }
 
 /// Decode one camera from an LRI already held in memory.
@@ -688,7 +764,27 @@ pub fn decode_camera_preview_bytes(
     let camera_id =
         camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
     let capture = parse_capture(data)?;
-    decode_from_capture(data, &capture, camera_id, max_edge, false)
+    decode_from_capture(data, &capture, camera_id, None, max_edge, false)
+}
+
+/// Decode one exact camera frame from an LRI already held in memory.
+pub fn decode_camera_frame_preview_bytes(
+    data: &[u8],
+    camera: &str,
+    frame_index: u64,
+    max_edge: usize,
+) -> Result<PreviewImage, LriError> {
+    let camera_id =
+        camera_index(camera).ok_or_else(|| LriError::MissingCamera(camera.to_owned()))?;
+    let capture = parse_capture(data)?;
+    decode_from_capture(
+        data,
+        &capture,
+        camera_id,
+        Some(frame_index),
+        max_edge,
+        false,
+    )
 }
 
 fn open_capture(path: &Path) -> Result<(memmap2::Mmap, Capture), LriError> {
@@ -710,6 +806,7 @@ fn decode_from_capture(
     data: &[u8],
     capture: &Capture,
     camera: u64,
+    frame_index: Option<u64>,
     max_edge: usize,
     is_reference: bool,
 ) -> Result<PreviewImage, LriError> {
@@ -717,7 +814,11 @@ fn decode_from_capture(
     let module = capture
         .modules
         .iter()
-        .filter(|module| module.enabled && module.camera == camera)
+        .filter(|module| {
+            module.enabled
+                && module.camera == camera
+                && frame_index.is_none_or(|frame_index| module.frame_index == frame_index)
+        })
         .min_by_key(|module| module.frame_index)
         .ok_or_else(|| {
             if is_reference {
@@ -745,7 +846,7 @@ fn decode_from_capture(
     } else {
         sensor_levels
     };
-    let (width, height, rgb) = render_preview(
+    let (width, height, mut rgb) = render_preview(
         data,
         module,
         capture.orientation,
@@ -754,6 +855,12 @@ fn decode_from_capture(
         color,
         capture.awb_gains,
     )?;
+    if module.format == RAW_BAYER_JPEG {
+        // The compressed night-mode planes use the opposite sensor scan
+        // direction from packed RAW10. LRI orientation metadata describes the
+        // completed capture and does not include this storage-level rotation.
+        rotate_rgb_180(&mut rgb);
+    }
     Ok(PreviewImage {
         size: [width, height],
         rgb,
@@ -761,6 +868,16 @@ fn decode_from_capture(
         color_calibrated: color.is_some() && valid_bayer(module.bayer_red),
         metadata: capture_metadata(capture, camera),
     })
+}
+
+fn rotate_rgb_180(rgb: &mut [u8]) {
+    let pixels = rgb.len() / 3;
+    for pixel in 0..pixels / 2 {
+        let opposite = pixels - 1 - pixel;
+        for channel in 0..3 {
+            rgb.swap(pixel * 3 + channel, opposite * 3 + channel);
+        }
+    }
 }
 
 fn preferred_color_calibration(capture: &Capture, camera: u64) -> Option<&ColorCalibration> {
@@ -771,6 +888,10 @@ fn preferred_color_calibration(capture: &Capture, camera: u64) -> Option<&ColorC
             .or_else(|| profiles.iter().find(|profile| profile.illuminant == 5))
             .or_else(|| profiles.first())
     })
+}
+
+fn camera_preview_color_ready(capture: &Capture, camera: u64, module: &CapturedModule) -> bool {
+    !valid_bayer(module.bayer_red) || preferred_color_calibration(capture, camera).is_some()
 }
 
 fn parse_capture(data: &[u8]) -> Result<Capture, LriError> {
@@ -1755,6 +1876,71 @@ mod tests {
         assert_eq!(capture.modules.len(), 1);
         assert_eq!(capture.modules[0].format, RAW_BAYER_JPEG);
         assert_eq!(capture.modules[0].row_stride, 0);
+    }
+
+    #[test]
+    fn capture_summary_preserves_repeated_camera_frames() {
+        let module = |frame_index| CapturedModule {
+            camera: 1,
+            enabled: true,
+            width: 4,
+            height: 2,
+            format: RAW_PACKED_10BPP,
+            frame_index,
+            ..Default::default()
+        };
+        let capture = Capture {
+            reference_camera: Some(1),
+            modules: vec![module(3), module(0), module(2), module(1), module(2)],
+            ..Default::default()
+        };
+
+        let summary = capture_summary(&capture).unwrap();
+        assert_eq!(summary.cameras.len(), 4);
+        assert_eq!(
+            summary
+                .cameras
+                .iter()
+                .map(|camera| camera.frame_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn bayer_preview_becomes_color_ready_when_calibration_arrives() {
+        let module = CapturedModule {
+            camera: 1,
+            enabled: true,
+            bayer_red: Some((0, 0)),
+            ..Default::default()
+        };
+        let mut capture = Capture::default();
+        assert!(!camera_preview_color_ready(&capture, 1, &module));
+
+        capture.colors.insert(
+            1,
+            vec![ColorCalibration {
+                illuminant: 2,
+                forward_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                rg_ratio: 1.0,
+                bg_ratio: 1.0,
+            }],
+        );
+        assert!(camera_preview_color_ready(&capture, 1, &module));
+
+        let mono = CapturedModule {
+            bayer_red: None,
+            ..module
+        };
+        assert!(camera_preview_color_ready(&Capture::default(), 1, &mono));
+    }
+
+    #[test]
+    fn bayer_jpeg_rotation_preserves_rgb_channel_order() {
+        let mut rgb = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        rotate_rgb_180(&mut rgb);
+        assert_eq!(rgb, vec![7, 8, 9, 4, 5, 6, 1, 2, 3]);
     }
 
     #[test]

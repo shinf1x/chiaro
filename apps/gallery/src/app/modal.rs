@@ -148,13 +148,15 @@ impl GalleryApp {
             }
         }
 
-        if let Some(camera) = open_camera {
+        if let Some((camera, frame_index, show_frame)) = open_camera {
             let ContactState::Ready { data, .. } = &sheet.state else {
                 return;
             };
             let id = sheet.id;
             sheet.full = Some(FullPreview {
                 camera: camera.clone(),
+                frame_index,
+                show_frame,
                 state: ModalImageState::Pending,
                 zoom: 1.0,
                 pan: Vec2::ZERO,
@@ -165,9 +167,11 @@ impl GalleryApp {
                 PreviewKey::Full {
                     modal: id,
                     camera: camera.clone(),
+                    frame_index,
                 },
                 data.clone(),
                 camera,
+                frame_index,
                 usize::MAX,
             );
         }
@@ -176,7 +180,11 @@ impl GalleryApp {
 
 fn full_view(ui: &mut egui::Ui, ctx: &egui::Context, name: &str, full: &mut FullPreview) {
     ui.horizontal(|ui| {
-        ui.heading(format!("{} - camera {}", name, full.camera));
+        ui.heading(format!(
+            "{} - camera {}",
+            name,
+            camera_frame_label(&full.camera, full.frame_index, full.show_frame)
+        ));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Back to contact sheet").clicked() {
                 ui.close();
@@ -315,7 +323,7 @@ fn camera_contact_grid(
     ui: &mut egui::Ui,
     modal: u64,
     cameras: &[CameraPreview],
-    mut open_camera: Option<&mut Option<String>>,
+    mut open_camera: Option<&mut Option<(String, u64, bool)>>,
 ) {
     let scroll_style = egui::style::ScrollStyle::solid();
     let scrollbar_width = scroll_style.allocated_width();
@@ -335,10 +343,15 @@ fn camera_contact_grid(
                 .spacing(Vec2::splat(CARD_GAP))
                 .show(ui, |ui| {
                     for (index, camera) in cameras.iter().enumerate() {
-                        if modal_camera_card(ui, camera, card_width)
+                        let show_frame = cameras
+                            .iter()
+                            .filter(|candidate| candidate.camera == camera.camera)
+                            .count()
+                            > 1;
+                        if modal_camera_card(ui, camera, show_frame, card_width)
                             && let Some(target) = open_camera.as_deref_mut()
                         {
-                            *target = Some(camera.camera.clone());
+                            *target = Some((camera.camera.clone(), camera.frame_index, show_frame));
                         }
                         if (index + 1) % columns == 0 {
                             ui.end_row();
@@ -348,7 +361,12 @@ fn camera_contact_grid(
         });
 }
 
-fn modal_camera_card(ui: &mut egui::Ui, camera: &CameraPreview, width: f32) -> bool {
+fn modal_camera_card(
+    ui: &mut egui::Ui,
+    camera: &CameraPreview,
+    show_frame: bool,
+    width: f32,
+) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, width + 34.0), Sense::click());
     ui.painter().rect(
         rect,
@@ -389,9 +407,17 @@ fn modal_camera_card(ui: &mut egui::Ui, camera: &CameraPreview, width: f32) -> b
     ui.painter().text(
         egui::pos2(rect.left() + 9.0, image_rect.bottom() + 8.0),
         egui::Align2::LEFT_TOP,
-        &camera.camera,
+        camera_frame_label(&camera.camera, camera.frame_index, show_frame),
         FontId::monospace(14.0),
         Color32::from_gray(225),
     );
     response.clicked() && matches!(camera.state, ModalImageState::Ready { .. })
+}
+
+fn camera_frame_label(camera: &str, frame_index: u64, show_frame: bool) -> String {
+    if show_frame {
+        format!("{camera} - frame {}", frame_index + 1)
+    } else {
+        camera.to_owned()
+    }
 }
