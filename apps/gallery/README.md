@@ -66,68 +66,6 @@ four interleaved Bayer JPEG planes or one full-resolution mono JPEG. Captures
 with repeated night frames use frame zero for the gallery and contact sheet. An
 unsupported or damaged capture remains as an error card; hover it for details.
 
-## How previews work
-
-- The LELR container and the required protobuf fields are parsed read-only.
-- `LightHeader.image_reference_camera` selects the camera module; it is not
-  hard-coded.
-- The source is memory-mapped. Packed 10-bit captures sample only pixels needed
-  for a maximum 720-pixel thumbnail; night-mode JPEG planes are decoded and
-  interleaved in memory before thumbnail sampling.
-- Bayer frames receive a lightweight demosaic, embedded black/white levels,
-  capture AWB gains, a per-camera D65/F7 forward color matrix, exposure
-  normalization, and display gamma. Mono camera frames are also supported.
-- Preview pixels live in RAM and are uploaded directly to an egui texture. No
-  PNG, JPEG, cache, sidecar, or temporary preview file is created.
-- PTP/MTP use the pure-Rust `mtp-rs` protocol implementation directly; no
-  desktop mount or external camera command is involved. Camera cards prefer the
-  small companion JPEG exposed by recent L16 firmware.
-  Opening a card streams its full LRI once into a shared memory buffer for the
-  contact sheet and full-camera views. An older PTP capture with no companion
-  JPEG remains clickable and loads its LRI on demand.
-- Every discovered capture enters the preview queue. Pending cards entering the
-  viewport are promoted ahead of unloaded off-screen cards without discarding
-  either task or duplicating its decode.
-- Camera captures are added to the gallery as their object records arrive;
-  their cards and preview jobs appear dynamically, but camera indexing has
-  exclusive transport priority over thumbnail reads. The queued thumbnails
-  begin when the complete DCIM index has been received.
-  If a companion JPEG is encountered after its LRI, the card is upgraded to use
-  it automatically. A per-card revision invalidates any queued, active, or
-  already displayed LRI thumbnail so the JPEG reliably wins the indexing race.
-- Companion JPEGs inherit capture metadata and orientation from sparse reads of
-  their matching LRI, but their already-correct display color is left unchanged.
-  Those metadata-only reads retain just protobuf messages, not zero-filled
-  stand-ins for the skipped RAW payloads.
-- Captures without a companion JPEG are read sparsely. The gallery fetches each
-  32-byte LELR header and trailing protobuf message, skips unrelated RAW data,
-  then requests only the declared reference camera's packed or Bayer-JPEG
-  payload. A continuous incremental stream remains as a compatibility fallback
-  for devices that reject partial-object reads.
-  Bayer RAW thumbnails continue scanning the small metadata messages until the
-  reference camera's AWB/color profile is available, so they use the same color
-  treatment as the completed contact-sheet RAW previews.
-- Two background workers decode previews so folder selection and resizing stay
-  responsive. A requested contact sheet or full view is prioritized over queued
-  card previews as soon as each worker finishes its current task; active card
-  work is never interrupted. Camera indexing pauses at an object boundary for
-  the contact transfer, while the free worker immediately accepts the modal job;
-  closing the modal resumes indexing and preserves the thumbnail queue.
-  Contact-sheet camera cards are emitted after each newly
-  completed LELR payload while the same stream continues into memory.
-- Closing a contact sheet or replacing an LRI task with its JPEG cancels that
-  transport cleanly. Switching tabs preserves each tab's items, camera-index
-  progress, and preview state while background work continues. A stale
-  transaction-ID response during the next camera open is retried with a fresh
-  session and a short backoff.
-- A newly enumerated L16 gets a short USB settle period before its tab opens.
-  Camera open operations use bounded timeouts and expose their current stage in
-  the UI. A disconnected, timed-out, or malformed initial PTP/MTP response
-  triggers a protocol reset (with USB re-enumeration as a fallback), then the
-  selected device tab keeps retrying while that same camera remains connected.
-  Brief discovery gaps keep the active camera tab and every loaded texture for
-  a grace period, avoiding a full gallery reset during transient USB events.
-
 ## Known bugs
 
 - Interrupting an active PTP operation by disconnecting USB can leave the Light
@@ -140,14 +78,6 @@ unsupported or damaged capture remains as an error card; hover it for details.
 The reusable library depends only on `memmap2`, `thiserror`, and the small
 `zune-jpeg` decoder required by night captures. It is a separate package from
 the gallery, so library consumers never pull in a UI or USB stack.
-
-The gallery uses `eframe`, `mtp-rs` plus its runtime-agnostic `futures`
-executor, `nusb`, and `rfd`.
-`eframe` is built with a reduced feature set: only the default fonts, OpenGL
-renderer, Wayland, and X11 are enabled. `rfd` uses the desktop portal on Linux;
-this is what allows the requested native picker without hard-coding a desktop
-environment. `mtp-rs` uses pure-Rust `nusb`, with no libmtp/libusb FFI or
-external `gphoto2` executable.
 
 ## Structure
 

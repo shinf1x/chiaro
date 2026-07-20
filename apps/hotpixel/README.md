@@ -86,13 +86,13 @@ cargo build -p chiaro-hotpixel --release
 The binary is:
 
 ```text
-target/release/chiaro-hotpixel
+chiaro-hotpixel
 ```
 
 ## Typical run
 
 ```bash
-target/release/chiaro-hotpixel \
+chiaro-hotpixel \
   /data/night_lrIs \
   /data/night_frames \
   --hotpixel-rec /data/hotpixel.rec \
@@ -104,7 +104,7 @@ This processes all `.lri` files directly inside `/data/night_lrIs`.
 For nested input directories:
 
 ```bash
-target/release/chiaro-hotpixel \
+chiaro-hotpixel \
   /data/night_lrIs \
   /data/night_frames \
   --hotpixel-rec /data/hotpixel.rec \
@@ -121,7 +121,7 @@ session_1/L16_04480.lri → B1/session_1__L16_04480.png
 ## Resume an interrupted extraction
 
 ```bash
-target/release/chiaro-hotpixel \
+chiaro-hotpixel \
   /data/night_lrIs \
   /data/night_frames \
   --hotpixel-rec /data/hotpixel.rec \
@@ -133,7 +133,7 @@ Existing PNG files are left untouched and missing frames are generated.
 ## Preserve Bayer mosaics
 
 ```bash
-target/release/chiaro-hotpixel \
+chiaro-hotpixel \
   /data/night_lrIs \
   /data/night_frames_raw \
   --hotpixel-rec /data/hotpixel.rec \
@@ -148,7 +148,7 @@ safer default for ordinary stacking software.
 ## Process selected cameras only
 
 ```bash
-target/release/chiaro-hotpixel \
+chiaro-hotpixel \
   /data/night_lrIs \
   /data/night_frames \
   --hotpixel-rec /data/hotpixel.rec \
