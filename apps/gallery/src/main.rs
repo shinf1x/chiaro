@@ -1,5 +1,6 @@
 mod app;
 mod gallery;
+mod parallel;
 mod source;
 
 use app::GalleryApp;

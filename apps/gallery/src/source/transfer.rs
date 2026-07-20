@@ -1,4 +1,5 @@
 use super::*;
+use crate::parallel;
 
 const LELR_HEADER_BYTES: usize = 32;
 const CONTACT_TRANSFER_WINDOW: u32 = 16 * 1024 * 1024;
@@ -162,6 +163,7 @@ fn decode_capture_windows(
             break;
         };
         bytes.extend_from_slice(&chunk);
+        let previous_prefix = complete_prefix;
         loop {
             let Some(header_end) = complete_prefix.checked_add(LELR_HEADER_BYTES) else {
                 return Err("LRI block offset overflow".to_owned());
@@ -177,43 +179,85 @@ fn decode_capture_windows(
                 break;
             }
             complete_prefix = block_end;
-            let prefix = &bytes[..complete_prefix];
-            let Some(summary) =
-                inspect_capture_prefix(prefix).map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
-            for camera in summary.cameras {
-                let identity = (camera.camera.clone(), camera.frame_index);
-                if emitted.get(&identity) == Some(&true) {
-                    continue;
-                }
-                let color_ready =
-                    camera_frame_preview_color_ready(prefix, &camera.camera, camera.frame_index)
-                        .map_err(|error| error.to_string())?
-                        .unwrap_or(false);
-                if emitted.get(&identity) == Some(&false) && !color_ready {
-                    continue;
-                }
-                if let Some(preview) = try_decode_camera_frame_preview_prefix(
-                    prefix,
-                    &camera.camera,
-                    camera.frame_index,
-                    520,
-                )
-                .map_err(|error| error.to_string())?
-                {
-                    emitted.insert(identity, color_ready);
-                    on_preview(CapturePreviewUpdate {
-                        reference_camera: summary.reference_camera.clone(),
-                        frame_index: camera.frame_index,
-                        preview,
-                    });
-                }
-            }
         }
+        if complete_prefix == previous_prefix {
+            continue;
+        }
+        emit_ready_camera_previews(&bytes[..complete_prefix], &mut emitted, on_preview)?;
     }
     Ok(bytes)
+}
+
+struct CameraPreviewRequest {
+    camera: String,
+    frame_index: u64,
+    color_ready: bool,
+}
+
+fn emit_ready_camera_previews(
+    prefix: &[u8],
+    emitted: &mut HashMap<(String, u64), bool>,
+    on_preview: &mut impl FnMut(CapturePreviewUpdate),
+) -> Result<(), String> {
+    let Some(summary) = inspect_capture_prefix(prefix).map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let mut requests = Vec::new();
+    for camera in summary.cameras {
+        let identity = (camera.camera.clone(), camera.frame_index);
+        if emitted.get(&identity) == Some(&true) {
+            continue;
+        }
+        let color_ready =
+            camera_frame_preview_color_ready(prefix, &camera.camera, camera.frame_index)
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false);
+        if emitted.get(&identity) == Some(&false) && !color_ready {
+            continue;
+        }
+        requests.push(CameraPreviewRequest {
+            camera: camera.camera,
+            frame_index: camera.frame_index,
+            color_ready,
+        });
+    }
+
+    let reference_camera = summary.reference_camera;
+    let mut first_error = None;
+    parallel::for_each(
+        &requests,
+        parallel::available_workers(),
+        |request| {
+            try_decode_camera_frame_preview_prefix(
+                prefix,
+                &request.camera,
+                request.frame_index,
+                520,
+            )
+            .map_err(|error| error.to_string())
+        },
+        |index, result| match result {
+            Ok(Some(preview)) => {
+                let request = &requests[index];
+                emitted.insert(
+                    (request.camera.clone(), request.frame_index),
+                    request.color_ready,
+                );
+                on_preview(CapturePreviewUpdate {
+                    reference_camera: reference_camera.clone(),
+                    frame_index: request.frame_index,
+                    preview,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        },
+    );
+    first_error.map_or(Ok(()), Err)
 }
 
 fn download_reference_preview(

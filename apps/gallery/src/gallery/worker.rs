@@ -33,7 +33,6 @@ pub(super) fn worker(
         let Some(task) = task else { continue };
         let task_generation = match &task {
             Task::Preview { generation, .. }
-            | Task::Camera { generation, .. }
             | Task::OpenCapture { generation, .. }
             | Task::ListDevice { generation, .. } => *generation,
         };
@@ -101,18 +100,6 @@ pub(super) fn worker(
                     },
                 }
             }
-            Task::Camera {
-                generation,
-                key,
-                data,
-                camera,
-                frame_index,
-                max_edge,
-            } => WorkerResult::Preview {
-                generation,
-                key,
-                result: decode_camera(&data, &camera, frame_index, max_edge),
-            },
             Task::OpenCapture {
                 generation,
                 modal,
@@ -208,6 +195,58 @@ pub(super) fn worker(
             let _ = results.send(result);
             ctx.request_repaint();
         }
+    }
+}
+
+pub(super) fn camera_worker(
+    queues: CameraWorkerQueues,
+    results: Sender<WorkerResult>,
+    active_generation: Arc<AtomicU64>,
+    active_modals: Arc<Mutex<HashSet<u64>>>,
+    ctx: egui::Context,
+) {
+    loop {
+        let priority = {
+            let receiver = queues
+                .priority
+                .lock()
+                .expect("priority camera task queue poisoned");
+            receiver.try_recv().ok()
+        };
+        let task = priority.or_else(|| {
+            let receiver = queues.tasks.lock().expect("camera task queue poisoned");
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .ok()
+        });
+        let Some(task) = task else { continue };
+        let Some(modal) = preview_modal(&task.key) else {
+            continue;
+        };
+        if active_generation.load(Ordering::Acquire) != task.generation
+            || !modal_is_active(&active_modals, modal)
+        {
+            continue;
+        }
+
+        let result = decode_camera(&task.data, &task.camera, task.frame_index, task.max_edge);
+        if active_generation.load(Ordering::Acquire) == task.generation
+            && modal_is_active(&active_modals, modal)
+        {
+            let _ = results.send(WorkerResult::Preview {
+                generation: task.generation,
+                key: task.key,
+                result,
+            });
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn preview_modal(key: &PreviewKey) -> Option<u64> {
+    match key {
+        PreviewKey::Contact { modal, .. } | PreviewKey::Full { modal, .. } => Some(*modal),
+        PreviewKey::Gallery { .. } => None,
     }
 }
 

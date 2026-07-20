@@ -14,6 +14,7 @@ use chiaro::lri::{
 };
 use eframe::egui;
 
+use crate::parallel;
 use crate::source::{
     CaptureData, CaptureLocator, CapturePreviewUpdate, DeviceItemEvent, LightDevice,
     PreviewLocator, SourceItem, apply_preview_orientation, decode_jpeg_preview,
@@ -23,7 +24,7 @@ use crate::source::{
 
 mod worker;
 
-use worker::{preview_is_current, worker};
+use worker::{camera_worker, preview_is_current, worker};
 
 const DECODE_EDGE: usize = 720;
 
@@ -58,14 +59,6 @@ enum Task {
         max_edge: usize,
         promoted: bool,
     },
-    Camera {
-        generation: u64,
-        key: PreviewKey,
-        data: CaptureData,
-        camera: String,
-        frame_index: u64,
-        max_edge: usize,
-    },
     OpenCapture {
         generation: u64,
         modal: u64,
@@ -75,6 +68,15 @@ enum Task {
         generation: u64,
         device: LightDevice,
     },
+}
+
+struct CameraTask {
+    generation: u64,
+    key: PreviewKey,
+    data: CaptureData,
+    camera: String,
+    frame_index: u64,
+    max_edge: usize,
 }
 
 enum WorkerResult {
@@ -230,6 +232,8 @@ pub struct PreviewLoader {
     tasks: Sender<Task>,
     priority_tasks: Sender<Task>,
     modal_tasks: Sender<Task>,
+    camera_tasks: Sender<CameraTask>,
+    priority_camera_tasks: Sender<CameraTask>,
     results: Receiver<WorkerResult>,
     generation: Arc<AtomicU64>,
     gallery_queue: Arc<GalleryQueueState>,
@@ -244,11 +248,19 @@ struct WorkerQueues {
     modal: Arc<Mutex<Receiver<Task>>>,
 }
 
+#[derive(Clone)]
+struct CameraWorkerQueues {
+    tasks: Arc<Mutex<Receiver<CameraTask>>>,
+    priority: Arc<Mutex<Receiver<CameraTask>>>,
+}
+
 impl PreviewLoader {
     pub fn new(ctx: egui::Context) -> Self {
         let (task_tx, task_rx) = mpsc::channel::<Task>();
         let (priority_tx, priority_rx) = mpsc::channel::<Task>();
         let (modal_tx, modal_rx) = mpsc::channel::<Task>();
+        let (camera_tx, camera_rx) = mpsc::channel::<CameraTask>();
+        let (priority_camera_tx, priority_camera_rx) = mpsc::channel::<CameraTask>();
         let (result_tx, result_rx) = mpsc::channel::<WorkerResult>();
         let task_rx = Arc::new(Mutex::new(task_rx));
         let priority_rx = Arc::new(Mutex::new(priority_rx));
@@ -260,6 +272,10 @@ impl PreviewLoader {
             tasks: task_rx,
             priority: priority_rx,
             modal: modal_rx,
+        };
+        let camera_queues = CameraWorkerQueues {
+            tasks: Arc::new(Mutex::new(camera_rx)),
+            priority: Arc::new(Mutex::new(priority_camera_rx)),
         };
         for thread_index in 0..2 {
             let queues = queues.clone();
@@ -282,11 +298,24 @@ impl PreviewLoader {
                 })
                 .expect("failed to start preview worker");
         }
+        for thread_index in 0..parallel::available_workers() {
+            let queues = camera_queues.clone();
+            let results = result_tx.clone();
+            let generation = Arc::clone(&generation);
+            let active_modals = Arc::clone(&active_modals);
+            let ctx = ctx.clone();
+            thread::Builder::new()
+                .name(format!("lri-camera-decode-{thread_index}"))
+                .spawn(move || camera_worker(queues, results, generation, active_modals, ctx))
+                .expect("failed to start camera decode worker");
+        }
 
         Self {
             tasks: task_tx,
             priority_tasks: priority_tx,
             modal_tasks: modal_tx,
+            camera_tasks: camera_tx,
+            priority_camera_tasks: priority_camera_tx,
             results: result_rx,
             generation,
             gallery_queue,
@@ -473,14 +502,20 @@ impl PreviewLoader {
         self.gallery_queue
             .modal_loading
             .store(true, Ordering::Release);
-        let _ = self.modal_tasks.send(Task::Camera {
+        let task = CameraTask {
             generation,
             key,
             data,
             camera,
             frame_index,
             max_edge,
-        });
+        };
+        let sender = if matches!(task.key, PreviewKey::Full { .. }) {
+            &self.priority_camera_tasks
+        } else {
+            &self.camera_tasks
+        };
+        let _ = sender.send(task);
     }
 
     pub fn drain(&self, active_generation: u64) -> Vec<LoadedEvent> {

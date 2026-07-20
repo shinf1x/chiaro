@@ -51,11 +51,13 @@ stored in the LRI metadata. Global transfer state and progress live in a bottom
 status bar so the gallery does not jump as work starts and finishes.
 
 Click a capture card to open its contact sheet. Complete LELR blocks populate
-camera cards while the remainder of the LRI is still transferring. Click a
-camera card after the transfer completes to decode its full native
-resolution image in memory. Drag to pan, and use the mouse wheel or slider for
-pointer-centered zoom. The image fits the viewer when first opened. Escape
-returns to the contact sheet; a second Escape closes the contact sheet.
+camera cards while the remainder of the LRI is still transferring. Ready frame
+batches, including later color-calibration updates, decode across the available
+CPU cores without making camera transport concurrent. Click a camera card after
+the transfer completes to decode its full native resolution image in memory.
+Drag to pan, and use the mouse wheel or slider for pointer-centered zoom. The
+image fits the viewer when first opened. Escape returns to the contact sheet; a
+second Escape closes the contact sheet.
 The contact modal and its dimmed backdrop stop above the status bar, leaving
 transfer progress unobscured. Both gallery and contact-sheet scrollbars reserve
 their own right-side gutter instead of overlapping image cards.
@@ -95,10 +97,11 @@ src/
   gallery/
     mod.rs      preview scheduler, queues, and public gallery state
     worker.rs   background capture loading and preview decoding
+  parallel.rs   dependency-free bounded CPU parallelism
   source/
     mod.rs       source models, device monitor, and public source API
     discovery.rs camera discovery, indexing, and local folder listing
-    transfer.rs  sparse/continuous LRI reads and preview orientation
+    transfer.rs  sparse/windowed LRI reads and streamed preview batches
     jpeg.rs      companion JPEG decoding and local path helpers
   main.rs        native application entry point
 ```
