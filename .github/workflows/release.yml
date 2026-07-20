@@ -1,0 +1,92 @@
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - name: Build release binaries (thin LTO)
+        run: |
+          cargo build \
+            --locked \
+            --release \
+            --target ${{ matrix.target }} \
+            --package chiaro-gallery \
+            --package chiaro-hotpixel
+
+      - name: Package archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          VERSION="${RELEASE_TAG:-v${PACKAGE_VERSION}}"
+          VERSION="${VERSION//\//-}"
+          TARGET_DIR="target/${TARGET}/release"
+          PACKAGE_NAME="chiaro-${VERSION}-${TARGET}"
+          PACKAGE_DIR="dist/${PACKAGE_NAME}"
+
+          mkdir -p "${PACKAGE_DIR}"
+          for binary in chiaro-gallery chiaro-hotpixel; do
+            cp "${TARGET_DIR}/${binary}" "${PACKAGE_DIR}/"
+            chmod +x "${PACKAGE_DIR}/${binary}"
+          done
+          cp README.md LICENSE "${PACKAGE_DIR}/"
+          mkdir -p "${PACKAGE_DIR}/assets/docs"
+          cp assets/docs/gallery_ui.png "${PACKAGE_DIR}/assets/docs/"
+          tar -czf "dist/${PACKAGE_NAME}.tar.gz" -C dist "${PACKAGE_NAME}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiaro-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz

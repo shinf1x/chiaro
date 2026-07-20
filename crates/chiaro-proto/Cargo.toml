@@ -1,0 +1,9 @@
+[package]
+name = "chiaro-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed protobuf bindings for Light L16 metadata"
+
+[dependencies]
+protobuf.workspace = true

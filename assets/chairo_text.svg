@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="1355.6064"
+   height="370.96051"
+   viewBox="0 0 1355.6064 370.96051"
+   version="1.1"
+   id="svg1"
+   inkscape:export-filename="/home/dantistnfs/chiaro_64.png"
+   inkscape:export-xdpi="12"
+   inkscape:export-ydpi="12"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   sodipodi:docname="logo.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#666666"
+     borderopacity="1.0"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     showgrid="true"
+     inkscape:zoom="0.51276154"
+     inkscape:cx="766.43814"
+     inkscape:cy="138.46592"
+     inkscape:window-width="1914"
+     inkscape:window-height="1025"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1">
+    <inkscape:grid
+       id="grid2"
+       units="mm"
+       originx="-672.48077"
+       originy="-60.351345"
+       spacingx="8"
+       spacingy="8"
+       empcolor="#0099e5"
+       empopacity="0.30196078"
+       color="#0099e5"
+       opacity="0.14901961"
+       empspacing="1"
+       enabled="true"
+       visible="true" />
+    <inkscape:page
+       x="0"
+       y="0"
+       width="1355.6064"
+       height="370.96051"
+       id="page2"
+       margin="0"
+       bleed="0" />
+  </sodipodi:namedview>
+  <defs
+     id="defs1">
+    <rect
+       x="565.56506"
+       y="23.402691"
+       width="1998.9799"
+       height="783.99017"
+       id="rect2" />
+  </defs>
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(-672.48079,-60.351345)">
+    <text
+       xml:space="preserve"
+       id="text2"
+       style="font-style:italic;font-variant:normal;font-weight:500;font-stretch:normal;font-size:491.339px;line-height:1.25;font-family:'IBM Plex Sans';-inkscape-font-specification:'IBM Plex Sans Medium Italic';text-align:center;white-space:pre;shape-inside:url(#rect2)"
+       transform="translate(-214.52467,-46.805382)"
+       inkscape:export-filename="/home/dantistnfs/chairo_128.png"
+       inkscape:export-xdpi="33.124821"
+       inkscape:export-ydpi="33.124821"><tspan
+         x="866.86128"
+         y="472.22161"
+         id="tspan1">chiaro</tspan></text>
+  </g>
+</svg>

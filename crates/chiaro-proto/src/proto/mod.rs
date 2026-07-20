@@ -1,0 +1,31 @@
+// @generated
+
+pub mod camera_id;
+pub mod camera_module;
+pub mod color_calibration;
+pub mod dead_pixel_map;
+pub mod device_temp;
+pub mod distortion;
+pub mod face_data;
+pub mod flash_calibration;
+pub mod geometric_calibration;
+pub mod gps_data;
+pub mod hot_pixel_map;
+pub mod hw_info;
+pub mod imu_data;
+pub mod lightheader;
+pub mod matrix3x3f;
+pub mod matrix4x4f;
+pub mod mirror_system;
+pub mod point2f;
+pub mod point2i;
+pub mod point3f;
+pub mod proximity_sensors;
+pub mod range2f;
+pub mod rectanglei;
+pub mod sensor_characterization;
+pub mod sensor_type;
+pub mod time_stamp;
+pub mod tof_calibration;
+pub mod view_preferences;
+pub mod vignetting_characterization;

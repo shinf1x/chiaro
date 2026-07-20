@@ -1,0 +1,8 @@
+syntax = "proto2";
+
+package ltpb;
+
+message Point2F {
+    optional float x = 1;
+    optional float y = 2;
+}

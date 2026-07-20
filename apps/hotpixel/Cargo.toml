@@ -1,0 +1,27 @@
+[package]
+name = "chiaro-hotpixel"
+version.workspace = true
+edition.workspace = true
+description = "Extract Light L16 LRI captures into per-camera, hot-pixel-corrected 16-bit PNG frames"
+license.workspace = true
+
+[[bin]]
+name = "chiaro-hotpixel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+clap.workspace = true
+flate2.workspace = true
+hex.workspace = true
+chiaro.workspace = true
+memmap2.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

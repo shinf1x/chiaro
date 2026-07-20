@@ -1,0 +1,19 @@
+[package]
+name = "chiaro-gallery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A dark, immediate-mode gallery for Light L16 LRI captures"
+
+[[bin]]
+name = "chiaro-gallery"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+futures.workspace = true
+chiaro.workspace = true
+mtp-rs.workspace = true
+nusb.workspace = true
+rfd.workspace = true
+zune-jpeg.workspace = true

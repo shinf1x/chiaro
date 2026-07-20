@@ -1,0 +1,12 @@
+[package]
+name = "chiaro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable, UI-independent Light L16 LRI support"
+
+[dependencies]
+chiaro-proto.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+zune-jpeg.workspace = true
