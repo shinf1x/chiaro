@@ -112,33 +112,6 @@ Use `--no-universal-hotpixel-model` to disable the bundled prior, or
 `--universal-hotpixel-profile FILE` to supply another compatible model. The
 validated runtime model is bundled as `assets/l16-universal-hotpixel-v1.json`.
 
-### Held-out validation
-
-The following results compare the normal adaptive factory correction against
-the same pipeline with the universal decision model enabled. The metric is RMS
-of the persistent residual at factory-listed, modeled hot-only coordinates, in
-original RAW10 codes; lower is better. The A/B captures were not used to fit
-their exposure profile. For the stronger C-group transfer test, C1 and C6 were
-excluded entirely while fitting the evaluated model.
-
-| Exposure | Camera | Held-out frames | Before | After | Reduction |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 1 s | A2 mono | 39 | 2.141 | 0.806 | 62.3% |
-| 1 s | A3 color | 39 | 2.446 | 1.627 | 33.5% |
-| 1 s | B1 color | 39 | 2.871 | 0.913 | 68.2% |
-| 5 s | A2 mono | 44 | 0.696 | 0.312 | 55.2% |
-| 5 s | A3 color | 44 | 1.058 | 0.404 | 61.8% |
-| 5 s | B1 color | 44 | 2.688 | 0.330 | 87.7% |
-| 15 s | A2 mono | 40 | 0.610 | 0.419 | 31.3% |
-| 15 s | A3 color | 40 | 0.409 | 0.371 | 9.1% |
-| 15 s | B1 color | 40 | 0.899 | 0.535 | 40.5% |
-| 15 s, C1 excluded | C1 color | 13 | 0.565 | 0.467 | 17.3% |
-| 15 s, C6 excluded | C6 mono | 13 | 3.944 | 0.968 | 75.5% |
-
-Row/column profiles, non-defect spatial fixed-pattern RMS, and temporal-noise
-RMS were unchanged in these comparisons. That is intentional: this model only
-changes interpolation decisions at coordinates supplied by `hotpixel.rec`.
-
 ## Universal temperature-conditioned corner-glow correction
 
 The validated low-frequency sensor-family coefficients are bundled into
@@ -270,22 +243,6 @@ offset = reference + slope × Δtemperature + curvature × Δtemperature²
 Validate a cleanup profile with dark captures that were not used to create it.
 Use one shared stretch for before/after images and inspect row/column profiles;
 independent auto-stretches or isolated bright pixels are misleading.
-
-## What is deliberately not applied by default
-
-- no black-level subtraction;
-- no device-specific fine fixed-pattern subtraction;
-- no flat-field correction;
-- no white balance;
-- no color matrix;
-- no exposure normalization;
-- no gamma or tone curve;
-- no stretch;
-- no denoising or sharpening;
-- no alignment or geometric correction.
-
-The default RGB output performs only simple linear bilinear demosaicing after hot-pixel
-correction. Use `--mode mosaic` to preserve the corrected Bayer mosaic instead.
 
 ## Build
 
