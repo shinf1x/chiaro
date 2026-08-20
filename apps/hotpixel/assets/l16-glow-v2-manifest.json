@@ -1,0 +1,32 @@
+{
+  "format": "chiaro-sensor-glow-profile",
+  "version": 2,
+  "source": "bundled Light L16 dark-capture dataset; C1 excluded for transfer validation",
+  "sensor_family": "Light L16 shared color/monochrome sensor glow",
+  "width": 4160,
+  "height": 3120,
+  "grid_width": 64,
+  "grid_height": 48,
+  "reference_temperature_c": 43.0,
+  "temperature_min_c": 36,
+  "temperature_max_c": 49,
+  "exposure_ns": 14999805952,
+  "exposure_min_ns": 4999935488,
+  "exposure_max_ns": 14999805952,
+  "reference_analog_gain": 6.25,
+  "reference_digital_gain": 1.015625,
+  "contributing_cameras": [
+    { "camera": "B1", "pattern": "RGGB", "frame_count": 102, "temperature_min_c": 34, "temperature_max_c": 51, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "B2", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 33, "temperature_max_c": 51, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "B3", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 33, "temperature_max_c": 50, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "B4", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 36, "temperature_max_c": 56, "analog_gain": 3.125, "digital_gain": 1.015625 },
+    { "camera": "B5", "pattern": "RGGB", "frame_count": 102, "temperature_min_c": 33, "temperature_max_c": 50, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "C2", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 31, "temperature_max_c": 50, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "C3", "pattern": "RGGB", "frame_count": 102, "temperature_min_c": 32, "temperature_max_c": 52, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "C4", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 31, "temperature_max_c": 50, "analog_gain": 6.25, "digital_gain": 1.015625 },
+    { "camera": "C5", "pattern": "BGGR", "frame_count": 102, "temperature_min_c": 31, "temperature_max_c": 49, "analog_gain": 6.25, "digital_gain": 1.015625 }
+  ],
+  "coefficients": "bundled:l16-glow-v2",
+  "coefficient_layout": "row-major canonical RGGB orientation; i16 spatial glow@reference Q8, i16 slope-per-C Q12; little-endian",
+  "orientation_rule": "RGGB=identity; BGGR=rotate180; GRBG=flip-horizontal; GBRG=flip-vertical; A2 MONO=flip-horizontal; C6 MONO=rotate180"
+}

@@ -35,6 +35,7 @@ sha2 = "0.10"
 tempfile = "3.12"
 thiserror = "2.0.18"
 walkdir = "2.5"
+zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zune-jpeg = { version = "0.3.17", default-features = false, features = ["std", "x86"] }
 
 [profile.release]

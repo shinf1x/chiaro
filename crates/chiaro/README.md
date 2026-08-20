@@ -16,6 +16,9 @@ Useful APIs include:
 - `lri::inspect_lelr_block_header` for sparse transports;
 - `lri::parse_raw_layout` for processing applications.
 
+`RawCamera` layout records include each module's sensor temperature, exposure,
+analogue/digital gain, and calibrated black/white levels for RAW correction.
+
 ## Example
 
 ```bash

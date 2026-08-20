@@ -1,0 +1,32 @@
+{
+  "format": "chiaro-universal-hotpixel-profile",
+  "version": 1,
+  "training_quantile": 0.25,
+  "reference_temperature_c": 40.0,
+  "reference_exposure_ns": 14999805952,
+  "reference_analog_gain": 6.25,
+  "reference_digital_gain": 1.015625,
+  "temperature_nodes_c": [25, 30, 35, 40, 45, 50, 55],
+  "families": {
+    "color": [
+      {"severity_min": 16, "severity_max_exclusive": 24, "excess_raw_codes": [2.485840, 14.274597, 32.841217, 52.291503, 78.913144, 105.042235, 121.285271]},
+      {"severity_min": 24, "severity_max_exclusive": 32, "excess_raw_codes": [13.024292, 28.412719, 56.303711, 80.604491, 116.443217, 157.074442, 177.118356]},
+      {"severity_min": 32, "severity_max_exclusive": 48, "excess_raw_codes": [22.236327, 43.238281, 79.983154, 118.651550, 164.559445, 219.689241, 251.762144]},
+      {"severity_min": 48, "severity_max_exclusive": 64, "excess_raw_codes": [33.098143, 64.589722, 118.337646, 179.051141, 245.812979, 331.547962, 419.022332]},
+      {"severity_min": 64, "severity_max_exclusive": 96, "excess_raw_codes": [47.149413, 90.447172, 165.227966, 243.033931, 340.000604, 457.814926, 592.506338]},
+      {"severity_min": 96, "severity_max_exclusive": 128, "excess_raw_codes": [71.668668, 131.722656, 240.458488, 354.605707, 500.093977, 698.446265, 874.404770]},
+      {"severity_min": 128, "severity_max_exclusive": 192, "excess_raw_codes": [106.226682, 158.941892, 299.944728, 465.659790, 665.426624, 881.508698, 1141.889450]},
+      {"severity_min": 192, "severity_max_exclusive": 255, "excess_raw_codes": [182.453613, 341.093170, 537.960938, 724.599505, 961.026365, 1251.703632, 1566.555122]}
+    ],
+    "mono": [
+      {"severity_min": 16, "severity_max_exclusive": 24, "excess_raw_codes": [5.410278, 24.044189, 44.354022, 66.903183, 88.496580, 91.603542, 89.792236]},
+      {"severity_min": 24, "severity_max_exclusive": 32, "excess_raw_codes": [13.239379, 39.079314, 67.237061, 95.176358, 111.834016, 116.685019, 105.396362]},
+      {"severity_min": 32, "severity_max_exclusive": 48, "excess_raw_codes": [19.248839, 57.080809, 97.382812, 134.176852, 160.187800, 170.016175, 189.238770]},
+      {"severity_min": 48, "severity_max_exclusive": 64, "excess_raw_codes": [28.193022, 81.732603, 141.975339, 198.887207, 248.034668, 290.415375, 324.176270]},
+      {"severity_min": 64, "severity_max_exclusive": 96, "excess_raw_codes": [41.836119, 116.383481, 197.317806, 280.307007, 359.872803, 435.256409, 509.931396]},
+      {"severity_min": 96, "severity_max_exclusive": 128, "excess_raw_codes": [47.921751, 157.337795, 281.811396, 410.311515, 541.201649, 670.246354, 797.503645]},
+      {"severity_min": 128, "severity_max_exclusive": 192, "excess_raw_codes": [89.403255, 227.210260, 379.650429, 549.017299, 722.437940, 878.341944, 1002.863523]},
+      {"severity_min": 192, "severity_max_exclusive": 255, "excess_raw_codes": [172.089654, 408.997732, 622.464587, 811.306990, 967.941962, 1081.319190, 1164.676517]}
+    ]
+  }
+}

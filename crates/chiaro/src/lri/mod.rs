@@ -153,6 +153,13 @@ pub struct RawCamera {
     pub absolute_offset: usize,
     pub byte_len: usize,
     pub pattern: SensorPattern,
+    /// Camera-module temperature in degrees Celsius at capture time.
+    pub sensor_temperature_c: Option<i32>,
+    pub analog_gain: f32,
+    pub digital_gain: f32,
+    pub exposure_ns: u64,
+    pub black_level: f32,
+    pub white_level: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +217,7 @@ struct CapturedModule {
     analog_gain: f32,
     digital_gain: f32,
     sensor_exposure_ns: u64,
+    sensor_temperature_c: Option<i32>,
 }
 
 #[derive(Default)]
@@ -306,6 +314,18 @@ pub fn parse_raw_layout(
             absolute_offset: module.payload_offset,
             byte_len,
             pattern,
+            sensor_temperature_c: module.sensor_temperature_c,
+            analog_gain: module.analog_gain,
+            digital_gain: module.digital_gain,
+            exposure_ns: module.sensor_exposure_ns,
+            black_level: capture
+                .sensor_levels
+                .get(&sensor)
+                .map_or(42.0, |levels| levels.0),
+            white_level: capture
+                .sensor_levels
+                .get(&sensor)
+                .map_or(1023.0, |levels| levels.1),
         });
     }
 
@@ -1049,6 +1069,7 @@ fn parse_camera_module(
         analog_gain: message.sensor_analog_gain.unwrap_or(1.0),
         digital_gain: message.sensor_digital_gain.unwrap_or(1.0),
         sensor_exposure_ns: message.sensor_exposure.unwrap_or(0),
+        sensor_temperature_c: message.sensor_temparature,
         frame_index: message.frame_index.map_or(0, u64::from),
         ..Default::default()
     };

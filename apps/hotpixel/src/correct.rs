@@ -36,6 +36,7 @@ pub struct CorrectionStats {
     pub corrected: usize,
     pub positive_corrected: usize,
     pub negative_corrected: usize,
+    pub forced_corrected: usize,
     pub mean_absolute_change: f64,
     pub maximum_absolute_change: u16,
 }
@@ -108,8 +109,23 @@ pub fn correct_hot_pixels(
     severity_map: &[u8],
     config: &CorrectionConfig,
 ) -> Result<CorrectionStats> {
+    correct_hot_pixels_with_forced_map(raw, width, height, pattern, severity_map, None, config)
+}
+
+pub fn correct_hot_pixels_with_forced_map(
+    raw: &mut [u16],
+    width: usize,
+    height: usize,
+    pattern: SensorPattern,
+    severity_map: &[u8],
+    forced_map: Option<&[bool]>,
+    config: &CorrectionConfig,
+) -> Result<CorrectionStats> {
     if raw.len() != width * height || severity_map.len() != raw.len() {
         bail!("RAW and hotpixel map dimensions differ");
+    }
+    if forced_map.is_some_and(|map| map.len() != raw.len()) {
+        bail!("forced hotpixel map dimensions differ");
     }
     if !matches!(config.kernel, 3 | 5 | 7) {
         bail!("correction kernel must be 3, 5, or 7");
@@ -119,7 +135,7 @@ pub fn correct_hot_pixels(
     }
 
     let source = raw.to_vec();
-    let mut replacements = Vec::<(usize, u16, i32)>::new();
+    let mut replacements = Vec::<(usize, u16, i32, bool)>::new();
     let mut candidates = 0usize;
 
     for index in 0..source.len() {
@@ -134,21 +150,23 @@ pub fn correct_hot_pixels(
             local_prediction_and_mad(&source, width, height, x, y, pattern, config.kernel);
         let delta = source[index] as i32 - prediction as i32;
 
-        let replace = match config.mode {
-            CorrectionMode::Replace => true,
-            CorrectionMode::Adaptive => {
-                let robust_threshold = config.sigma_threshold * f64::from(mad.max(1));
-                let threshold = robust_threshold.max(config.absolute_threshold as f64);
-                if severity == 255 {
-                    f64::from(delta.abs()) > threshold
-                } else {
-                    f64::from(delta) > threshold
+        let forced = forced_map.is_some_and(|map| map[index]);
+        let replace = forced
+            || match config.mode {
+                CorrectionMode::Replace => true,
+                CorrectionMode::Adaptive => {
+                    let robust_threshold = config.sigma_threshold * f64::from(mad.max(1));
+                    let threshold = robust_threshold.max(config.absolute_threshold as f64);
+                    if severity == 255 {
+                        f64::from(delta.abs()) > threshold
+                    } else {
+                        f64::from(delta) > threshold
+                    }
                 }
-            }
-        };
+            };
 
         if replace {
-            replacements.push((index, prediction, delta));
+            replacements.push((index, prediction, delta, forced));
         }
     }
 
@@ -156,7 +174,8 @@ pub fn correct_hot_pixels(
     let mut maximum_change = 0u16;
     let mut positive = 0usize;
     let mut negative = 0usize;
-    for (index, prediction, delta) in replacements.iter().copied() {
+    let mut forced_corrected = 0usize;
+    for (index, prediction, delta, forced) in replacements.iter().copied() {
         let change = source[index].abs_diff(prediction);
         total_change += change as u64;
         maximum_change = maximum_change.max(change);
@@ -164,6 +183,9 @@ pub fn correct_hot_pixels(
             positive += 1;
         } else if delta < 0 {
             negative += 1;
+        }
+        if forced {
+            forced_corrected += 1;
         }
         raw[index] = prediction;
     }
@@ -173,6 +195,7 @@ pub fn correct_hot_pixels(
         corrected: replacements.len(),
         positive_corrected: positive,
         negative_corrected: negative,
+        forced_corrected,
         mean_absolute_change: if replacements.is_empty() {
             0.0
         } else {
@@ -281,6 +304,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.corrected, 1);
+        assert_eq!(raw[index], 200);
+    }
+
+    #[test]
+    fn temperature_active_factory_pixel_forces_local_replacement() {
+        let width = 9;
+        let height = 9;
+        let mut raw = vec![200u16; width * height];
+        let index = 4 * width + 4;
+        raw[index] = 202;
+        let mut severity = vec![0u8; raw.len()];
+        severity[index] = 64;
+        let mut active = vec![false; raw.len()];
+        active[index] = true;
+        let stats = correct_hot_pixels_with_forced_map(
+            &mut raw,
+            width,
+            height,
+            SensorPattern::Mono,
+            &severity,
+            Some(&active),
+            &CorrectionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.corrected, 1);
+        assert_eq!(stats.forced_corrected, 1);
         assert_eq!(raw[index], 200);
     }
 
