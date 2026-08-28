@@ -1,0 +1,28 @@
+[package]
+name = "chiaro-hotpixel-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable, UI-independent hot-pixel, glow, and defect correction for Light L16 RAW frames"
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+chiaro.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+hex.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+tempfile.workspace = true
+
+[[example]]
+name = "compare_png_dirs"
+required-features = []

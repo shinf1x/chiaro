@@ -4,15 +4,14 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use chiaro::lri::{RawCamera, SensorPattern, parse_raw_layout};
 
 use crate::hotpixel::HotpixelRec;
 use crate::raw10::unpack_l16_10bit;
+use crate::scan::{discover_lri_files, mmap_file};
 
 const PROFILE_FORMAT: &str = "chiaro-defect-cleanup-profile";
 const PROFILE_VERSION: u32 = 2;
@@ -450,7 +449,7 @@ pub fn build_cleanup_profile(
     let files = discover_lri_files(&options.input, options.recursive)?;
     let mut jobs = BTreeMap::<String, Vec<CalibrationJob>>::new();
     for path in files {
-        let mmap = mmap_read(&path)?;
+        let mmap = mmap_file(&path)?;
         let layout = parse_raw_layout(&mmap, &options.pattern_overrides)
             .with_context(|| format!("parse RAW layout in {}", path.display()))?;
         for camera in layout.cameras {
@@ -593,7 +592,7 @@ fn fit_camera(
     let mut slope = vec![0f32; count];
     let mut curvature = vec![0f32; count];
     for (frame_index, (job, &temperature)) in jobs.iter().zip(&centered_temperatures).enumerate() {
-        let mmap = mmap_read(&job.source)?;
+        let mmap = mmap_file(&job.source)?;
         let start = job.camera.absolute_offset;
         let end = start + job.camera.byte_len;
         if end > mmap.len() {
@@ -970,35 +969,6 @@ fn median_f32(mut values: Vec<f32>) -> f32 {
     }
 }
 
-fn discover_lri_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        bail!("cleanup input is not a directory: {}", root.display());
-    }
-    let walker = if recursive {
-        WalkDir::new(root)
-    } else {
-        WalkDir::new(root).max_depth(1)
-    };
-    let mut files = walker
-        .follow_links(false)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| entry.file_type().is_file() || entry.path().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("lri"))
-        })
-        .collect::<Vec<_>>();
-    files.sort();
-    if files.is_empty() {
-        bail!("no .lri files found in {}", root.display());
-    }
-    Ok(files)
-}
-
 fn prepare_output_file(path: &Path, overwrite: bool) -> Result<()> {
     if path.exists() {
         if path.is_dir() {
@@ -1023,13 +993,6 @@ fn prepare_output_file(path: &Path, overwrite: bool) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     Ok(())
-}
-
-fn mmap_read(path: &Path) -> Result<Mmap> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: the mapping is read-only and File remains valid during creation.
-    unsafe { MmapOptions::new().map(&file) }
-        .with_context(|| format!("memory-map {}", path.display()))
 }
 
 fn read_profile_entry(path: &Path, name: &str) -> Result<Vec<u8>> {

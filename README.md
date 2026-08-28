@@ -1,85 +1,60 @@
 # Chiaro
 
-Chiaro is an open-source suite for the Light L16, growing toward a portable
-replacement for the proprietary Lumen workflow - from browsing `.lri` captures
-to processing and export. Linux is the current focus; support for additional
-platforms, possibly original L16 Android, is being explored.
-
-The suite currently includes:
-
-- **Chiaro Gallery** for browsing and inspecting Light L16 captures.
-- **Chiaro Hotpixel** for extracting each camera into separate files and
-  removing hot pixels from nighttime-sky captures, ready for further
-  processing in Siril or other stacking software.
+Chiaro is an open-source toolkit for browsing and processing Light L16
+captures. It is intended to provide a portable alternative to parts of the
+proprietary Lumen workflow. Linux is currently the primary supported platform.
 
 ![Chiaro Gallery displaying Light L16 captures](assets/docs/gallery_ui.png)
 
-## Feature comparison
+## Applications
 
-✅ Available · 🟡 In development · 🚧 Planned · ❌ Not planned
+- **Chiaro Gallery** browses local or camera-resident `.lri` captures, previews
+  individual camera modules, and runs export pipelines.
+- **Chiaro Hotpixel** extracts corrected 16-bit per-camera frames for
+  astrophotography and stacking workflows.
+- **Chiaro Fuse** aligns the modules of a capture and synthesises one
+  high-resolution frame.
 
-| Feature | Chiaro Gallery | Light Lumen |
-| --- | --- | --- |
-| Desktop platform | ✅ Native Linux | ✅ Windows and macOS |
-| Getting to captures | ✅ Browse folders or a connected camera directly over PTP/MTP | ✅ Transfer captures from the camera into Lumen |
-| Individual camera views | ✅ Contact sheet and full-resolution preview for every camera | ❌ Not available |
-| Captures without companion `.lris` files | ✅ Builds a color-calibrated preview from the LRI RAW data | ❌ Not detected or processed |
-| Computational fusion | 🟡 In development | ✅ Fuses images from ten or more cameras |
-| Depth and focus editing | 🚧 Planned | ✅ Depth effect, focus adjustment, and depth-map repair tools |
-| Finished-image export | 🚧 Planned | ✅ JPG and DNG |
-| Android support | Under consideration | ❌ Not available; x86 desktop application |
-| Best fit | Fast browsing and inspection | Full computational processing and editing |
-
-## Workspace
-
-| Package | Path | Purpose |
-| --- | --- | --- |
-| `chiaro-proto` | `crates/chiaro-proto` | Shared recovered schemas and generated Light metadata bindings |
-| `chiaro` | `crates/chiaro` | Portable LELR parsing, metadata, RAW layout, and preview decoding |
-| `chiaro-gallery` | `apps/gallery` | Native egui gallery with folder and PTP/MTP sources |
-| `chiaro-hotpixel` | `apps/hotpixel` | Per-camera extraction and hot-pixel correction for nighttime-sky captures |
-
-Production packages depend on the shared `chiaro` crate instead of
-implementing the LRI protocol independently.
+The fusion pipeline currently assumes distant scenes. Near subjects may show
+parallax or ghosting, and depth-aware fusion is not yet implemented. Night
+captures are best processed as per-camera stacks with Chiaro Hotpixel.
 
 ## Installation
 
-Download the latest prebuilt Linux archive from [GitHub
-Releases](https://github.com/shinf1x/chiaro/releases), or install either app
-directly from the repository with Cargo:
+Download a prebuilt Linux archive from [GitHub
+Releases](https://github.com/shinf1x/chiaro/releases), or install individual
+applications with Cargo:
 
 ```bash
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-gallery
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-hotpixel
+cargo install --git https://github.com/shinf1x/chiaro.git chiaro-fuse
 ```
 
-## Build
+To build the complete workspace:
 
 ```bash
 cargo build --workspace --release
 ```
 
-The application binaries are:
+The resulting binaries are written to `target/release/`.
 
-```text
-target/release/chiaro-gallery
-target/release/chiaro-hotpixel
-```
+## Workspace
 
-Published GitHub releases automatically build a Linux x86-64 archive containing
-both binaries, this README, and the license. The same archive can be produced as
-a workflow artifact by manually running the **Release Binaries** workflow.
-
-Package-specific usage is documented in
-[`apps/gallery/README.md`](apps/gallery/README.md) and
-[`apps/hotpixel/README.md`](apps/hotpixel/README.md).
+| Package | Purpose |
+| --- | --- |
+| [`chiaro-gallery`](apps/gallery/README.md) | Native gallery and export application |
+| [`chiaro-hotpixel`](apps/hotpixel/README.md) | Per-camera extraction and correction CLI |
+| [`chiaro-fuse`](apps/fuse/README.md) | Multi-camera fusion CLI |
+| [`chiaro`](crates/chiaro/README.md) | Shared LRI parsing, metadata, and preview decoding |
+| [`chiaro-hotpixel-core`](crates/chiaro-hotpixel-core/README.md) | Reusable RAW correction pipeline |
+| [`chiaro-fusion`](crates/chiaro-fusion/README.md) | Alignment and synthesis library |
+| [`chiaro-proto`](crates/chiaro-proto/README.md) | Recovered Light metadata bindings |
 
 ## Acknowledgements
 
-- [`ookami125/lri-cpp`](https://github.com/ookami125/lri-cpp) by
-  [`@ookami125`](https://github.com/ookami125).
-- [`gennyble/lri-rs`](https://github.com/gennyble/lri-rs) by
-  [`@gennyble`](https://github.com/gennyble).
-- [`dllu/lri-rs`](https://github.com/dllu/lri-rs) by
-  [`@dllu`](https://github.com/dllu), who recovered the original Protocol
-  Buffer definitions from Lumen.
+Chiaro builds on Light L16 format research from
+[`ookami125/lri-cpp`](https://github.com/ookami125/lri-cpp),
+[`gennyble/lri-rs`](https://github.com/gennyble/lri-rs), and
+[`dllu/lri-rs`](https://github.com/dllu/lri-rs). The latter recovered the
+original Protocol Buffer definitions from Lumen.

@@ -1,107 +1,79 @@
 # Chiaro Gallery
 
-Chiaro Gallery is the suite's native Linux application for browsing and
-inspecting Light L16 captures from local folders or directly from a camera over
-PTP/MTP. Its dark-themed UI uses the immediate-mode
-[`egui`](https://github.com/emilk/egui) framework through `eframe`.
-
-The current release focuses on browsing and inspection. Copying, moving, and
-exporting captures are not available yet.
+Chiaro Gallery is a native Linux application for browsing and processing Light
+L16 captures from local folders or a connected camera over PTP/MTP.
 
 ![Chiaro Gallery displaying Light L16 captures](../../assets/docs/gallery_ui.png)
 
-The header uses the shared Chiaro logo and wordmark assets, with the application
-name on its upper row and the workspace package version below it. Raster exports
-are embedded for display so the app does not need a runtime SVG renderer.
-
 ## Installation
 
-Download the latest prebuilt Linux archive from [GitHub
-Releases](https://github.com/shinf1x/chiaro/releases), or install the gallery
-directly from the repository:
+Download a prebuilt archive from [GitHub
+Releases](https://github.com/shinf1x/chiaro/releases), install with Cargo, or
+run the workspace package directly:
 
 ```bash
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-gallery
-```
-
-## Run from source
-
-```bash
 cargo run -p chiaro-gallery --release
 ```
 
-Sources appear as tabs across the top:
+## Browsing captures
 
-- Every connected Light L16 becomes an **L16 - PTP** or **L16 - MTP** tab.
-  Discovery starts with the app and continues in the background, so tabs appear
-  and disappear as cameras connect or disconnect. A newly detected L16 is
-  selected and loaded automatically, including when it changes USB mode.
-- **+ Folder...** opens the folder-path view, which accepts a manual path and
-  exposes the system folder picker. Choosing a folder creates its own closable
-  tab. Dropping a folder or an LRI file from an explorer does the same thing.
+Connected Light L16 cameras appear automatically. Local folders can be opened
+with **+ Folder...** or by dropping a folder or LRI file onto the application.
+Folder scans are non-recursive.
 
-The tab strip scrolls horizontally when space is tight. Source controls and the
-preview-size slider live on separate responsive rows, so neither can overlap the
-other at half-screen widths. Folder tabs can be closed from the tab strip. Each
-card shows the file name, ISO, shutter speed, focal length, capture time, and
-selected reference-camera ID. Active night/tripod states appear as compact
-icons beside the filename. The initial size fits five columns in the default
-window. Images follow the orientation
-stored in the LRI metadata. Global transfer state and progress live in a bottom
-status bar so the gallery does not jump as work starts and finishes.
+Each capture card shows its main metadata and framed preview. Opening a card
+shows every camera module and, when present, every frame of a repeated
+night-mode capture. Full-resolution module previews support pan and zoom.
+Damaged or unsupported captures remain visible as error cards.
 
-Click a capture card to open its contact sheet. Complete LELR blocks populate
-camera cards while the remainder of the LRI is still transferring. Ready frame
-batches, including later color-calibration updates, decode across the available
-CPU cores without making camera transport concurrent. Click a camera card after
-the transfer completes to decode its full native resolution image in memory.
-Drag to pan, and use the mouse wheel or slider for pointer-centered zoom. The
-image fits the viewer when first opened. Escape returns to the contact sheet; a
-second Escape closes the contact sheet.
-The contact modal and its dimmed backdrop stop above the status bar, leaving
-transfer progress unobscured. Both gallery and contact-sheet scrollbars reserve
-their own right-side gutter instead of overlapping image cards.
+Decoded previews are cached in the platform cache directory. The **Settings**
+tab controls whether caching is enabled, its size limit, and cache clearing.
+Persistent settings are stored in the platform configuration directory as
+`chiaro/gallery.json`.
 
-The app scans the selected directory itself (not subdirectories). It supports
-both `RAW_PACKED_10BPP` surfaces and the L16 night-mode `RAW_BAYER_JPEG` layouts:
-four interleaved Bayer JPEG planes or one full-resolution mono JPEG. The contact
-sheet shows every frame in a repeated night capture and labels each frame under
-its physical camera. An unsupported or damaged capture remains as an error
-card; hover it for details.
+## Exporting
 
-## Known bugs
+Select cards with their checkbox or non-image area; Shift-click extends the
+current selection range. Starting an export clears the selection. Additional
+exports can be added while another job is running and are processed in order.
 
-- Interrupting an active PTP operation by disconnecting USB can leave the Light
-  L16 camera stuck. Recovery currently requires a hard camera reboot by holding
-  its power button for approximately 30 seconds. This is documented for now and
-  is not being fixed in the current work.
+Available pipelines:
 
-## Dependencies
+- **Hot-pixel corrected frames** writes linear 16-bit PNGs into one directory
+  per physical camera. It uses the same correction pipeline as
+  [`chiaro-hotpixel`](../hotpixel/README.md).
+- **Fused high-resolution frame** aligns the participating modules and writes
+  one 16-bit PNG plus a `.fusion.json` diagnostic report per capture. It uses
+  the same pipeline as [`chiaro-fuse`](../fuse/README.md).
 
-The reusable library depends only on `memmap2`, `thiserror`, and the small
-`zune-jpeg` decoder required by night captures. It is a separate package from
-the gallery, so library consumers never pull in a UI or USB stack.
+Exports report progress, can be cancelled, check available disk space, and
+record failures in `export-log.txt`. Night-mode captures are not currently
+accepted by either export pipeline; use the Hotpixel CLI for per-camera
+night-frame extraction.
 
-## Structure
+### Camera calibration
 
-```text
-src/
-  app/
-    mod.rs      application state and top-level immediate-mode update
-    branding.rs embedded Chiaro logo, wordmark, and version header
-    tabs.rs     tab strip, source controls, and status bar
-    cards.rs    responsive gallery card grid
-    events.rs   background-result handling and texture upload routing
-    modal.rs    contact sheet and full-resolution image viewer
-    visuals.rs  shared image, metadata, progress, and icon widgets
-  gallery/
-    mod.rs      preview scheduler, queues, and public gallery state
-    worker.rs   background capture loading and preview decoding
-  parallel.rs   dependency-free bounded CPU parallelism
-  source/
-    mod.rs       source models, device monitor, and public source API
-    discovery.rs camera discovery, indexing, and local folder listing
-    transfer.rs  sparse/windowed LRI reads and streamed preview batches
-    jpeg.rs      companion JPEG decoding and local path helpers
-  main.rs        native application entry point
-```
+When a camera is indexed, Gallery looks for these device-specific files in
+`DCIM/Camera/lightcal`:
+
+- `hotpixel.rec`
+- `calibration.lri`
+- `zoom_calib_v0.lri`
+
+They are copied to a local cache when first needed. Manually selected paths are
+not overwritten.
+
+Use the `hotpixel.rec` belonging to the same physical camera. The geometric
+calibration files are also strongly recommended: capture headers contain only
+part of the camera model, and cross-module alignment is likely to be poor
+without the remaining geometry and mirror-aiming data.
+
+## Important limitations
+
+- Fusion uses one refined homography per module and is intended for distant
+  scenes. Near subjects can ghost because depth-dependent parallax is not yet
+  modelled.
+- Disconnecting USB during an active PTP operation can leave some L16 cameras
+  unresponsive. Recovery may require holding the camera power button for about
+  30 seconds.

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use chiaro::lri::{RawCamera, SensorPattern};
 
+use crate::parallel;
+
 const PROFILE_VERSION: u32 = 2;
 const MANIFEST_NAME: &str = "manifest.json";
 const REFERENCE_SCALE: f32 = 256.0;
@@ -48,6 +50,7 @@ pub struct ThermalSourceCamera {
     pub digital_gain: f32,
 }
 
+#[derive(Clone, Debug)]
 pub struct ThermalProfile {
     pub root: PathBuf,
     pub manifest: ThermalProfileManifest,
@@ -143,7 +146,20 @@ impl ThermalProfile {
         camera: &RawCamera,
         raw: &mut [u16],
     ) -> Result<ThermalCorrectionStats> {
-        self.correct_calibrated_plane_with_scale(camera, raw, 64)
+        self.correct_plane(camera, raw, 64, false, 0)
+    }
+
+    /// Like [`Self::correct_calibrated_plane_q6`], but operating directly on
+    /// the decoded RAW plane, which is the calibrated plane rotated by 180
+    /// degrees. This avoids reversing the buffer before and after the call.
+    /// `threads` splits the rows across worker threads (`0` = all cores).
+    pub fn correct_raw_plane_q6(
+        &self,
+        camera: &RawCamera,
+        raw: &mut [u16],
+        threads: usize,
+    ) -> Result<ThermalCorrectionStats> {
+        self.correct_plane(camera, raw, 64, true, threads)
     }
 
     fn correct_calibrated_plane_with_scale(
@@ -151,6 +167,24 @@ impl ThermalProfile {
         camera: &RawCamera,
         raw: &mut [u16],
         sample_scale: u16,
+    ) -> Result<ThermalCorrectionStats> {
+        self.correct_plane(camera, raw, sample_scale, false, 0)
+    }
+
+    /// Shared implementation. `rotated_input` means `raw` is in decoded RAW
+    /// order rather than calibrated orientation.
+    ///
+    /// The bilinear weights depend only on the column (x) or only on the row
+    /// (y), so they are tabulated once per frame instead of recomputed per
+    /// pixel. The arithmetic is performed in exactly the same order as the
+    /// straightforward per-pixel formulation, so results are bit-identical.
+    fn correct_plane(
+        &self,
+        camera: &RawCamera,
+        raw: &mut [u16],
+        sample_scale: u16,
+        rotated_input: bool,
+        threads: usize,
     ) -> Result<ThermalCorrectionStats> {
         if camera.width != self.manifest.width
             || camera.height != self.manifest.height
@@ -197,34 +231,60 @@ impl ThermalProfile {
         let gain_scale = camera.analog_gain / self.manifest.reference_analog_gain
             * (camera.digital_gain / self.manifest.reference_digital_gain);
 
-        let mut total_change = 0u64;
-        let mut maximum_change = 0u16;
-        for y in 0..camera.height {
-            for x in 0..camera.width {
-                let index = y * camera.width + x;
-                let (canonical_x, canonical_y) = canonical_coordinates_for_camera(
-                    &camera.name,
-                    camera.pattern,
-                    x,
-                    y,
-                    camera.width,
-                    camera.height,
-                );
-                let (reference, slope) = self.interpolate(canonical_x, canonical_y);
-                let glow = (reference
-                    + slope * (applied_temperature - self.manifest.reference_temperature_c))
-                    * gain_scale
-                    * exposure_scale;
-                let corrected = (raw[index] as f32 - glow * f32::from(sample_scale))
-                    .round()
-                    .clamp(0.0, camera.white_level.max(1.0) * f32::from(sample_scale))
-                    as u16;
-                let change = raw[index].abs_diff(corrected);
-                total_change += u64::from(change);
-                maximum_change = maximum_change.max(change);
-                raw[index] = corrected;
+        let width = camera.width;
+        let height = camera.height;
+        // Plane (x, y) -> canonical (x, y): both axes are either identity or
+        // mirrored. A rotated input adds one more mirror on each axis.
+        let (flip_x, flip_y) = {
+            let (cx, cy) =
+                canonical_coordinates_for_camera(&camera.name, camera.pattern, 0, 0, 2, 2);
+            (cx == 1, cy == 1)
+        };
+        let (flip_x, flip_y) = if rotated_input {
+            (!flip_x, !flip_y)
+        } else {
+            (flip_x, flip_y)
+        };
+        let grid_width = self.manifest.grid_width;
+        let grid_height = self.manifest.grid_height;
+        let columns = (0..width)
+            .map(|x| {
+                let canonical = if flip_x { width - 1 - x } else { x };
+                axis_weights(canonical, width, grid_width)
+            })
+            .collect::<Vec<_>>();
+        let grid = (0..grid_width * grid_height)
+            .map(|index| self.coefficient(index % grid_width, index / grid_width))
+            .collect::<Vec<_>>();
+        let delta_temperature = applied_temperature - self.manifest.reference_temperature_c;
+        let glow_scale = f32::from(sample_scale);
+        let white = camera.white_level.max(1.0) * glow_scale;
+
+        let scales = GlowScales {
+            delta_temperature,
+            gain_scale,
+            exposure_scale,
+            glow_scale,
+            white,
+        };
+        let band_stats = parallel::map_row_bands_mut(raw, width, threads, 1, |rows, band| {
+            let mut stats = (0u64, 0u16);
+            for (row_offset, y) in rows.enumerate() {
+                let canonical_y = if flip_y { height - 1 - y } else { y };
+                let (y0, y1, ty) = axis_weights(canonical_y, height, grid_height);
+                let top_row = &grid[y0 * grid_width..(y0 + 1) * grid_width];
+                let bottom_row = &grid[y1 * grid_width..(y1 + 1) * grid_width];
+                let row = &mut band[row_offset * width..(row_offset + 1) * width];
+                glow_row(row, &columns, top_row, bottom_row, ty, &scales, &mut stats);
             }
-        }
+            stats
+        });
+        let total_change = band_stats.iter().map(|(total, _)| total).sum::<u64>();
+        let maximum_change = band_stats
+            .iter()
+            .map(|(_, maximum)| *maximum)
+            .max()
+            .unwrap_or(0);
 
         Ok(ThermalCorrectionStats {
             applied: true,
@@ -242,19 +302,13 @@ impl ThermalProfile {
         })
     }
 
+    /// Reference implementation kept for equivalence tests.
+    #[cfg(test)]
     fn interpolate(&self, x: usize, y: usize) -> (f32, f32) {
         let grid_width = self.manifest.grid_width;
         let grid_height = self.manifest.grid_height;
-        let fx = (((x as f32 + 0.5) * grid_width as f32 / self.manifest.width as f32) - 0.5)
-            .clamp(0.0, (grid_width - 1) as f32);
-        let fy = (((y as f32 + 0.5) * grid_height as f32 / self.manifest.height as f32) - 0.5)
-            .clamp(0.0, (grid_height - 1) as f32);
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(grid_width - 1);
-        let y1 = (y0 + 1).min(grid_height - 1);
-        let tx = fx - x0 as f32;
-        let ty = fy - y0 as f32;
+        let (x0, x1, tx) = axis_weights(x, self.manifest.width, grid_width);
+        let (y0, y1, ty) = axis_weights(y, self.manifest.height, grid_height);
         let top = mix_pair(self.coefficient(x0, y0), self.coefficient(x1, y0), tx);
         let bottom = mix_pair(self.coefficient(x0, y1), self.coefficient(x1, y1), tx);
         mix_pair(top, bottom, ty)
@@ -305,6 +359,64 @@ fn canonical_coordinates_for_camera(
     } else {
         canonical_coordinates(pattern, x, y, width, height)
     }
+}
+
+/// Per-frame constants of the glow formula.
+#[derive(Clone, Copy)]
+struct GlowScales {
+    delta_temperature: f32,
+    gain_scale: f32,
+    exposure_scale: f32,
+    /// Sample scale (1 for RAW codes, 64 for Q6).
+    glow_scale: f32,
+    /// Clamp ceiling in sample units.
+    white: f32,
+}
+
+crate::simd::multiversion! {
+    /// Subtract the interpolated glow from one row. `columns` holds the x
+    /// grid cells and weight per pixel; `top`/`bottom` are the two grid rows
+    /// bracketing this image row, blended with `ty`. `stats` accumulates
+    /// (total absolute change, maximum absolute change).
+    fn glow_row(
+        row: &mut [u16],
+        columns: &[(usize, usize, f32)],
+        top: &[(f32, f32)],
+        bottom: &[(f32, f32)],
+        ty: f32,
+        scales: &GlowScales,
+        stats: &mut (u64, u16),
+    ) {
+        let mut total_change = 0u64;
+        let mut maximum_change = 0u16;
+        for (sample, &(x0, x1, tx)) in row.iter_mut().zip(columns) {
+            let top_mix = mix_pair(top[x0], top[x1], tx);
+            let bottom_mix = mix_pair(bottom[x0], bottom[x1], tx);
+            let (reference, slope) = mix_pair(top_mix, bottom_mix, ty);
+            let glow = (reference + slope * scales.delta_temperature)
+                * scales.gain_scale
+                * scales.exposure_scale;
+            let corrected = (*sample as f32 - glow * scales.glow_scale)
+                .round()
+                .clamp(0.0, scales.white) as u16;
+            let change = sample.abs_diff(corrected);
+            total_change += u64::from(change);
+            maximum_change = maximum_change.max(change);
+            *sample = corrected;
+        }
+        stats.0 += total_change;
+        stats.1 = stats.1.max(maximum_change);
+    }
+}
+
+/// Grid cell pair and blend weight for one canonical pixel coordinate along an
+/// axis of `length` pixels mapped onto `grid` nodes.
+fn axis_weights(coordinate: usize, length: usize, grid: usize) -> (usize, usize, f32) {
+    let position = (((coordinate as f32 + 0.5) * grid as f32 / length as f32) - 0.5)
+        .clamp(0.0, (grid - 1) as f32);
+    let lower = position.floor() as usize;
+    let upper = (lower + 1).min(grid - 1);
+    (lower, upper, position - lower as f32)
 }
 
 fn mix_pair(left: (f32, f32), right: (f32, f32), amount: f32) -> (f32, f32) {
@@ -396,6 +508,134 @@ mod tests {
         assert_eq!(profile.manifest.exposure_ns, 14_999_805_952);
         assert_eq!(profile.manifest.exposure_min_ns, Some(4_999_935_488));
         assert_eq!(profile.manifest.exposure_max_ns, Some(14_999_805_952));
+    }
+
+    /// Straightforward per-pixel formulation, used to prove the tabulated
+    /// kernel is bit-identical.
+    fn reference_correct(
+        profile: &ThermalProfile,
+        camera: &RawCamera,
+        raw: &mut [u16],
+        sample_scale: u16,
+        rotated_input: bool,
+    ) {
+        let applied = (camera.sensor_temperature_c.unwrap() as f32).clamp(
+            profile.manifest.temperature_min_c as f32,
+            profile.manifest.temperature_max_c as f32,
+        );
+        let exposure_scale = camera.exposure_ns as f32 / profile.manifest.exposure_ns as f32;
+        let gain_scale = camera.analog_gain / profile.manifest.reference_analog_gain
+            * (camera.digital_gain / profile.manifest.reference_digital_gain);
+        for y in 0..camera.height {
+            for x in 0..camera.width {
+                let index = y * camera.width + x;
+                let (px, py) = if rotated_input {
+                    (camera.width - 1 - x, camera.height - 1 - y)
+                } else {
+                    (x, y)
+                };
+                let (cx, cy) = canonical_coordinates_for_camera(
+                    &camera.name,
+                    camera.pattern,
+                    px,
+                    py,
+                    camera.width,
+                    camera.height,
+                );
+                let (reference, slope) = profile.interpolate(cx, cy);
+                let glow = (reference
+                    + slope * (applied - profile.manifest.reference_temperature_c))
+                    * gain_scale
+                    * exposure_scale;
+                raw[index] = (raw[index] as f32 - glow * f32::from(sample_scale))
+                    .round()
+                    .clamp(0.0, camera.white_level.max(1.0) * f32::from(sample_scale))
+                    as u16;
+            }
+        }
+    }
+
+    fn bumpy_profile(width: usize, height: usize) -> ThermalProfile {
+        let manifest = ThermalProfileManifest {
+            format: "chiaro-sensor-glow-profile".to_owned(),
+            version: PROFILE_VERSION,
+            source: "test".to_owned(),
+            sensor_family: "test".to_owned(),
+            width,
+            height,
+            grid_width: 5,
+            grid_height: 4,
+            reference_temperature_c: 43.0,
+            temperature_min_c: 36,
+            temperature_max_c: 49,
+            exposure_ns: 14_999_805_952,
+            exposure_min_ns: Some(4_999_935_488),
+            exposure_max_ns: Some(14_999_805_952),
+            reference_analog_gain: 6.25,
+            reference_digital_gain: 1.015625,
+            contributing_cameras: Vec::new(),
+            coefficients: "test".to_owned(),
+            coefficient_layout: "test".to_owned(),
+            orientation_rule: "test".to_owned(),
+        };
+        let mut coefficients = Vec::new();
+        for index in 0..20i32 {
+            coefficients.extend_from_slice(&((index * 37 % 23 - 11) * 90).to_le_bytes()[..2]);
+            coefficients.extend_from_slice(&((index * 17 % 13 - 6) * 300).to_le_bytes()[..2]);
+        }
+        ThermalProfile::from_parts(PathBuf::new(), manifest, coefficients).unwrap()
+    }
+
+    #[test]
+    fn tabulated_kernel_matches_reference_for_every_orientation_and_thread_count() {
+        let (width, height) = (37, 23);
+        let profile = bumpy_profile(width, height);
+        let samples = (0..width * height)
+            .map(|index| ((index * 7919 % 1000) as u16 + 10) << 6)
+            .collect::<Vec<_>>();
+        for (name, pattern) in [
+            ("A1", SensorPattern::Rggb),
+            ("A3", SensorPattern::Bggr),
+            ("B1", SensorPattern::Grbg),
+            ("B2", SensorPattern::Gbrg),
+            ("A2", SensorPattern::Mono),
+            ("C6", SensorPattern::Mono),
+        ] {
+            let camera = RawCamera {
+                id: 0,
+                name: name.to_owned(),
+                width,
+                height,
+                row_stride: 0,
+                absolute_offset: 0,
+                byte_len: 0,
+                pattern,
+                sensor_temperature_c: Some(40),
+                analog_gain: 3.0,
+                digital_gain: 1.0,
+                exposure_ns: 9_000_000_000,
+                black_level: 42.0,
+                white_level: 1023.0,
+            };
+            for rotated in [false, true] {
+                let mut expected = samples.clone();
+                reference_correct(&profile, &camera, &mut expected, 64, rotated);
+                for threads in [1, 3, 8] {
+                    let mut actual = samples.clone();
+                    let stats = if rotated {
+                        profile.correct_raw_plane_q6(&camera, &mut actual, threads)
+                    } else {
+                        profile.correct_plane(&camera, &mut actual, 64, false, threads)
+                    }
+                    .unwrap();
+                    assert!(stats.applied);
+                    assert_eq!(
+                        actual, expected,
+                        "{name} rotated={rotated} threads={threads}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

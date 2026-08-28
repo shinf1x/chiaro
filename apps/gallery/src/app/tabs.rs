@@ -13,8 +13,10 @@ impl GalleryApp {
             |ui| {
                 self.brand.show(ui);
                 header_divider(ui, tab_height);
+                let settings_width = 90.0;
                 egui::ScrollArea::horizontal()
                     .id_salt("source-tabs")
+                    .max_width((ui.available_width() - settings_width).max(40.0))
                     .max_height(header_height)
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
@@ -83,6 +85,15 @@ impl GalleryApp {
                             },
                         );
                     });
+                // The Settings tab sits at the far right, outside the
+                // scrolling strip of sources.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    Self::source_tab_frame(ui, self.active_tab == TabKey::Settings, |ui| {
+                        if ui.add(egui::Button::new("Settings").frame(false)).clicked() {
+                            selected = Some(TabKey::Settings);
+                        }
+                    });
+                });
             },
         );
 
@@ -110,11 +121,14 @@ impl GalleryApp {
         ui.separator();
         match self.active_tab.clone() {
             TabKey::FolderInput if self.folder_prompt_open => self.folder_controls(ui),
-            TabKey::FolderInput => {}
+            TabKey::FolderInput | TabKey::Settings => {}
             TabKey::Folder(id) => self.open_folder_controls(ui, id),
             TabKey::Device { location_id, mode } => self.device_controls(ui, location_id, mode),
         }
 
+        if self.active_tab == TabKey::Settings {
+            return;
+        }
         ui.add_space(3.0);
         let compact_preview_controls = ui.available_width() < 340.0;
         ui.horizontal(|ui| {
@@ -134,7 +148,13 @@ impl GalleryApp {
             );
             if has_captures && !compact_preview_controls {
                 ui.separator();
-                ui.label(format!("{} captures", self.current_view.items.len()));
+                let label = ui.label(format!("{} captures", self.current_view.items.len()));
+                if let Some(cache) = self.loader.thumbnail_cache() {
+                    label.on_hover_text(format!(
+                        "Thumbnails are cached in {}",
+                        cache.root().display()
+                    ));
+                }
             }
         });
         if compact_preview_controls && !self.current_view.items.is_empty() {
@@ -224,24 +244,38 @@ impl GalleryApp {
             .filter(|item| matches!(item.state, ItemState::Pending { .. }))
             .count();
         ui.horizontal(|ui| {
-            if contact_loading.is_some() || self.current_view.busy.is_some() || pending > 0 {
-                ui.spinner();
-            }
-            if let Some((message, _)) = &contact_loading {
-                ui.label(message);
-            } else if let Some(busy) = &self.current_view.busy {
-                ui.label(busy);
-            } else if let Some(status) = &self.current_view.status {
-                ui.label(RichText::new(status).color(Color32::from_gray(165)));
-            } else if pending > 0 {
-                ui.label(format!("Loading previews ({pending} remaining)"));
-            } else if !self.current_view.items.is_empty() {
-                ui.label("Ready");
-            }
-            if pending > 0 && self.current_view.busy.is_some() {
-                ui.separator();
-                ui.label(format!("{pending} previews queued"));
-            }
+            // Export controls anchor the right edge; the loading message and
+            // progress fill whatever remains on the left.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.export_controls(ui);
+                if !self.current_view.items.is_empty() {
+                    ui.separator();
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    if self.export_status(ui, pending) {
+                        return;
+                    }
+                    if contact_loading.is_some() || self.current_view.busy.is_some() || pending > 0
+                    {
+                        ui.spinner();
+                    }
+                    if let Some((message, _)) = &contact_loading {
+                        ui.label(message);
+                    } else if let Some(busy) = &self.current_view.busy {
+                        ui.label(busy);
+                    } else if pending > 0 {
+                        ui.label(format!("Loading previews ({pending} remaining)"));
+                    } else if let Some(status) = &self.current_view.status {
+                        ui.label(RichText::new(status).color(Color32::from_gray(165)));
+                    } else if !self.current_view.items.is_empty() {
+                        ui.label("Ready");
+                    }
+                    if pending > 0 && self.current_view.busy.is_some() {
+                        ui.separator();
+                        ui.label(format!("{pending} previews queued"));
+                    }
+                });
+            });
         });
         if let Some((_, Some(fraction))) = contact_loading {
             ui.add(egui::ProgressBar::new(fraction));

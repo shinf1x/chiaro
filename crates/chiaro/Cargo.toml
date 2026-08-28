@@ -10,3 +10,14 @@ chiaro-proto.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
 zune-jpeg.workspace = true
+
+[features]
+# Synthetic LRI generation for tests, examples, and UI development.
+mock = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[example]]
+name = "make_mock_lri"
+required-features = ["mock"]

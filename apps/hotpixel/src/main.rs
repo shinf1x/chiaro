@@ -1,36 +1,38 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use memmap2::Mmap;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
-use walkdir::WalkDir;
 
 use chiaro::lri::{RawCamera, SensorPattern, parse_raw_layout};
-use chiaro_hotpixel::cleanup::{
-    BuildCleanupProfileOptions, CleanupCameraProfile, CleanupCorrectionStats, CleanupProfile,
-    build_cleanup_profile,
+use chiaro_hotpixel_core::cleanup::{
+    BuildCleanupProfileOptions, CleanupProfile, build_cleanup_profile,
 };
-use chiaro_hotpixel::correct::{
-    CorrectionConfig, CorrectionMode, CorrectionStats, correct_hot_pixels_with_forced_map,
-    demosaic_bilinear,
-};
-use chiaro_hotpixel::hotpixel::HotpixelRec;
-use chiaro_hotpixel::png16::{write_gray16_native_atomic, write_rgb16_native_atomic};
-use chiaro_hotpixel::raw10::unpack_l16_10bit;
-use chiaro_hotpixel::thermal::{ThermalCorrectionStats, ThermalProfile};
-use chiaro_hotpixel::universal_hotpixel::{UniversalHotpixelProfile, UniversalHotpixelStats};
+use chiaro_hotpixel_core::correct::{CorrectionConfig, CorrectionMode};
+use chiaro_hotpixel_core::hotpixel::HotpixelRec;
+use chiaro_hotpixel_core::pipeline::{CleanupStage, FramePipeline, OutputMode};
+use chiaro_hotpixel_core::scan::{discover_lri_files, mmap_file, parse_pattern_overrides};
+use chiaro_hotpixel_core::thermal::ThermalProfile;
+use chiaro_hotpixel_core::universal_hotpixel::UniversalHotpixelProfile;
 
-#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum OutputMode {
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliOutputMode {
     /// Bayer cameras become linear 16-bit RGB PNGs through simple bilinear demosaicing.
     /// Monochrome cameras remain 16-bit grayscale.
     Rgb,
     /// Preserve Bayer mosaics as linear 16-bit grayscale PNGs.
     Mosaic,
+}
+
+impl From<CliOutputMode> for OutputMode {
+    fn from(value: CliOutputMode) -> Self {
+        match value {
+            CliOutputMode::Rgb => OutputMode::Rgb,
+            CliOutputMode::Mosaic => OutputMode::Mosaic,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -124,7 +126,7 @@ struct ExtractArgs {
 
     /// RGB is stacker-friendly. Mosaic preserves the corrected Bayer mosaic.
     #[arg(long, value_enum, default_value = "rgb")]
-    mode: OutputMode,
+    mode: CliOutputMode,
 
     /// Factory severity at which a coordinate becomes a correction candidate.
     #[arg(long, default_value_t = 16)]
@@ -157,6 +159,15 @@ struct ExtractArgs {
     /// Continue processing other frames after an error; exits nonzero at the end.
     #[arg(long)]
     continue_on_error: bool,
+
+    /// Worker threads per frame (rows are split across them); 0 uses every core.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// PNG deflate level 0-9. 0 stores rows uncompressed (fastest, ~2.3x larger);
+    /// 2 is the measured sweet spot; higher levels cost seconds per frame.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(0..=9))]
+    png_level: u32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -305,55 +316,6 @@ struct RunManifest {
     failures: Vec<FailureReport>,
 }
 
-fn mmap_file(path: &Path) -> Result<Mmap> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: the mapping is read-only and the File remains valid during creation.
-    unsafe { Mmap::map(&file) }.with_context(|| format!("memory-map {}", path.display()))
-}
-
-fn parse_pattern_overrides(values: &[String]) -> Result<HashMap<String, SensorPattern>> {
-    let mut result = HashMap::new();
-    for value in values {
-        let (camera, pattern) = value
-            .split_once('=')
-            .with_context(|| format!("pattern override must be CAMERA=PATTERN: {value}"))?;
-        result.insert(camera.to_ascii_uppercase(), SensorPattern::parse(pattern)?);
-    }
-    Ok(result)
-}
-
-fn discover_lri_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        bail!("input is not a directory: {}", root.display());
-    }
-    let mut files = Vec::new();
-    let walker = if recursive {
-        WalkDir::new(root)
-    } else {
-        WalkDir::new(root).max_depth(1)
-    };
-    for entry in walker.follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() && !entry.path().is_file() {
-            continue;
-        }
-        let is_lri = entry
-            .path()
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.eq_ignore_ascii_case("lri"))
-            .unwrap_or(false);
-        if is_lri {
-            files.push(entry.into_path());
-        }
-    }
-    files.sort();
-    if files.is_empty() {
-        bail!("no .lri files found under {}", root.display());
-    }
-    Ok(files)
-}
-
 fn sanitize_component(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for character in value.chars() {
@@ -480,10 +442,7 @@ fn process_frame(
     args: &ExtractArgs,
     job: &Job,
     severity_map: &[u8],
-    config: &CorrectionConfig,
-    cleanup: Option<&CleanupCameraProfile>,
-    universal_hotpixel: Option<&UniversalHotpixelProfile>,
-    thermal: Option<&ThermalProfile>,
+    pipeline: &FramePipeline<'_>,
 ) -> Result<FrameReport> {
     let camera_dir = args.output.join(&job.camera.name);
     fs::create_dir_all(&camera_dir)?;
@@ -493,6 +452,7 @@ fn process_frame(
         .unwrap_or(&output_path)
         .to_string_lossy()
         .to_string();
+    let mode = OutputMode::from(args.mode);
 
     if output_path.exists() {
         if args.resume {
@@ -503,13 +463,7 @@ fn process_frame(
                 pattern: job.camera.pattern.as_str().to_owned(),
                 width: job.camera.width,
                 height: job.camera.height,
-                png_color_type: if matches!(args.mode, OutputMode::Rgb)
-                    && job.camera.pattern != SensorPattern::Mono
-                {
-                    "RGB16"
-                } else {
-                    "GRAY16"
-                },
+                png_color_type: mode.png_color_type(job.camera.pattern),
                 status: "skipped-existing",
                 candidates: 0,
                 corrected: 0,
@@ -555,119 +509,14 @@ fn process_frame(
 
     let started = Instant::now();
     let mmap = mmap_file(&job.source)?;
-    let start = job.camera.absolute_offset;
-    let end = start + job.camera.byte_len;
-    if end > mmap.len() {
-        bail!("RAW span for {} lies outside the LRI", job.camera.name);
-    }
-    let expected_packed = job
-        .camera
-        .width
-        .checked_mul(job.camera.height)
-        .and_then(|samples| samples.checked_mul(5))
-        .map(|bytes| bytes / 4)
-        .context("RAW dimensions overflow")?;
-    if job.camera.byte_len != expected_packed {
-        bail!(
-            "{} uses a padded RAW stride ({} bytes, expected {}); this version supports tightly packed RAW10",
-            job.camera.name,
-            job.camera.byte_len,
-            expected_packed
-        );
-    }
-
-    let mut raw = unpack_l16_10bit(&mmap[start..end], job.camera.width * job.camera.height)?;
-    let mut cleanup_stats = CleanupCorrectionStats::default();
-    let (mut forced_map, universal_hotpixel_stats) = if let Some(profile) = universal_hotpixel {
-        let (active, stats) =
-            profile.active_map(&job.camera, severity_map, config.absolute_threshold as f32);
-        (stats.applied.then_some(active), stats)
-    } else {
-        (
-            None,
-            UniversalHotpixelStats {
-                reason: Some("bundled universal hotpixel model disabled".to_owned()),
-                requested_temperature_c: job.camera.sensor_temperature_c,
-                ..UniversalHotpixelStats::default()
-            },
-        )
-    };
-    let (stats, mut output_samples) = if let Some(profile) = cleanup {
-        let mut output_samples = raw.iter().map(|sample| sample << 6).collect::<Vec<_>>();
-        cleanup_stats = profile.correct_q6(
-            &job.camera,
-            &mut output_samples,
-            config.absolute_threshold as f32,
-        );
-        if let Ok(personal_map) =
-            profile.temperature_active_map(&job.camera, config.absolute_threshold as f32)
-        {
-            let combined = forced_map.get_or_insert_with(|| vec![false; personal_map.len()]);
-            for (active, personal) in combined.iter_mut().zip(personal_map) {
-                *active |= personal;
-            }
-        }
-        let mut q6_config = config.clone();
-        q6_config.absolute_threshold = config.absolute_threshold.saturating_mul(64);
-        let mut stats = correct_hot_pixels_with_forced_map(
-            &mut output_samples,
-            job.camera.width,
-            job.camera.height,
-            job.camera.pattern,
-            severity_map,
-            forced_map.as_deref(),
-            &q6_config,
-        )?;
-        stats.mean_absolute_change /= 64.0;
-        stats.maximum_absolute_change =
-            ((u32::from(stats.maximum_absolute_change) + 32) / 64) as u16;
-        (stats, output_samples)
-    } else {
-        let stats: CorrectionStats = correct_hot_pixels_with_forced_map(
-            &mut raw,
-            job.camera.width,
-            job.camera.height,
-            job.camera.pattern,
-            severity_map,
-            forced_map.as_deref(),
-            config,
-        )?;
-        // Promote RAW10 to Q6 before glow subtraction. The original samples remain
-        // exact multiples of 64, while the smooth model can retain sub-code detail.
-        let output_samples = raw.iter().map(|sample| sample << 6).collect::<Vec<_>>();
-        (stats, output_samples)
-    };
-    if cleanup.is_none() && args.cleanup_profile.is_some() {
-        cleanup_stats.reason = Some("cleanup profile has no entry for this camera".to_owned());
-    }
-    let mut thermal_stats = ThermalCorrectionStats::default();
-    if let Some(profile) = thermal {
-        output_samples.reverse();
-        thermal_stats = profile.correct_calibrated_plane_q6(&job.camera, &mut output_samples)?;
-        output_samples.reverse();
-    }
-
-    let png_color_type = match args.mode {
-        OutputMode::Rgb if job.camera.pattern != SensorPattern::Mono => {
-            let rgb = demosaic_bilinear(
-                &output_samples,
-                job.camera.width,
-                job.camera.height,
-                job.camera.pattern,
-            )?;
-            write_rgb16_native_atomic(&output_path, job.camera.width, job.camera.height, &rgb)?;
-            "RGB16"
-        }
-        _ => {
-            write_gray16_native_atomic(
-                &output_path,
-                job.camera.width,
-                job.camera.height,
-                &output_samples,
-            )?;
-            "GRAY16"
-        }
-    };
+    let frame = pipeline.correct_lri(&mmap, &job.camera, severity_map)?;
+    let png_color_type =
+        frame.write_png_with_options(&output_path, mode, args.threads, args.png_level)?;
+    let corrected_fraction = frame.corrected_fraction();
+    let stats = frame.hotpixel;
+    let universal_hotpixel_stats = frame.universal_hotpixel;
+    let thermal_stats = frame.thermal;
+    let cleanup_stats = frame.cleanup;
 
     Ok(FrameReport {
         source: job.source_relative.clone(),
@@ -691,7 +540,7 @@ fn process_frame(
         universal_hotpixel_analog_gain_scale: universal_hotpixel_stats.analog_gain_scale,
         universal_hotpixel_digital_gain_scale: universal_hotpixel_stats.digital_gain_scale,
         universal_hotpixel_active_pixels: universal_hotpixel_stats.active_pixels,
-        corrected_fraction: stats.corrected as f64 / raw.len() as f64,
+        corrected_fraction,
         mean_absolute_change: stats.mean_absolute_change,
         maximum_absolute_change: stats.maximum_absolute_change,
         thermal_applied: thermal_stats.applied,
@@ -878,6 +727,13 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
             .map(|profile| profile.load_camera(&first.camera))
             .transpose()?
             .flatten();
+        let pipeline = FramePipeline {
+            config: config.clone(),
+            universal_hotpixel: universal_hotpixel.as_ref(),
+            thermal: thermal.as_ref(),
+            cleanup: CleanupStage::from_loaded(cleanup.is_some(), cleanup_camera.as_ref()),
+            threads: args.threads,
+        };
         println!("{camera_name}: {} frames", jobs.len());
 
         for (index, job) in jobs.iter().enumerate() {
@@ -897,15 +753,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
                 continue;
             }
 
-            match process_frame(
-                &args,
-                job,
-                &map,
-                &config,
-                cleanup_camera.as_ref(),
-                universal_hotpixel.as_ref(),
-                thermal.as_ref(),
-            ) {
+            match process_frame(&args, job, &map, &pipeline) {
                 Ok(report) => {
                     println!(
                         "  [{:>3}/{}] {}: {} pixels corrected ({:.3}s)",
@@ -957,7 +805,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
             orientation: "rotate180",
         },
         settings: SettingsManifest {
-            output_mode: args.mode,
+            output_mode: OutputMode::from(args.mode),
             severity_threshold: args.severity_threshold,
             sigma_threshold: args.sigma_threshold,
             absolute_threshold: args.absolute_threshold,
@@ -967,10 +815,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
                 CliCorrectionMode::Replace => "replace",
             },
             png_scaling: "linear Q6 RAW codes; unmodified RAW10 samples are exact value << 6",
-            color_processing: match args.mode {
-                OutputMode::Rgb => "Bayer cameras: bilinear demosaic only; mono: grayscale",
-                OutputMode::Mosaic => "corrected RAW mosaic/grayscale; no demosaic",
-            },
+            color_processing: OutputMode::from(args.mode).color_processing(),
             glow_profile: if args.no_glow_correction {
                 None
             } else {

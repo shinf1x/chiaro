@@ -1,0 +1,18 @@
+[package]
+name = "chiaro-fusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-camera alignment and high-resolution frame synthesis for Light L16 captures"
+
+[dependencies]
+anyhow.workspace = true
+chiaro.workspace = true
+chiaro-hotpixel-core.workspace = true
+chiaro-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+chiaro = { workspace = true, features = ["mock"] }
+tempfile.workspace = true

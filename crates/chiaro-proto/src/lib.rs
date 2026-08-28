@@ -6,4 +6,4 @@
 mod proto;
 
 pub use proto::*;
-pub use protobuf::Message;
+pub use protobuf::{Enum, EnumOrUnknown, Message};

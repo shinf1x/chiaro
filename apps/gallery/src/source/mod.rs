@@ -41,6 +41,12 @@ const LIGHT_USB_IDS: [(u16, u16); 2] = [
     (LIGHT_VENDOR_ID, LIGHT_PTP_PRODUCT_ID),
 ];
 const CANCELLED_LOAD: &str = "camera load cancelled";
+/// Device calibration files worth mirroring from a connected camera: the
+/// hot-pixel record and the geometric/colour calibration used by fusion.
+pub const DEVICE_CALIBRATION_FILES: [&str; 3] =
+    ["hotpixel.rec", "calibration.lri", "zoom_calib_v0.lri"];
+/// Fixed `DCIM/Camera` child containing the L16's device-specific calibration files.
+pub const DEVICE_CALIBRATION_FOLDER: &str = "lightcal";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeviceMode {
@@ -77,6 +83,13 @@ pub struct RemoteObject {
     pub name: String,
     pub size: u64,
     device: LightDevice,
+}
+
+impl RemoteObject {
+    /// The camera this object lives on.
+    pub fn device(&self) -> &LightDevice {
+        &self.device
+    }
 }
 
 impl fmt::Debug for RemoteObject {
@@ -122,6 +135,9 @@ pub enum DeviceItemEvent {
         capture_name: String,
         preview: PreviewLocator,
     },
+    /// A factory calibration file (see `DEVICE_CALIBRATION_FILES`) found in
+    /// `DCIM/Camera/lightcal`.
+    Calibration(RemoteObject),
 }
 
 pub struct CapturePreviewUpdate {

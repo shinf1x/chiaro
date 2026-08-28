@@ -127,6 +127,20 @@ impl SensorPattern {
         }
     }
 
+    /// The pattern seen after rotating the raster by 180 degrees. Light's CFA
+    /// metadata describes the calibration raster; the decoded packed stream
+    /// is that raster rotated by 180 degrees, which for even-sized sensors
+    /// moves each colour to the diagonally opposite cell.
+    pub fn rotated_180(self) -> Self {
+        match self {
+            Self::Rggb => Self::Bggr,
+            Self::Bggr => Self::Rggb,
+            Self::Grbg => Self::Gbrg,
+            Self::Gbrg => Self::Grbg,
+            Self::Mono => Self::Mono,
+        }
+    }
+
     pub fn color_at(self, row: usize, column: usize) -> usize {
         if self == Self::Mono {
             return 0;
@@ -152,6 +166,11 @@ pub struct RawCamera {
     pub row_stride: usize,
     pub absolute_offset: usize,
     pub byte_len: usize,
+    /// Colour-filter layout in *calibration raster* coordinates (the decoded
+    /// stream rotated by 180 degrees), as recorded by the camera. Use
+    /// [`SensorPattern::rotated_180`] when indexing the stream-order plane by
+    /// colour; parity-only operations (same-colour neighbourhoods) are
+    /// unaffected.
     pub pattern: SensorPattern,
     /// Camera-module temperature in degrees Celsius at capture time.
     pub sensor_temperature_c: Option<i32>,
@@ -291,7 +310,11 @@ pub fn parse_raw_layout(
             .unwrap_or(0);
         let pattern = if let Some(pattern) = pattern_overrides.get(name) {
             *pattern
-        } else if matches!(sensor, 3 | 5) {
+        } else if matches!(sensor, 3 | 5)
+            || module.bayer_red.is_some_and(|red| !valid_bayer(Some(red)))
+        {
+            // A negative red position (`-1, -1`) is how the camera marks a
+            // module without a colour filter, whatever `hw_info` says.
             SensorPattern::Mono
         } else if let Some((red_x, red_y)) = module.bayer_red {
             match (red_x & 1, red_y & 1) {

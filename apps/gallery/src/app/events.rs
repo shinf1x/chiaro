@@ -270,6 +270,17 @@ impl GalleryApp {
                         capture,
                     );
                 }
+                LoadedEvent::DeviceCalibration(object) => {
+                    if let Some(key) = self.indexing_tab.clone()
+                        && let Some(view) = self.tab_view_mut(&key)
+                        && !view
+                            .device_calibration
+                            .iter()
+                            .any(|existing| existing.name.eq_ignore_ascii_case(&object.name))
+                    {
+                        view.device_calibration.push(object);
+                    }
+                }
                 LoadedEvent::DeviceProgress { fetched, total } => {
                     if let Some(key) = self.indexing_tab.clone()
                         && let Some(view) = self.tab_view_mut(&key)

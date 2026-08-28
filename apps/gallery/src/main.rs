@@ -1,4 +1,5 @@
 mod app;
+mod export;
 mod gallery;
 mod parallel;
 mod source;

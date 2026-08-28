@@ -538,8 +538,32 @@ version = "0.2.2"
 dependencies = [
  "chiaro-proto",
  "memmap2",
+ "tempfile",
  "thiserror 2.0.18",
  "zune-jpeg 0.3.17",
+]
+
+[[package]]
+name = "chiaro-fuse"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "chiaro-fusion",
+ "chiaro-hotpixel-core",
+ "clap",
+]
+
+[[package]]
+name = "chiaro-fusion"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "chiaro",
+ "chiaro-hotpixel-core",
+ "chiaro-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -547,11 +571,20 @@ name = "chiaro-gallery"
 version = "0.2.2"
 dependencies = [
  "chiaro",
+ "chiaro-fusion",
+ "chiaro-hotpixel-core",
  "eframe",
  "futures",
+ "image",
+ "libc",
  "mtp-rs",
  "nusb",
  "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "windows-sys 0.61.2",
  "zune-jpeg 0.3.17",
 ]
 
@@ -560,9 +593,21 @@ name = "chiaro-hotpixel"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "chiaro",
+ "chiaro-hotpixel-core",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "chiaro-hotpixel-core"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
  "byteorder",
  "chiaro",
- "clap",
+ "crc32fast",
  "flate2",
  "hex",
  "memmap2",
@@ -1538,6 +1583,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core 0.5.1",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]
