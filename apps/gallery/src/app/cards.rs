@@ -176,7 +176,6 @@ impl GalleryApp {
                 response.clone().on_hover_text(error);
             }
         }
-
         let name_rect = egui::Rect::from_min_max(
             egui::pos2(content.left(), image_rect.bottom() + 9.0),
             content.right_bottom(),
@@ -185,7 +184,8 @@ impl GalleryApp {
             ItemState::Ready { metadata, .. } => Some(metadata),
             _ => None,
         };
-        let icon_width = metadata.map_or(0.0, capture_icon_width);
+        let export_icon_width = if item.exported { 22.0 } else { 0.0 };
+        let icon_width = metadata.map_or(0.0, capture_icon_width) + export_icon_width;
         let filename_font = FontId::proportional(14.0);
         let filename_color = Color32::from_gray(225);
         ui.painter().text(
@@ -202,8 +202,13 @@ impl GalleryApp {
             filename_color,
         );
         if let Some(metadata) = metadata {
-            paint_capture_icons(ui, name_rect, metadata, fill);
+            let mut capture_icons_rect = name_rect;
+            capture_icons_rect.max.x -= export_icon_width;
+            paint_capture_icons(ui, capture_icons_rect, metadata, fill);
             paint_metadata(ui, name_rect, metadata);
+        }
+        if item.exported {
+            paint_exported_icon(ui, name_rect);
         }
 
         // Selection checkbox: hidden until the pointer comes close, always
@@ -234,9 +239,49 @@ impl GalleryApp {
         } else {
             None
         };
-        response.on_hover_text(&item.source.location_label);
+        response.on_hover_text(if item.exported {
+            format!("{}\nExported previously", item.source.location_label)
+        } else {
+            item.source.location_label.clone()
+        });
         action
     }
+}
+
+/// A quiet output-to-tray glyph keeps export history out of the photograph and
+/// visually separate from the blue selection checkbox.
+fn paint_exported_icon(ui: &egui::Ui, name_rect: egui::Rect) {
+    let center = name_rect.right_top() + Vec2::new(-9.0, 9.0);
+    let painter = ui.painter();
+    let color = Color32::from_rgb(190, 158, 94);
+    let stroke = Stroke::new(1.35_f32, color);
+    painter.line_segment(
+        [center + Vec2::new(0.0, -6.0), center + Vec2::new(0.0, 3.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-3.5, -2.5),
+            center + Vec2::new(0.0, -6.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(3.5, -2.5), center + Vec2::new(0.0, -6.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(-6.0, 1.0), center + Vec2::new(-6.0, 6.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(-6.0, 6.0), center + Vec2::new(6.0, 6.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(6.0, 6.0), center + Vec2::new(6.0, 1.0)],
+        stroke,
+    );
 }
 
 fn paint_checkbox(

@@ -15,6 +15,23 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 - **Chiaro Fuse** aligns the modules of a capture and synthesises one
   high-resolution frame.
 
+## Feature comparison
+
+✅ Available · 🟡 Limited/baseline · 🚧 Planned · ❌ Not available
+
+| Feature | Chiaro | Light Lumen |
+| --- | --- | --- |
+| Desktop support | ✅ Linux is primary; Windows and macOS release builds | ✅ Windows and macOS |
+| Access to captures | ✅ Browse folders or a connected L16 directly over PTP/MTP | ✅ Import captures from the camera |
+| Individual camera views | ✅ Contact sheet and full-resolution preview for every module | ❌ Not exposed |
+| Captures without companion `.lris` files | ✅ Builds a colour-calibrated preview from LRI RAW data | ❌ Not detected or processed |
+| Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
+| Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks | ❌ Not exposed |
+| Computational fusion | 🟡 Calibrated far-scene alignment and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
+| Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |
+| Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
+| Best fit | Open browsing, inspection, research, and per-module workflows | Finished-photo fusion and depth editing |
+
 The fusion pipeline currently assumes distant scenes. Near subjects may show
 parallax or ghosting, and depth-aware fusion is not yet implemented. Night
 captures are best processed as per-camera stacks with Chiaro Hotpixel.

@@ -383,6 +383,9 @@ fn run_job(
                 monitor.update(|progress| {
                     progress.outputs_written += usize::from(written);
                     progress.completed += 1;
+                    if let Some(identity) = &target.identity {
+                        progress.succeeded_hashes.push(identity.hash.clone());
+                    }
                 });
             }
             Err(error) => {
@@ -466,6 +469,7 @@ mod tests {
         let target = ExportTarget {
             name: "x.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x.lri")),
+            identity: None,
             frames: None,
         };
         assert_eq!(
@@ -522,6 +526,7 @@ mod tests {
         run_job(&export, &targets, &monitor).unwrap();
         let progress = monitor.progress.lock().unwrap().clone();
         assert!(progress.failures.is_empty(), "{:?}", progress.failures);
+        assert_eq!(progress.succeeded_hashes.len(), 1);
         assert!(dir.path().join("fused/L16_00001_fused.png").is_file());
         assert!(
             dir.path()

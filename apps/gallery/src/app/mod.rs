@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,7 +17,10 @@ use eframe::egui::{
 
 use crate::{
     export::{DeviceCalibration, ExportJob, ExportRegistry, FilePicker, PendingExport},
-    gallery::{GalleryItem, ItemState, LoadedEvent, PreviewKey, PreviewLoader},
+    gallery::{
+        GalleryItem, ItemState, LoadedEvent, PreviewKey, PreviewLoader, database::GalleryDatabase,
+        overlay::CaptureOverlayGeometry,
+    },
     source::{
         CaptureData, DeviceMode, DeviceMonitor, LightDevice, RemoteObject, SourceItem, local_items,
     },
@@ -134,6 +140,7 @@ enum ContactState {
         cameras: Vec<CameraPreview>,
         data: CaptureData,
         metadata: CaptureMetadata,
+        overlay_geometry: Option<CaptureOverlayGeometry>,
     },
     Failed(String),
 }
@@ -159,6 +166,8 @@ enum ModalImageState {
     Ready {
         texture: egui::TextureHandle,
         dimensions: [usize; 2],
+        color_calibrated: bool,
+        orientation: u64,
     },
     Failed(String),
 }
@@ -166,7 +175,13 @@ enum ModalImageState {
 impl GalleryApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let loader = PreviewLoader::new(cc.egui_ctx.clone());
+        let database = settings::database_path().and_then(|path| {
+            GalleryDatabase::open(&path)
+                .map(Arc::new)
+                .map_err(|error| eprintln!("gallery database {}: {error}", path.display()))
+                .ok()
+        });
+        let loader = PreviewLoader::new(cc.egui_ctx.clone(), database);
         let generation = loader.begin_source_load();
         let device_monitor = DeviceMonitor::new(cc.egui_ctx.clone());
         let folder_dialog = rfd::FileDialog::new().set_parent(cc);

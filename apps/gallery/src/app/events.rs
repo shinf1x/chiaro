@@ -87,6 +87,7 @@ impl GalleryApp {
                                 cameras,
                                 data: capture.data,
                                 metadata: capture.summary.metadata,
+                                overlay_geometry: capture.overlay_geometry,
                             };
                             if matches!(&sheet.state, ContactState::Ready { cameras, .. } if cameras
                                 .iter()

@@ -23,20 +23,37 @@ with **+ Folder...** or by dropping a folder or LRI file onto the application.
 Folder scans are non-recursive.
 
 Each capture card shows its main metadata and framed preview. Opening a card
-shows every camera module and, when present, every frame of a repeated
-night-mode capture. Full-resolution module previews support pan and zoom.
-Damaged or unsupported captures remain visible as error cards.
+shows all calibrated camera frames together on one translucent composite
+canvas. Embedded camera intrinsics, distortion, and module pose remap usable
+frames into the reference view; modules whose embedded geometry is incomplete
+fall back to focal-group scaling. Pointing at a frame in the list on the right
+draws that layer last without hiding the other frames; clicking either the list
+entry or canvas opens the existing full-resolution pan-and-zoom preview for
+that frame. A gold outline marks the final crop recorded by the camera, relative
+to the reference focal group. Colour previews use the calibration matrix and
+white balance embedded in the LRI. The traditional grid remains available by
+turning off **Show a combined calibrated frame overlay** in Settings. Damaged
+or unsupported captures remain visible as error cards.
+
+![Image Preview](../../assets/docs/gallery_image_preview.png)
 
 Decoded previews are cached in the platform cache directory. The **Settings**
 tab controls whether caching is enabled, its size limit, and cache clearing.
 Persistent settings are stored in the platform configuration directory as
 `chiaro/gallery.json`.
 
+An inspectable `gallery.sqlite3` database beside `gallery.json` indexes capture
+identity hashes, source and thumbnail paths, and successful exports. Thumbnail
+files are split across two hash-prefix directory levels so large collections do
+not put thousands of files in one directory.
+
 ## Exporting
 
 Select cards with their checkbox or non-image area; Shift-click extends the
 current selection range. Starting an export clears the selection. Additional
 exports can be added while another job is running and are processed in order.
+Cards that have been exported successfully show a muted bronze output icon
+beside their filename; the state persists through `gallery.sqlite3`.
 
 Available pipelines:
 
