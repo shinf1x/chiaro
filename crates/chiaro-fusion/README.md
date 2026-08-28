@@ -21,7 +21,8 @@ photometric, and timing diagnostics.
 Captures embed part of the camera model and take priority when their calibration
 is newer. Device `calibration.lri` and `zoom_calib_v0.lri` files fill important
 gaps, including mirror-aiming data. Supply both whenever possible; alignment is
-likely to be poor without them.
+likely to be poor without them. An overlay is merged only when its physical
+device id matches the capture.
 
 `hotpixel.rec` is optional at the fusion API level, but when enabled it must
 belong to the same physical camera.

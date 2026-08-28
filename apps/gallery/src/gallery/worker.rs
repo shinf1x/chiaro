@@ -328,8 +328,10 @@ fn load_capture(
     let overlay_geometry = match &data {
         CaptureData::Local(path) => chiaro_hotpixel_core::scan::mmap_file(path)
             .ok()
-            .and_then(|bytes| overlay::CaptureOverlayGeometry::from_lri(&bytes).ok()),
-        CaptureData::Memory(bytes) => overlay::CaptureOverlayGeometry::from_lri(bytes).ok(),
+            .and_then(|bytes| overlay::CaptureOverlayGeometry::from_lri_with_cache(&bytes).ok()),
+        CaptureData::Memory(bytes) => {
+            overlay::CaptureOverlayGeometry::from_lri_with_cache(bytes).ok()
+        }
     };
     Ok(LoadedCapture {
         summary,

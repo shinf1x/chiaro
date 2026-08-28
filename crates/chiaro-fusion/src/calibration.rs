@@ -13,7 +13,10 @@
 //! extrinsics are world-to-camera, the mirror matrix is camera-to-world, and
 //! `flip_img_around_x` selects which image axis a mirror reflects.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use anyhow::{Context, Result, bail};
 use chiaro::lri::inspect_lelr_block_header;
@@ -44,6 +47,27 @@ pub struct LriMessages {
     pub view_preferences: Vec<ViewPreferences>,
 }
 
+/// Stable identity of the physical L16 that produced an LRI. Device-specific
+/// calibration must never cross this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceId {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl DeviceId {
+    /// Filesystem-safe fixed-width representation.
+    pub fn cache_key(self) -> String {
+        format!("{:016x}{:016x}", self.high, self.low)
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.cache_key())
+    }
+}
+
 impl LriMessages {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut headers = Vec::new();
@@ -72,6 +96,16 @@ impl LriMessages {
         Ok(Self {
             headers,
             view_preferences,
+        })
+    }
+
+    /// Physical device recorded in this file, if both halves are present.
+    pub fn device_id(&self) -> Option<DeviceId> {
+        self.headers.iter().find_map(|header| {
+            Some(DeviceId {
+                low: header.device_unique_id_low?,
+                high: header.device_unique_id_high?,
+            })
         })
     }
 }
@@ -571,12 +605,17 @@ impl CalibrationDatabase {
     }
 
     /// Resolve from a capture plus optional overlay files (`calibration.lri`,
-    /// `zoom_calib_v0.lri`). The capture's headers take priority.
+    /// `zoom_calib_v0.lri`). The capture's headers take priority. Overlays are
+    /// accepted only when their physical-device id exactly matches the
+    /// capture, preventing accidental cross-camera calibration.
     pub fn from_capture_and_overlays(capture: &LriMessages, overlays: &[LriMessages]) -> Self {
-        let headers = capture
-            .headers
-            .iter()
-            .chain(overlays.iter().flat_map(|overlay| overlay.headers.iter()));
+        let device_id = capture.device_id();
+        let headers = capture.headers.iter().chain(
+            overlays
+                .iter()
+                .filter(|overlay| device_id.is_some() && overlay.device_id() == device_id)
+                .flat_map(|overlay| overlay.headers.iter()),
+        );
         Self::from_headers(headers)
     }
 

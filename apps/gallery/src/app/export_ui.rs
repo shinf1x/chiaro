@@ -4,11 +4,12 @@
 //! Everything pipeline-specific is behind `crate::export::ExportPipeline`;
 //! this file only hosts whichever pipeline the user picked.
 
-use std::{fs, path::PathBuf, thread};
+use std::{path::PathBuf, thread};
 
 use super::*;
 use crate::{
     export::{ExportEstimate, ExportSource, ExportTarget, ExportUiServices, disk, format_size},
+    gallery::calibration_cache,
     source::{ObjectLocator, read_preview},
 };
 
@@ -23,6 +24,8 @@ pub(super) struct ExportDialog {
     free_space: Option<Result<u64, String>>,
     /// USB location of the camera whose calibration files apply, if any.
     device_location: Option<u64>,
+    /// Exact device-matched persistent calibration for local captures.
+    cached_calibration: Option<DeviceCalibration>,
     source: ExportSource,
     /// Selected night-mode captures left out of the job.
     skipped_night: Vec<String>,
@@ -136,9 +139,22 @@ impl GalleryApp {
             TabKey::Device { .. } => ExportSource::Camera,
             _ => ExportSource::Folder,
         };
-        // Calibration comes from the camera the captures are on, or, for a
-        // folder, from any camera that is connected right now.
-        let device_location = self.connected_calibration_source();
+        // Remote captures use the camera they live on. Local captures use only
+        // a persistent calibration whose physical device id matches every
+        // selected LRI; an arbitrary connected camera is never substituted.
+        let device_location = (source == ExportSource::Camera)
+            .then(|| self.connected_calibration_source())
+            .flatten();
+        let target_device_id = targets.first().and_then(|first| {
+            let id = first.device_id?;
+            targets
+                .iter()
+                .all(|target| target.device_id == Some(id))
+                .then_some(id)
+        });
+        let cached_calibration = target_device_id
+            .and_then(|id| calibration_cache::load_for_device_id(id).ok().flatten())
+            .map(|cached| DeviceCalibration::Ready(cached.files));
         if let Some((location, objects)) = device_location.clone() {
             let should_download = !matches!(
                 self.device_calibrations.get(&location),
@@ -154,6 +170,7 @@ impl GalleryApp {
             free_space_dir: None,
             free_space: None,
             device_location: device_location.map(|(location, _)| location),
+            cached_calibration,
             source,
             skipped_night,
             error: None,
@@ -180,7 +197,7 @@ impl GalleryApp {
     }
 
     /// Copy the camera's calibration files into the local cache in the background.
-    fn download_device_calibration(
+    pub(super) fn download_device_calibration(
         &mut self,
         location: u64,
         objects: Vec<RemoteObject>,
@@ -197,22 +214,23 @@ impl GalleryApp {
             .find(|device| device.location_id == location)
             .and_then(|device| device.serial_number.clone())
             .unwrap_or_else(|| format!("usb-{location}"));
+        if let Ok(Some(cached)) = calibration_cache::load_for_label(&label) {
+            self.device_calibrations
+                .insert(location, DeviceCalibration::Ready(cached.files));
+            return;
+        }
+        hold.store(true, std::sync::atomic::Ordering::Release);
         thread::Builder::new()
             .name("chiaro-calibration-download".to_owned())
             .spawn(move || {
-                hold.store(true, std::sync::atomic::Ordering::Release);
                 let result = (|| {
-                    let dir = std::env::temp_dir().join("chiaro").join(sanitize(&label));
-                    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
                     let mut files = HashMap::new();
                     for object in objects {
                         let name = object.name.to_ascii_lowercase();
                         let bytes = read_preview(&ObjectLocator::Device(object))?;
-                        let path = dir.join(&name);
-                        fs::write(&path, bytes).map_err(|error| error.to_string())?;
-                        files.insert(name, path);
+                        files.insert(name, bytes);
                     }
-                    Ok::<_, String>(files)
+                    calibration_cache::store_device_files(&label, files).map(|cached| cached.files)
                 })();
                 hold.store(false, std::sync::atomic::Ordering::Release);
                 let _ = sender.send((location, result));
@@ -413,9 +431,20 @@ impl GalleryApp {
             .as_ref()
             .and_then(|result| result.as_ref().ok().copied());
         let insufficient = free.is_some_and(|free| estimate.bytes + FREE_SPACE_MARGIN > free);
+        if dialog.cached_calibration.is_none()
+            && let Some(device_id) = dialog.targets.first().and_then(|target| target.device_id)
+            && dialog
+                .targets
+                .iter()
+                .all(|target| target.device_id == Some(device_id))
+            && let Ok(Some(cached)) = calibration_cache::load_for_device_id(device_id)
+        {
+            dialog.cached_calibration = Some(DeviceCalibration::Ready(cached.files));
+        }
         let device_calibration = dialog
             .device_location
-            .and_then(|location| self.device_calibrations.get(&location));
+            .and_then(|location| self.device_calibrations.get(&location))
+            .or(dialog.cached_calibration.as_ref());
         let calibration_pending =
             matches!(device_calibration, Some(DeviceCalibration::Downloading));
         let will_queue = self.export_job.is_some() || !self.export_queue.is_empty();
@@ -714,23 +743,5 @@ fn disk_summary(
             Color32::from_rgb(225, 125, 125),
             "Not enough free space: choose another destination or export fewer captures.",
         );
-    }
-}
-
-fn sanitize(value: &str) -> String {
-    let cleaned = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if cleaned.is_empty() {
-        "camera".to_owned()
-    } else {
-        cleaned
     }
 }

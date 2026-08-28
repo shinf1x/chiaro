@@ -587,6 +587,7 @@ mod tests {
             name: "x.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x.lri")),
             identity: None,
+            device_id: None,
             frames,
         }
     }
@@ -766,5 +767,11 @@ mod tests {
         assert!(!field.is_from_camera());
         field.adopt(Some(&DeviceCalibration::Downloading), "calibration.lri");
         assert_eq!(field.value, "/my/own.rec");
+
+        let mut stale_automatic = CalibrationPath::default();
+        stale_automatic.adopt(Some(&ready), "hotpixel.rec");
+        stale_automatic.adopt(None, "hotpixel.rec");
+        assert!(stale_automatic.value.is_empty());
+        assert!(!stale_automatic.is_from_camera());
     }
 }
