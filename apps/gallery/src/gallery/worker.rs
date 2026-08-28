@@ -13,7 +13,7 @@ pub(super) fn worker(
             let receiver = queues.modal.lock().expect("modal task queue poisoned");
             receiver.try_recv().ok()
         };
-        if modal.is_none() && gallery_queue.device_indexing.load(Ordering::Acquire) {
+        if modal.is_none() && gallery_queue.preview_transport_busy() {
             thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
@@ -63,6 +63,7 @@ pub(super) fn worker(
                 let progress_ctx = ctx.clone();
                 let progress_key = key.clone();
                 let decoded = decode_preview_source(
+                    gallery_queue.thumbnails.as_deref(),
                     &source,
                     &capture,
                     max_edge,
@@ -170,6 +171,12 @@ pub(super) fn worker(
                                 preview,
                             });
                         }
+                        DeviceItemEvent::Calibration(object) => {
+                            let _ = progress_results.send(WorkerResult::DeviceCalibration {
+                                generation: list_generation,
+                                object,
+                            });
+                        }
                     },
                     |message| {
                         let _ = progress_results.send(WorkerResult::DeviceStatus {
@@ -179,7 +186,7 @@ pub(super) fn worker(
                         progress_ctx.request_repaint();
                     },
                     || active_generation.load(Ordering::Acquire) == task_generation,
-                    || gallery_queue.modal_loading.load(Ordering::Acquire),
+                    || gallery_queue.device_indexing_should_yield(),
                 );
                 gallery_queue
                     .device_indexing
@@ -250,16 +257,39 @@ fn preview_modal(key: &PreviewKey) -> Option<u64> {
     }
 }
 
+/// Decode a gallery preview, serving it from the thumbnail cache when the
+/// same capture was decoded before and storing fresh decodes for next time.
 fn decode_preview_source(
+    thumbnails: Option<&cache::ThumbnailCache>,
     source: &PreviewLocator,
     capture: &CaptureLocator,
     max_edge: usize,
-    on_progress: impl FnMut(u64, u64),
-    should_continue: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(u64, u64),
+    mut should_continue: impl FnMut() -> bool,
 ) -> Result<Option<PreviewImage>, String> {
-    match source {
+    let key = thumbnails.and_then(|_| cache::ThumbnailKey::for_preview(source, capture, max_edge));
+    if let (Some(cache), Some(key)) = (thumbnails, key.as_ref())
+        && let Some(preview) = cache.load(key)
+    {
+        return Ok(Some(preview));
+    }
+    let decoded = match source {
         PreviewLocator::Lri(locator) => {
-            decode_reference_source(locator, max_edge, on_progress, should_continue)
+            let mut decoded =
+                decode_reference_source(locator, max_edge, &mut on_progress, &mut should_continue)?;
+            // The reference module is the wide view; show what was framed. A
+            // local file is cheap to decode again at the edge the crop needs so
+            // the thumbnail keeps its resolution; a camera download is not.
+            if let (Some(preview), CaptureLocator::Local(_)) = (&decoded, locator)
+                && let Some(edge) = cache::framed_decode_edge(preview, max_edge)
+            {
+                decoded =
+                    decode_reference_source(locator, edge, &mut on_progress, &mut should_continue)?;
+            }
+            decoded.map(|mut preview| {
+                cache::crop_to_framing(&mut preview);
+                preview
+            })
         }
         PreviewLocator::Jpeg(locator) => {
             let bytes = read_preview(locator)?;
@@ -272,9 +302,15 @@ fn decode_preview_source(
             let orientation = metadata.orientation;
             preview.metadata = metadata;
             apply_preview_orientation(&mut preview, orientation);
-            Ok(Some(preview))
+            Some(preview)
         }
+    };
+    if let (Some(cache), Some(key), Some(preview)) = (thumbnails, key.as_ref(), decoded.as_ref())
+        && let Err(error) = cache.store(key, preview)
+    {
+        eprintln!("thumbnail cache: could not store {}: {error}", key.as_str());
     }
+    Ok(decoded)
 }
 
 fn load_capture(
@@ -333,4 +369,21 @@ fn decode_camera(
         }
     }
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_processing_does_not_pause_preview_workers_between_camera_transfers() {
+        let queue = GalleryQueueState::default();
+        assert!(!queue.preview_transport_busy());
+
+        queue.transport_hold.store(true, Ordering::Release);
+        assert!(queue.preview_transport_busy());
+
+        queue.transport_hold.store(false, Ordering::Release);
+        assert!(!queue.preview_transport_busy());
+    }
 }

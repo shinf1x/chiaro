@@ -12,8 +12,24 @@ path = "src/main.rs"
 [dependencies]
 eframe.workspace = true
 futures.workspace = true
+image.workspace = true
 chiaro.workspace = true
+chiaro-fusion.workspace = true
+chiaro-hotpixel-core.workspace = true
 mtp-rs.workspace = true
 nusb.workspace = true
 rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 zune-jpeg.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+chiaro = { workspace = true, features = ["mock"] }
+tempfile.workspace = true

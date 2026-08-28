@@ -19,6 +19,17 @@ Useful APIs include:
 `RawCamera` layout records include each module's sensor temperature, exposure,
 analogue/digital gain, and calibrated black/white levels for RAW correction.
 
+## Synthetic captures
+
+The optional `mock` feature adds `chiaro::mock`, which builds format-accurate
+LRIs (real LELR framing and recovered protobuf schemas) from generated pixel
+data. It exists for tests, UI development, and processing experiments when a
+real capture is too large to share:
+
+```bash
+cargo run -p chiaro --features mock --example make_mock_lri -- /tmp/mock_lris [count] [edge] [cameras]
+```
+
 ## Example
 
 ```bash

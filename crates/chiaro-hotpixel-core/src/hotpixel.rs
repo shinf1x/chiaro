@@ -139,6 +139,59 @@ impl HotpixelRec {
     }
 }
 
+/// Write a `hotpixel.rec` container from raw severity maps.
+///
+/// `maps` are `(width, height, row-major severity bytes)` in record order
+/// (`A1..A5, B1..B5, C1..C6`) in the factory orientation, that is, *before*
+/// the 180-degree rotation `load_rotated_map` applies. The footer is opaque to
+/// this crate and is written as zeros. Intended for tests and tooling.
+pub fn write_hotpixel_rec(path: impl AsRef<Path>, maps: &[(usize, usize, Vec<u8>)]) -> Result<()> {
+    use byteorder::WriteBytesExt;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    let mut records = Vec::new();
+    for (index, (width, height, severity)) in maps.iter().enumerate() {
+        if severity.len() != width * height {
+            bail!(
+                "record {index} has {} bytes; expected {width}x{height}",
+                severity.len()
+            );
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(severity)?;
+        let compressed = encoder.finish()?;
+        records.push((*width, *height, compressed));
+    }
+    let footer = vec![0u8; 16];
+    let footer_offset = FILE_HEADER_SIZE
+        + records
+            .iter()
+            .map(|(_, _, compressed)| MAP_HEADER_SIZE + compressed.len() as u64)
+            .sum::<u64>();
+    let total = footer_offset + footer.len() as u64;
+
+    let path = path.as_ref();
+    let mut output = std::io::BufWriter::new(
+        File::create(path).with_context(|| format!("create {}", path.display()))?,
+    );
+    output.write_all(MAGIC)?;
+    output.write_u64::<LittleEndian>(total)?;
+    output.write_u64::<LittleEndian>(footer_offset)?;
+    output.write_u64::<LittleEndian>(footer.len() as u64)?;
+    output.write_u32::<LittleEndian>(0)?;
+    for (width, height, compressed) in &records {
+        output.write_u64::<LittleEndian>(0)?;
+        output.write_u32::<LittleEndian>(compressed.len() as u32)?;
+        output.write_u32::<LittleEndian>(*width as u32)?;
+        output.write_u32::<LittleEndian>(*height as u32)?;
+        output.write_all(compressed)?;
+    }
+    output.write_all(&footer)?;
+    output.flush()?;
+    Ok(())
+}
+
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut digest = Sha256::new();
@@ -160,6 +213,30 @@ mod tests {
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn written_records_read_back_in_rotated_raw_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hotpixel.rec");
+        let maps = (0..16)
+            .map(|record| {
+                (
+                    4usize,
+                    2usize,
+                    (0..8).map(|i| (record * 8 + i) as u8).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_hotpixel_rec(&path, &maps).unwrap();
+
+        let rec = HotpixelRec::open(&path).unwrap();
+        assert_eq!(rec.records.len(), 16);
+        assert_eq!(rec.total_size, std::fs::metadata(&path).unwrap().len());
+        let mut expected = maps[5].2.clone();
+        expected.reverse();
+        assert_eq!(rec.load_rotated_map(5, 4, 2).unwrap(), expected);
+        assert!(rec.load_rotated_map(5, 2, 4).is_err());
+    }
 
     #[test]
     fn parses_and_rotates_a_synthetic_record() {

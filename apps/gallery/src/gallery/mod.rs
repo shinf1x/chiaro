@@ -17,11 +17,12 @@ use eframe::egui;
 use crate::parallel;
 use crate::source::{
     CaptureData, CaptureLocator, CapturePreviewUpdate, DeviceItemEvent, LightDevice,
-    PreviewLocator, SourceItem, apply_preview_orientation, decode_jpeg_preview,
+    PreviewLocator, RemoteObject, SourceItem, apply_preview_orientation, decode_jpeg_preview,
     decode_reference_source, device_items, read_capture_metadata, read_capture_with_updates,
     read_preview,
 };
 
+pub mod cache;
 mod worker;
 
 use worker::{camera_worker, preview_is_current, worker};
@@ -126,6 +127,10 @@ enum WorkerResult {
         capture_name: String,
         preview: PreviewLocator,
     },
+    DeviceCalibration {
+        generation: u64,
+        object: RemoteObject,
+    },
     DeviceProgress {
         generation: u64,
         fetched: usize,
@@ -149,6 +154,7 @@ impl WorkerResult {
             | Self::DeviceDone { generation, .. }
             | Self::DeviceItem { generation, .. }
             | Self::DevicePreview { generation, .. }
+            | Self::DeviceCalibration { generation, .. }
             | Self::DeviceProgress { generation, .. }
             | Self::DeviceStatus { generation, .. } => *generation,
         }
@@ -212,6 +218,8 @@ pub enum LoadedEvent {
         capture_name: String,
         preview: PreviewLocator,
     },
+    /// The connected camera's factory `hotpixel.rec`.
+    DeviceCalibration(RemoteObject),
     DeviceProgress {
         fetched: usize,
         total: usize,
@@ -226,6 +234,24 @@ struct GalleryQueueState {
     claimed: Mutex<HashSet<(u64, u64, u64)>>,
     device_indexing: AtomicBool,
     modal_loading: AtomicBool,
+    /// Raised by exports while they transfer from the camera. Gallery preview
+    /// loading pauses so the USB link is not shared with a bulk download.
+    transport_hold: Arc<AtomicBool>,
+    /// On-disk thumbnail cache, when a cache directory could be resolved.
+    thumbnails: Option<Arc<cache::ThumbnailCache>>,
+}
+
+impl GalleryQueueState {
+    /// Preview work keeps running during export processing. It yields only
+    /// while the camera transport is actually occupied by indexing, a modal
+    /// download, or an export/calibration transfer.
+    fn preview_transport_busy(&self) -> bool {
+        self.device_indexing.load(Ordering::Acquire) || self.transport_hold.load(Ordering::Acquire)
+    }
+
+    fn device_indexing_should_yield(&self) -> bool {
+        self.modal_loading.load(Ordering::Acquire) || self.transport_hold.load(Ordering::Acquire)
+    }
 }
 
 pub struct PreviewLoader {
@@ -266,7 +292,10 @@ impl PreviewLoader {
         let priority_rx = Arc::new(Mutex::new(priority_rx));
         let modal_rx = Arc::new(Mutex::new(modal_rx));
         let generation = Arc::new(AtomicU64::new(0));
-        let gallery_queue = Arc::new(GalleryQueueState::default());
+        let gallery_queue = Arc::new(GalleryQueueState {
+            thumbnails: cache::ThumbnailCache::platform().map(Arc::new),
+            ..GalleryQueueState::default()
+        });
         let active_modals = Arc::new(Mutex::new(HashSet::new()));
         let queues = WorkerQueues {
             tasks: task_rx,
@@ -472,6 +501,22 @@ impl PreviewLoader {
             .store(false, Ordering::Release);
     }
 
+    /// The on-disk thumbnail cache, if one is in use.
+    pub fn thumbnail_cache(&self) -> Option<&Arc<cache::ThumbnailCache>> {
+        self.gallery_queue.thumbnails.as_ref()
+    }
+
+    /// Flag exports raise while transferring from the camera; see
+    /// `GalleryQueueState::transport_hold`.
+    pub fn transport_hold(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.gallery_queue.transport_hold)
+    }
+
+    /// Whether an export or calibration copy currently owns the camera link.
+    pub fn export_transport_held(&self) -> bool {
+        self.gallery_queue.transport_hold.load(Ordering::Acquire)
+    }
+
     pub fn set_modal_loading(&self, loading: bool) {
         self.gallery_queue
             .modal_loading
@@ -570,6 +615,9 @@ impl PreviewLoader {
                     capture_name,
                     preview,
                 },
+                WorkerResult::DeviceCalibration { object, .. } => {
+                    LoadedEvent::DeviceCalibration(object)
+                }
                 WorkerResult::DeviceProgress { fetched, total, .. } => {
                     LoadedEvent::DeviceProgress { fetched, total }
                 }

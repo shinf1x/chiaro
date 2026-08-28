@@ -96,21 +96,28 @@ where
         if !should_continue() {
             return Ok(());
         }
-        let Some(camera_folder) = find_folder(&storage, &["DCIM", "Camera"])
+        let root = storage
+            .list_objects(None)
             .await
-            .map_err(|error| format!("Could not navigate L16 storage: {error}"))?
-        else {
+            .map_err(|error| format!("Could not list the L16 storage root: {error}"))?;
+        let Some(dcim_folder) = named_folder(&root, "DCIM") else {
             continue;
         };
+        let dcim = storage
+            .list_objects(Some(dcim_folder))
+            .await
+            .map_err(|error| format!("Could not list the L16 DCIM folder: {error}"))?;
+        let Some(camera_folder) = named_folder(&dcim, "Camera") else {
+            continue;
+        };
+        let storage = Arc::new(storage);
         let mut listing = storage
             .list_objects_stream(Some(camera_folder))
             .await
             .map_err(|error| format!("Could not list L16 DCIM/Camera: {error}"))?;
         let total = listing.total();
         on_progress(0, total);
-        let storage = Arc::new(storage);
-        let mut jpegs = HashMap::<String, ObjectInfo>::new();
-        let mut captures = HashMap::<String, String>::new();
+        let mut camera_objects = Vec::with_capacity(total);
         let mut fetched = 0;
         while should_continue() {
             while should_pause() && should_continue() {
@@ -124,6 +131,35 @@ where
             };
             let object = object.map_err(|error| format!("Could not list L16 files: {error}"))?;
             fetched += 1;
+            camera_objects.push(object);
+            if fetched % 16 == 0 || fetched == total {
+                on_progress(fetched, total);
+            }
+        }
+        // ObjectListing must be consumed or dropped before another storage
+        // request. Discover the fixed Camera/lightcal directory from that one
+        // pass, then fetch its three known files before thumbnail work begins.
+        drop(listing);
+        let calibration_folder = named_folder(&camera_objects, DEVICE_CALIBRATION_FOLDER);
+        match find_calibration_files(&storage, calibration_folder, &DEVICE_CALIBRATION_FILES).await
+        {
+            Ok(calibrations) => {
+                for calibration in calibrations {
+                    on_item(DeviceItemEvent::Calibration(remote_object(
+                        Arc::clone(&storage),
+                        descriptor,
+                        &calibration,
+                    )));
+                }
+            }
+            Err(error) => on_status(format!(
+                "Could not read the L16 DCIM/Camera/lightcal folder: {error}"
+            )),
+        }
+
+        let mut jpegs = HashMap::<String, ObjectInfo>::new();
+        let mut captures = HashMap::<String, String>::new();
+        for object in camera_objects {
             let path = Path::new(&object.filename);
             if has_extension(path, "jpg") || has_extension(path, "jpeg") {
                 if let Some(stem) = file_stem_lower(path) {
@@ -151,9 +187,6 @@ where
                     &object,
                     jpeg,
                 )));
-            }
-            if fetched % 16 == 0 || fetched == total {
-                on_progress(fetched, total);
             }
         }
         return Ok(());
@@ -237,22 +270,35 @@ async fn reset_light_transport(location_id: u64) {
     thread::sleep(Duration::from_secs(3));
 }
 
-async fn find_folder(
+/// Read the known factory calibration files from `DCIM/Camera/lightcal`.
+///
+/// The caller resolves the fixed folder handle; this function does not recurse.
+async fn find_calibration_files(
     storage: &Storage,
-    components: &[&str],
-) -> Result<Option<ObjectHandle>, mtp_rs::Error> {
-    let mut parent = None;
-    for component in components {
-        let objects = storage.list_objects(parent).await?;
-        let Some(folder) = objects
-            .into_iter()
-            .find(|object| object.is_folder() && object.filename.eq_ignore_ascii_case(component))
-        else {
-            return Ok(None);
-        };
-        parent = Some(folder.handle);
-    }
-    Ok(parent)
+    folder: Option<ObjectHandle>,
+    names: &[&str],
+) -> Result<Vec<ObjectInfo>, mtp_rs::Error> {
+    let Some(folder) = folder else {
+        return Ok(Vec::new());
+    };
+    Ok(storage
+        .list_objects(Some(folder))
+        .await?
+        .into_iter()
+        .filter(|object| {
+            !object.is_folder()
+                && names
+                    .iter()
+                    .any(|name| object.filename.eq_ignore_ascii_case(name))
+        })
+        .collect())
+}
+
+fn named_folder(objects: &[ObjectInfo], name: &str) -> Option<ObjectHandle> {
+    objects
+        .iter()
+        .find(|object| object.is_folder() && object.filename.eq_ignore_ascii_case(name))
+        .map(|object| object.handle)
 }
 
 fn device_source_item(

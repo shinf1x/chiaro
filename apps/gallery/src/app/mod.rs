@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
@@ -13,18 +13,25 @@ use eframe::egui::{
 };
 
 use crate::{
+    export::{DeviceCalibration, ExportJob, ExportRegistry, FilePicker, PendingExport},
     gallery::{GalleryItem, ItemState, LoadedEvent, PreviewKey, PreviewLoader},
-    source::{CaptureData, DeviceMode, DeviceMonitor, LightDevice, SourceItem, local_items},
+    source::{
+        CaptureData, DeviceMode, DeviceMonitor, LightDevice, RemoteObject, SourceItem, local_items,
+    },
 };
 
 mod branding;
 mod cards;
 mod events;
+mod export_ui;
 mod modal;
+mod settings;
 mod tabs;
 mod visuals;
 
+use export_ui::ExportDialog;
 use modal::{modal_state, upload_preview};
+use settings::Settings;
 use visuals::*;
 
 use branding::BrandTextures;
@@ -38,6 +45,7 @@ enum TabKey {
     Device { location_id: u64, mode: DeviceMode },
     FolderInput,
     Folder(u64),
+    Settings,
 }
 
 impl TabKey {
@@ -48,6 +56,10 @@ impl TabKey {
         }
     }
 }
+
+/// Result of mirroring a camera's calibration files: USB location and the
+/// local copies by lower-case file name.
+type CalibrationDownload = (u64, Result<HashMap<String, PathBuf>, String>);
 
 struct FolderTab {
     id: u64,
@@ -61,6 +73,12 @@ struct TabViewState {
     status: Option<String>,
     busy: Option<String>,
     listing_progress: Option<(usize, usize)>,
+    /// Ids of items marked for export.
+    selected: HashSet<u64>,
+    /// Item that anchors the next shift-click range.
+    selection_anchor: Option<u64>,
+    /// Factory calibration files located on the connected camera.
+    device_calibration: Vec<RemoteObject>,
 }
 
 pub struct GalleryApp {
@@ -85,6 +103,16 @@ pub struct GalleryApp {
     device_missing_since: Option<Instant>,
     contact_sheet: Option<ContactSheet>,
     next_modal_id: u64,
+    exports: ExportRegistry,
+    export_dialog: Option<ExportDialog>,
+    export_job: Option<ExportJob>,
+    export_queue: VecDeque<PendingExport>,
+    export_picker: FilePicker,
+    /// Camera `hotpixel.rec` copies keyed by USB location id.
+    device_calibrations: HashMap<u64, DeviceCalibration>,
+    calibration_downloads: Option<Receiver<CalibrationDownload>>,
+    calibration_sender: mpsc::Sender<CalibrationDownload>,
+    settings: Settings,
 }
 
 struct ContactSheet {
@@ -142,7 +170,9 @@ impl GalleryApp {
         let generation = loader.begin_source_load();
         let device_monitor = DeviceMonitor::new(cc.egui_ctx.clone());
         let folder_dialog = rfd::FileDialog::new().set_parent(cc);
-        Self {
+        let export_picker = FilePicker::new(folder_dialog.clone());
+        let (calibration_sender, calibration_downloads) = mpsc::channel();
+        let app = Self {
             brand: BrandTextures::new(&cc.egui_ctx),
             active_tab: TabKey::FolderInput,
             current_view: TabViewState::default(),
@@ -164,7 +194,18 @@ impl GalleryApp {
             device_missing_since: None,
             contact_sheet: None,
             next_modal_id: 1,
-        }
+            exports: ExportRegistry::new(),
+            export_dialog: None,
+            export_job: None,
+            export_queue: VecDeque::new(),
+            export_picker,
+            device_calibrations: HashMap::new(),
+            calibration_downloads: Some(calibration_downloads),
+            calibration_sender,
+            settings: Settings::load(),
+        };
+        app.apply_settings();
+        app
     }
 
     fn open_folder_input(&mut self) {
@@ -222,7 +263,7 @@ impl GalleryApp {
     fn load_active_tab(&mut self) {
         self.current_view = TabViewState::default();
         match self.active_tab.clone() {
-            TabKey::FolderInput => {}
+            TabKey::FolderInput | TabKey::Settings => {}
             TabKey::Folder(id) => {
                 let Some(folder) = self
                     .folder_tabs
@@ -342,6 +383,9 @@ impl GalleryApp {
                     .cloned();
                 let disconnected = previous.iter().any(|old| !devices.contains(old));
                 if let Some(device) = newly_connected {
+                    // A different camera can appear at the same USB location;
+                    // never reuse calibration copied for the previous device.
+                    self.device_calibrations.remove(&device.location_id);
                     self.device_missing_since = None;
                     self.devices = devices;
                     if self.current_view.loaded {
@@ -406,6 +450,7 @@ impl GalleryApp {
         };
         self.devices
             .retain(|device| device.location_id != location_id || device.mode != mode);
+        self.device_calibrations.remove(&location_id);
         self.saved_views
             .remove(&TabKey::Device { location_id, mode });
         self.active_tab = TabKey::FolderInput;
@@ -488,6 +533,7 @@ impl eframe::App for GalleryApp {
         self.receive_events(ctx);
         self.retry_device_if_due(ctx);
         self.expire_missing_device(ctx);
+        self.poll_exports(ctx);
 
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -514,7 +560,9 @@ impl eframe::App for GalleryApp {
                     .inner_margin(Margin::same(18)),
             )
             .show(ctx, |ui| {
-                if self.current_view.items.is_empty() {
+                if self.active_tab == TabKey::Settings {
+                    self.settings_view(ui);
+                } else if self.current_view.items.is_empty() {
                     if self.current_view.busy.is_none() && self.current_view.status.is_none() {
                         ui.centered_and_justified(|ui| {
                             ui.label(
@@ -532,5 +580,6 @@ impl eframe::App for GalleryApp {
             });
 
         self.show_contact_sheet(ctx, status_panel.response.rect.top());
+        self.show_export_dialog(ctx, status_panel.response.rect.top());
     }
 }

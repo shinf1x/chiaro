@@ -1,0 +1,16 @@
+[package]
+name = "chiaro-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fuse the cameras of a Light L16 capture into one high-resolution frame"
+
+[[bin]]
+name = "chiaro-fuse"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+chiaro-fusion.workspace = true
+chiaro-hotpixel-core.workspace = true

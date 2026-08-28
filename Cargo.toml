@@ -2,10 +2,13 @@
 members = [
     "crates/chiaro",
     "crates/chiaro-proto",
+    "crates/chiaro-hotpixel-core",
+    "crates/chiaro-fusion",
     "apps/gallery",
     "apps/hotpixel",
+    "apps/fuse",
 ]
-default-members = ["apps/gallery", "apps/hotpixel"]
+default-members = ["apps/gallery", "apps/hotpixel", "apps/fuse"]
 resolver = "3"
 
 [workspace.package]
@@ -17,12 +20,17 @@ license = "MIT"
 anyhow = "1.0"
 byteorder = "1.5"
 clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 flate2 = "1.0"
 futures = "0.3.31"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+libc = "0.2"
 chiaro = { path = "crates/chiaro" }
 chiaro-proto = { path = "crates/chiaro-proto" }
+chiaro-hotpixel-core = { path = "crates/chiaro-hotpixel-core" }
+chiaro-fusion = { path = "crates/chiaro-fusion" }
 memmap2 = "0.9.10"
 mtp-rs = "0.25.0"
 nusb = { version = "0.2.5", default-features = false }
@@ -35,6 +43,7 @@ sha2 = "0.10"
 tempfile = "3.12"
 thiserror = "2.0.18"
 walkdir = "2.5"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zune-jpeg = { version = "0.3.17", default-features = false, features = ["std", "x86"] }
 
