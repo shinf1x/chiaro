@@ -19,6 +19,7 @@ use crate::{
     export::{DeviceCalibration, ExportJob, ExportRegistry, FilePicker, PendingExport},
     gallery::{
         GalleryItem, ItemState, LoadedEvent, PreviewKey, PreviewLoader, database::GalleryDatabase,
+        overlay::CaptureOverlayGeometry,
     },
     source::{
         CaptureData, DeviceMode, DeviceMonitor, LightDevice, RemoteObject, SourceItem, local_items,
@@ -139,6 +140,7 @@ enum ContactState {
         cameras: Vec<CameraPreview>,
         data: CaptureData,
         metadata: CaptureMetadata,
+        overlay_geometry: Option<CaptureOverlayGeometry>,
     },
     Failed(String),
 }
@@ -165,6 +167,7 @@ enum ModalImageState {
         texture: egui::TextureHandle,
         dimensions: [usize; 2],
         color_calibrated: bool,
+        orientation: u64,
     },
     Failed(String),
 }

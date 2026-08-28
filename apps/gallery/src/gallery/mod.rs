@@ -24,6 +24,7 @@ use crate::source::{
 
 pub mod cache;
 pub mod database;
+pub mod overlay;
 mod worker;
 
 use database::{CaptureIdentity, GalleryDatabase};
@@ -188,6 +189,7 @@ pub enum PreviewKey {
 pub struct LoadedCapture {
     pub summary: CaptureSummary,
     pub data: CaptureData,
+    pub overlay_geometry: Option<overlay::CaptureOverlayGeometry>,
 }
 
 pub enum LoadedEvent {

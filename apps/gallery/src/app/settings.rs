@@ -15,7 +15,7 @@ use crate::gallery::cache::{DEFAULT_LIMIT_BYTES, TYPICAL_ENTRY_BYTES};
 pub struct Settings {
     pub thumbnail_cache_enabled: bool,
     pub thumbnail_cache_limit_mb: u64,
-    /// Present capture frames as a calibrated stack with a hoverable frame list.
+    /// Present capture frames as a calibrated composite with a hoverable layer list.
     pub stacked_capture_preview: bool,
 }
 
@@ -87,7 +87,7 @@ impl GalleryApp {
         ui.label(RichText::new("Capture previews").strong());
         ui.checkbox(
             &mut self.settings.stacked_capture_preview,
-            "Show a calibrated frame stack with a hoverable frame list",
+            "Show a combined calibrated frame overlay with a hoverable frame list",
         );
         ui.label(
             RichText::new("Turn this off to use the traditional grid of individual camera frames.")

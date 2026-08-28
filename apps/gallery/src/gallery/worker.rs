@@ -325,7 +325,17 @@ fn load_capture(
         CaptureData::Memory(bytes) => inspect_capture_bytes(bytes),
     }
     .map_err(|error| error.to_string())?;
-    Ok(LoadedCapture { summary, data })
+    let overlay_geometry = match &data {
+        CaptureData::Local(path) => chiaro_hotpixel_core::scan::mmap_file(path)
+            .ok()
+            .and_then(|bytes| overlay::CaptureOverlayGeometry::from_lri(&bytes).ok()),
+        CaptureData::Memory(bytes) => overlay::CaptureOverlayGeometry::from_lri(bytes).ok(),
+    };
+    Ok(LoadedCapture {
+        summary,
+        data,
+        overlay_geometry,
+    })
 }
 
 pub(super) fn preview_is_current(
