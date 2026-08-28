@@ -164,6 +164,7 @@ enum ModalImageState {
     Ready {
         texture: egui::TextureHandle,
         dimensions: [usize; 2],
+        color_calibrated: bool,
     },
     Failed(String),
 }

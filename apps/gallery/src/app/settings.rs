@@ -11,9 +11,12 @@ use super::*;
 use crate::gallery::cache::{DEFAULT_LIMIT_BYTES, TYPICAL_ENTRY_BYTES};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub thumbnail_cache_enabled: bool,
     pub thumbnail_cache_limit_mb: u64,
+    /// Present capture frames as a calibrated stack with a hoverable frame list.
+    pub stacked_capture_preview: bool,
 }
 
 impl Default for Settings {
@@ -21,6 +24,7 @@ impl Default for Settings {
         Self {
             thumbnail_cache_enabled: true,
             thumbnail_cache_limit_mb: DEFAULT_LIMIT_BYTES / 1_000_000,
+            stacked_capture_preview: true,
         }
     }
 }
@@ -80,6 +84,17 @@ impl GalleryApp {
         let before = self.settings.clone();
         ui.heading("Settings");
         ui.add_space(8.0);
+        ui.label(RichText::new("Capture previews").strong());
+        ui.checkbox(
+            &mut self.settings.stacked_capture_preview,
+            "Show a calibrated frame stack with a hoverable frame list",
+        );
+        ui.label(
+            RichText::new("Turn this off to use the traditional grid of individual camera frames.")
+                .color(Color32::from_gray(150))
+                .size(12.0),
+        );
+        ui.add_space(16.0);
         ui.label(RichText::new("Thumbnail cache").strong());
         match self.loader.thumbnail_cache().cloned() {
             None => {
@@ -161,8 +176,17 @@ mod tests {
     fn settings_round_trip_and_default_limit() {
         let settings = Settings::default();
         assert_eq!(settings.limit_bytes(), 500 * 1_000_000);
+        assert!(settings.stacked_capture_preview);
         let json = serde_json::to_string(&settings).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), settings);
+        let old_json = r#"{
+            "thumbnail_cache_enabled": false,
+            "thumbnail_cache_limit_mb": 750
+        }"#;
+        let upgraded = serde_json::from_str::<Settings>(old_json).unwrap();
+        assert!(!upgraded.thumbnail_cache_enabled);
+        assert_eq!(upgraded.thumbnail_cache_limit_mb, 750);
+        assert!(upgraded.stacked_capture_preview);
         assert!(
             settings_path().is_none_or(|p| p.ends_with(Path::new("chiaro").join("gallery.json")))
         );

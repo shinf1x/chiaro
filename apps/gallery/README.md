@@ -23,9 +23,13 @@ with **+ Folder...** or by dropping a folder or LRI file onto the application.
 Folder scans are non-recursive.
 
 Each capture card shows its main metadata and framed preview. Opening a card
-shows every camera module and, when present, every frame of a repeated
-night-mode capture. Full-resolution module previews support pan and zoom.
-Damaged or unsupported captures remain visible as error cards.
+shows calibrated camera frames as an overlapping stack. Pointing at a frame in
+the list on the right brings it to the top; clicking either the list entry or
+the top frame opens the existing full-resolution pan-and-zoom preview. Colour
+previews use the calibration matrix and white balance embedded in the LRI.
+The traditional grid remains available by turning off **Show a calibrated frame
+stack** in Settings. Damaged or unsupported captures remain visible as error
+cards.
 
 Decoded previews are cached in the platform cache directory. The **Settings**
 tab controls whether caching is enabled, its size limit, and cache clearing.
