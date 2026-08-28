@@ -14,6 +14,12 @@ enum Color {
     Linear,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Intrinsics {
+    LinearHall,
+    Clamp,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "chiaro-fuse",
@@ -69,6 +75,10 @@ struct Cli {
     #[arg(long)]
     no_refine: bool,
 
+    /// Focus calibration outside the measured Hall range.
+    #[arg(long, value_enum, default_value = "linear-hall")]
+    intrinsics: Intrinsics,
+
     /// Skip the factory flat-field (vignetting) correction.
     #[arg(long)]
     no_flat_field: bool,
@@ -100,7 +110,10 @@ fn main() -> Result<()> {
     let mut options = FusionOptions {
         reference: cli.reference.clone(),
         overlays: cli.overlays.clone(),
-        intrinsics_mode: IntrinsicsMode::Clamp,
+        intrinsics_mode: match cli.intrinsics {
+            Intrinsics::LinearHall => IntrinsicsMode::LinearHall,
+            Intrinsics::Clamp => IntrinsicsMode::Clamp,
+        },
         hotpixel: cli.hotpixel_rec.clone().map(|rec| HotpixelStage {
             rec,
             universal_model: !cli.no_universal_hotpixel_model,

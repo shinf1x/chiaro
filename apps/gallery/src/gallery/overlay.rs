@@ -69,7 +69,7 @@ impl CaptureOverlayGeometry {
                 let camera = ResolvedCamera::new(
                     model,
                     &state,
-                    IntrinsicsMode::Clamp,
+                    IntrinsicsMode::LinearHall,
                     &CameraRefinement::default(),
                 )
                 .ok()?;

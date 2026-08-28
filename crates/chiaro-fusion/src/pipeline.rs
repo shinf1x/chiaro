@@ -74,7 +74,7 @@ impl Default for FusionOptions {
         Self {
             reference: None,
             overlays: Vec::new(),
-            intrinsics_mode: IntrinsicsMode::Clamp,
+            intrinsics_mode: IntrinsicsMode::LinearHall,
             hotpixel: None,
             cameras: Vec::new(),
             align: AlignOptions::default(),
@@ -219,6 +219,16 @@ fn framing_crop(
     )
 }
 
+/// Blend confidence for an accepted refined alignment. The synthesis stage
+/// already rewards resolution by magnification squared; this counterweight
+/// stops a barely supported tele frame from overwhelming the reference.
+fn correspondence_confidence(inlier_ratio: f32, minimum: f32) -> f32 {
+    let minimum = minimum.clamp(0.0, 1.0);
+    let reliable = (minimum + 0.25).min(1.0);
+    let t = ((inlier_ratio - minimum) / (reliable - minimum).max(1e-3)).clamp(0.0, 1.0);
+    (t * t * (3.0 - 2.0 * t)).max(0.05)
+}
+
 struct LoadedModule {
     raw: RawCamera,
     mosaic: Mosaic,
@@ -351,7 +361,7 @@ pub fn fuse(
                 .and_then(|c| c.vignetting.as_ref())
         {
             let mirror_hall = state.as_ref().map_or(0.0, |s| s.mirror_hall);
-            mosaic.vignetting = vignetting.mesh_for_hall(mirror_hall).cloned();
+            mosaic.vignetting = vignetting.mesh_for_hall(mirror_hall);
             if !mosaic.is_mono() {
                 mosaic.crosstalk = vignetting.crosstalk.clone();
             }
@@ -463,7 +473,7 @@ pub fn fuse(
     // (mirror-path glare, colour shading).
     let mut gain_fields = vec![GainField::identity(); modules.len()];
     for index in 0..modules.len() {
-        if modules[index].raw.name != reference_name {
+        if modules[index].raw.name != reference_name && alignments[index].report.accepted {
             let (gain, offset) = photometric_match(
                 &modules[reference_index].mosaic,
                 &module_colors[reference_index],
@@ -474,6 +484,15 @@ pub fn fuse(
             alignments[index].gain = gain;
             alignments[index].offset = offset;
             if options.local_photometric {
+                // A narrow module sees too little of the reference to
+                // constrain a full-frame gain grid. Use one robust XYZ gain
+                // over its measured overlap instead of extrapolating sparse
+                // cells, which produced strong magenta/green blocks.
+                let (columns, rows) = if alignments[index].report.coverage >= 0.5 {
+                    (GAIN_FIELD_COLUMNS, GAIN_FIELD_ROWS)
+                } else {
+                    (1, 1)
+                };
                 gain_fields[index] = photometric_field(
                     &modules[reference_index].mosaic,
                     &module_colors[reference_index],
@@ -482,8 +501,8 @@ pub fn fuse(
                     &alignments[index].warp,
                     gain,
                     offset,
-                    GAIN_FIELD_COLUMNS,
-                    GAIN_FIELD_ROWS,
+                    columns,
+                    rows,
                 );
             }
         }
@@ -520,13 +539,26 @@ pub fn fuse(
             .unwrap_or_else(|| nominal_focal_px(&module.raw.name))
             / reference_focal) as f32
     };
+    let synthesis_confidence = |alignment: &ModuleAlignment| {
+        if !options.align.refine || alignment.name == reference_name {
+            return 1.0;
+        }
+        // Smoothly suppress barely accepted modules. A small floor lets them
+        // fill otherwise uncovered areas without allowing a high-resolution
+        // but low-consensus tele frame to dominate the reference.
+        correspondence_confidence(
+            alignment.report.inlier_ratio,
+            options.align.min_inlier_ratio,
+        )
+    };
     // The finest module that intersects the framed view decides the maximum
     // useful canvas resolution ("as much detail as any module provides").
     let finest = modules
         .iter()
         .zip(&alignments)
         .filter(|(module, alignment)| {
-            (options.synth.include_mono || !module.mosaic.is_mono())
+            alignment.report.accepted
+                && (options.synth.include_mono || !module.mosaic.is_mono())
                 && intersects_crop(alignment, module, &crop)
         })
         .map(|(module, _)| magnification(module))
@@ -548,10 +580,12 @@ pub fn fuse(
         .iter()
         .zip(&alignments)
         .zip(module_colors.iter().zip(&gain_fields))
+        .filter(|((_, alignment), _)| alignment.report.accepted)
         .map(|((module, alignment), (color, gain_field))| SynthSource {
             mosaic: &module.mosaic,
             alignment,
             magnification: magnification(module),
+            confidence: synthesis_confidence(alignment),
             color: *color,
             gain_field: gain_field.clone(),
         })
@@ -596,5 +630,14 @@ mod tests {
         assert_eq!(b.width, 2_800.0);
         assert_eq!(b.height, 2_100.0);
         assert_eq!(c, CropWindow::full(4_000, 3_000));
+    }
+
+    #[test]
+    fn correspondence_confidence_only_rewards_clear_consensus() {
+        let minimum = 0.45;
+        assert_eq!(correspondence_confidence(minimum, minimum), 0.05);
+        assert!((correspondence_confidence(0.575, minimum) - 0.5).abs() < 1e-6);
+        assert_eq!(correspondence_confidence(0.70, minimum), 1.0);
+        assert_eq!(correspondence_confidence(0.90, minimum), 1.0);
     }
 }

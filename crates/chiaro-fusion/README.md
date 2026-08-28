@@ -24,6 +24,11 @@ gaps, including mirror-aiming data. Supply both whenever possible; alignment is
 likely to be poor without them. An overlay is merged only when its physical
 device id matches the capture.
 
+Focus-dependent intrinsics are interpolated in lens Hall space and continued
+linearly just beyond the factory samples, matching the validated reconstruction
+model. The CLI's diagnostic `--intrinsics clamp` mode freezes out-of-range
+captures at the nearest sample instead.
+
 `hotpixel.rec` is optional at the fusion API level, but when enabled it must
 belong to the same physical camera.
 
