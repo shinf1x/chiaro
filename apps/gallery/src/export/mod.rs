@@ -24,6 +24,7 @@ use std::{
 };
 
 use chiaro::lri::{SensorPattern, parse_raw_layout};
+use chiaro_fusion::calibration::{DeviceId, LriMessages};
 use eframe::egui;
 
 use crate::{gallery::database::CaptureIdentity, source::CaptureLocator};
@@ -43,6 +44,9 @@ pub struct ExportTarget {
     pub capture: CaptureLocator,
     /// Cheap stable identity used by the export-history catalog.
     pub identity: Option<CaptureIdentity>,
+    /// Physical camera recorded in the LRI. Automatic calibration is enabled
+    /// only when every target agrees on this id.
+    pub device_id: Option<DeviceId>,
     /// RAW frames in the capture when they could be probed cheaply. `None`
     /// for remote captures that would require a full download to inspect.
     pub frames: Option<Vec<FrameInfo>>,
@@ -53,14 +57,15 @@ impl ExportTarget {
     /// RAW layout so estimates can be exact.
     pub fn new(name: String, capture: CaptureLocator) -> Self {
         let identity = CaptureIdentity::for_capture(&capture);
-        let frames = match &capture {
-            CaptureLocator::Local(path) => probe_frames(path),
-            CaptureLocator::Device(_) => None,
+        let (frames, device_id) = match &capture {
+            CaptureLocator::Local(path) => (probe_frames(path), probe_device_id(path)),
+            CaptureLocator::Device(_) => (None, None),
         };
         Self {
             name,
             capture,
             identity,
+            device_id,
             frames,
         }
     }
@@ -85,6 +90,11 @@ impl ExportTarget {
             output
         }
     }
+}
+
+fn probe_device_id(path: &Path) -> Option<DeviceId> {
+    let mmap = chiaro_hotpixel_core::scan::mmap_file(path).ok()?;
+    LriMessages::parse(&mmap).ok()?.device_id()
 }
 
 /// Shape of one RAW frame, enough for output-size estimates.
@@ -401,6 +411,10 @@ pub struct CalibrationPath {
 impl CalibrationPath {
     pub fn adopt(&mut self, calibration: Option<&DeviceCalibration>, file_name: &str) {
         let Some(path) = calibration.and_then(|c| c.file(file_name)) else {
+            if self.is_from_camera() {
+                self.value.clear();
+                self.adopted = None;
+            }
             return;
         };
         let untouched = self.value.trim().is_empty()
@@ -640,7 +654,7 @@ pub fn calibration_status(
                     RichText::new(match services.source {
                         ExportSource::Camera => format!("Using the camera's own {file_name}."),
                         ExportSource::Folder => {
-                            format!("Using {file_name} from the connected camera.")
+                            format!("Using cached device-matched {file_name}.")
                         }
                     })
                     .color(Color32::from_rgb(105, 205, 135))
@@ -718,6 +732,7 @@ mod tests {
             name: "L16_04480.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x/L16_04480.lri")),
             identity: None,
+            device_id: None,
             frames: None,
         };
         assert_eq!(target.stem(), "L16_04480");
@@ -725,6 +740,7 @@ mod tests {
             name: "night sky (1).LRI".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x/y")),
             identity: None,
+            device_id: None,
             frames: None,
         };
         assert_eq!(odd.stem(), "night_sky__1_");

@@ -13,7 +13,10 @@
 //! extrinsics are world-to-camera, the mirror matrix is camera-to-world, and
 //! `flip_img_around_x` selects which image axis a mirror reflects.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use anyhow::{Context, Result, bail};
 use chiaro::lri::inspect_lelr_block_header;
@@ -44,6 +47,27 @@ pub struct LriMessages {
     pub view_preferences: Vec<ViewPreferences>,
 }
 
+/// Stable identity of the physical L16 that produced an LRI. Device-specific
+/// calibration must never cross this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceId {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl DeviceId {
+    /// Filesystem-safe fixed-width representation.
+    pub fn cache_key(self) -> String {
+        format!("{:016x}{:016x}", self.high, self.low)
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.cache_key())
+    }
+}
+
 impl LriMessages {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut headers = Vec::new();
@@ -72,6 +96,16 @@ impl LriMessages {
         Ok(Self {
             headers,
             view_preferences,
+        })
+    }
+
+    /// Physical device recorded in this file, if both halves are present.
+    pub fn device_id(&self) -> Option<DeviceId> {
+        self.headers.iter().find_map(|header| {
+            Some(DeviceId {
+                low: header.device_unique_id_low?,
+                high: header.device_unique_id_high?,
+            })
         })
     }
 }
@@ -321,16 +355,50 @@ pub struct Vignetting {
 }
 
 impl Vignetting {
-    /// Mesh for the capture's mirror position (nearest calibrated code).
-    pub fn mesh_for_hall(&self, mirror_hall: f64) -> Option<&VignettingMesh> {
-        self.meshes
-            .iter()
-            .min_by(|a, b| {
-                (a.0 - mirror_hall)
-                    .abs()
-                    .total_cmp(&(b.0 - mirror_hall).abs())
-            })
-            .map(|(_, mesh)| mesh)
+    /// Mesh for the capture's mirror position. Nodes are interpolated in Hall
+    /// space; positions outside the measured interval use the nearest mesh.
+    pub fn mesh_for_hall(&self, mirror_hall: f64) -> Option<VignettingMesh> {
+        let mut meshes = self.meshes.iter().collect::<Vec<_>>();
+        meshes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let first = *meshes.first()?;
+        let last = *meshes.last()?;
+        if mirror_hall <= first.0 {
+            return Some(first.1.clone());
+        }
+        if mirror_hall >= last.0 {
+            return Some(last.1.clone());
+        }
+        let pair = meshes
+            .windows(2)
+            .find(|pair| pair[0].0 <= mirror_hall && mirror_hall <= pair[1].0)
+            .expect("mirror Hall position lies inside the sorted mesh interval");
+        let (left, right) = (pair[0], pair[1]);
+        if left.1.columns != right.1.columns
+            || left.1.rows != right.1.rows
+            || left.1.gains.len() != right.1.gains.len()
+            || right.0 == left.0
+        {
+            return Some(
+                if (mirror_hall - left.0).abs() <= (right.0 - mirror_hall).abs() {
+                    &left.1
+                } else {
+                    &right.1
+                }
+                .clone(),
+            );
+        }
+        let t = ((mirror_hall - left.0) / (right.0 - left.0)) as f32;
+        Some(VignettingMesh {
+            columns: left.1.columns,
+            rows: left.1.rows,
+            gains: left
+                .1
+                .gains
+                .iter()
+                .zip(&right.1.gains)
+                .map(|(&a, &b)| a * (1.0 - t) + b * t)
+                .collect(),
+        })
     }
 }
 
@@ -349,11 +417,12 @@ pub struct CameraCalibration {
 /// How focus-dependent intrinsics behave outside the calibrated Hall range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum IntrinsicsMode {
-    /// Freeze at the nearest calibrated bundle. The safe default: lens Hall
-    /// codes far outside the range otherwise extrapolate to nonsense.
-    #[default]
+    /// Freeze at the nearest calibrated bundle outside the measured range.
     Clamp,
-    /// Continue the nearest segment linearly in Hall space.
+    /// Continue the nearest segment linearly in Hall space. Real captures
+    /// commonly focus just outside the two factory samples, and the validated
+    /// reconstruction model uses this continuation.
+    #[default]
     LinearHall,
 }
 
@@ -571,12 +640,17 @@ impl CalibrationDatabase {
     }
 
     /// Resolve from a capture plus optional overlay files (`calibration.lri`,
-    /// `zoom_calib_v0.lri`). The capture's headers take priority.
+    /// `zoom_calib_v0.lri`). The capture's headers take priority. Overlays are
+    /// accepted only when their physical-device id exactly matches the
+    /// capture, preventing accidental cross-camera calibration.
     pub fn from_capture_and_overlays(capture: &LriMessages, overlays: &[LriMessages]) -> Self {
-        let headers = capture
-            .headers
-            .iter()
-            .chain(overlays.iter().flat_map(|overlay| overlay.headers.iter()));
+        let device_id = capture.device_id();
+        let headers = capture.headers.iter().chain(
+            overlays
+                .iter()
+                .filter(|overlay| device_id.is_some() && overlay.device_id() == device_id)
+                .flat_map(|overlay| overlay.headers.iter()),
+        );
         Self::from_headers(headers)
     }
 
@@ -713,4 +787,71 @@ pub fn awb_gains(messages: &LriMessages) -> Option<[f64; 3]> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn intrinsic(focal: f64) -> Mat3 {
+        [
+            [focal, 0.0, 2_080.0],
+            [0.0, focal, 1_560.0],
+            [0.0, 0.0, 1.0],
+        ]
+    }
+
+    #[test]
+    fn focus_intrinsics_interpolate_and_optionally_continue() {
+        let camera = CameraCalibration {
+            name: "B1".to_owned(),
+            intrinsics: vec![
+                IntrinsicsBundle {
+                    hall_code: Some(100.0),
+                    focus_distance: 1_000.0,
+                    k: intrinsic(1_000.0),
+                },
+                IntrinsicsBundle {
+                    hall_code: Some(200.0),
+                    focus_distance: 2_000.0,
+                    k: intrinsic(900.0),
+                },
+            ],
+            ..CameraCalibration::default()
+        };
+        assert_eq!(
+            camera.k_for_hall(150.0, IntrinsicsMode::Clamp).unwrap()[0][0],
+            950.0
+        );
+        assert_eq!(
+            camera.k_for_hall(50.0, IntrinsicsMode::Clamp).unwrap()[0][0],
+            1_000.0
+        );
+        assert_eq!(
+            camera.k_for_hall(50.0, IntrinsicsMode::LinearHall).unwrap()[0][0],
+            1_050.0
+        );
+    }
+
+    #[test]
+    fn vignetting_interpolates_mesh_nodes_in_mirror_hall_space() {
+        let mesh = |gain| VignettingMesh {
+            columns: 2,
+            rows: 2,
+            gains: vec![gain; 4],
+        };
+        let calibration = Vignetting {
+            meshes: vec![(100.0, mesh(1.0)), (200.0, mesh(3.0))],
+            ..Vignetting::default()
+        };
+        assert_eq!(calibration.mesh_for_hall(50.0).unwrap().gains, vec![1.0; 4]);
+        assert_eq!(
+            calibration.mesh_for_hall(150.0).unwrap().gains,
+            vec![2.0; 4]
+        );
+        assert_eq!(
+            calibration.mesh_for_hall(250.0).unwrap().gains,
+            vec![3.0; 4]
+        );
+    }
 }

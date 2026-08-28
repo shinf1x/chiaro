@@ -78,8 +78,11 @@ When a camera is indexed, Gallery looks for these device-specific files in
 - `calibration.lri`
 - `zoom_calib_v0.lri`
 
-They are copied to a local cache when first needed. Manually selected paths are
-not overwritten.
+They are copied automatically to the platform cache when a camera is first
+indexed. Gallery matches the calibration files to captures by the physical
+camera's 128-bit device id and uses the completed geometry for the combined
+preview and export defaults. Calibration from a different camera is ignored;
+manually selected paths are not overwritten.
 
 Use the `hotpixel.rec` belonging to the same physical camera. The geometric
 calibration files are also strongly recommended: capture headers contain only

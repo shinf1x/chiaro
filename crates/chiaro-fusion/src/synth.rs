@@ -247,6 +247,9 @@ pub struct SynthSource<'a> {
     pub alignment: &'a ModuleAlignment,
     /// Linear resolution relative to the reference (focal length ratio).
     pub magnification: f32,
+    /// Alignment confidence, used to stop an uncertain high-resolution
+    /// module from dominating a well-supported lower-resolution one.
+    pub confidence: f32,
     pub color: ModuleColor,
     pub gain_field: GainField,
 }
@@ -356,7 +359,10 @@ pub fn synthesize(
                         if feather <= 0.0 {
                             continue;
                         }
-                        let weight = feather * source.magnification * source.magnification;
+                        let weight = feather
+                            * source.magnification
+                            * source.magnification
+                            * source.confidence;
                         let gain = source.alignment.gain;
                         let offset = source.alignment.offset;
                         let field = source

@@ -88,6 +88,25 @@ fn calibration_database_resolves_every_module_of_the_device() {
 }
 
 #[test]
+fn calibration_overlays_are_rejected_across_physical_devices() {
+    let capture =
+        LriMessages::parse(&fs::read(fixture_dir().join("L16_04366_headers.lri")).unwrap())
+            .unwrap();
+    let embedded = CalibrationDatabase::from_capture_and_overlays(&capture, &[]);
+    let mut overlay =
+        LriMessages::parse(&fs::read(fixture_dir().join("calibration.lri")).unwrap()).unwrap();
+    let id = capture.device_id().unwrap();
+    assert_eq!(overlay.device_id(), Some(id));
+    for header in &mut overlay.headers {
+        if let Some(low) = header.device_unique_id_low.as_mut() {
+            *low ^= 1;
+        }
+    }
+    let rejected = CalibrationDatabase::from_capture_and_overlays(&capture, &[overlay]);
+    assert_eq!(rejected.cameras.len(), embedded.cameras.len());
+}
+
+#[test]
 fn intrinsics_rays_and_projections_match_the_python_reference() {
     let (db, states, fixture) = load();
     let cameras = cameras(&db, &states);

@@ -180,6 +180,7 @@ impl GalleryApp {
                     match result {
                         Ok(()) => {
                             self.device_retry_at = None;
+                            let mut calibration_download = None;
                             if let Some(view) = self.tab_view_mut(&key) {
                                 view.busy = None;
                                 view.listing_progress = None;
@@ -187,6 +188,24 @@ impl GalleryApp {
                                     .items
                                     .is_empty()
                                     .then(|| "No .lri files found on this camera".to_owned());
+                                if let TabKey::Device { location_id, .. } = key
+                                    && !view.device_calibration.is_empty()
+                                {
+                                    calibration_download =
+                                        Some((location_id, view.device_calibration.clone()));
+                                }
+                            }
+                            if let Some((location, objects)) = calibration_download {
+                                let should_download = !matches!(
+                                    self.device_calibrations.get(&location),
+                                    Some(
+                                        DeviceCalibration::Downloading
+                                            | DeviceCalibration::Ready(_)
+                                    )
+                                );
+                                if should_download {
+                                    self.download_device_calibration(location, objects, ctx);
+                                }
                             }
                         }
                         Err(error) => {

@@ -470,6 +470,7 @@ mod tests {
             name: "x.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x.lri")),
             identity: None,
+            device_id: None,
             frames: None,
         };
         assert_eq!(

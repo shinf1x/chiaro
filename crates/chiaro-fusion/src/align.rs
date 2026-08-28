@@ -139,6 +139,12 @@ pub struct AlignmentReport {
     pub patches: usize,
     pub residual_median_px: f32,
     pub residual_p90_px: f32,
+    /// Fraction of the finest-level patch matches consistent with the robust
+    /// model. Low consensus usually means competing scene depths or a false
+    /// correlation, even when the inlier residual itself is small.
+    pub inlier_ratio: f32,
+    /// Whether synthesis may use this module.
+    pub accepted: bool,
     pub status: String,
 }
 
@@ -163,6 +169,8 @@ pub struct AlignOptions {
     pub min_score: f32,
     /// RANSAC inlier threshold in reference pixels (full resolution).
     pub inlier_px: f32,
+    /// Minimum finest-level correspondence consensus required for synthesis.
+    pub min_inlier_ratio: f32,
     /// Skip refinement and keep the factory model (for diagnostics).
     pub refine: bool,
 }
@@ -175,6 +183,7 @@ impl Default for AlignOptions {
             coarse_radius: 12,
             min_score: 0.5,
             inlier_px: 3.0,
+            min_inlier_ratio: 0.45,
             refine: true,
         }
     }
@@ -212,6 +221,8 @@ pub fn align_module(
         let warp = Warp::from_fn(width, height, options.grid_step, Some);
         report.initialised_from = "reference";
         report.coverage = 1.0;
+        report.inlier_ratio = 1.0;
+        report.accepted = true;
         report.status = "reference".to_owned();
         return Ok(ModuleAlignment {
             name: target.name.to_owned(),
@@ -397,7 +408,18 @@ pub fn align_module(
             [(moved[0] - centre[0]) as f32, (moved[1] - centre[1]) as f32];
     }
 
-    report.status = if !options.refine {
+    report.inlier_ratio = if report.patches == 0 {
+        0.0
+    } else {
+        report.inliers as f32 / report.patches as f32
+    };
+    report.accepted = !options.refine || report.inlier_ratio >= options.min_inlier_ratio;
+    report.status = if !report.accepted {
+        format!(
+            "rejected: {:.0}% correspondence consensus",
+            report.inlier_ratio * 100.0
+        )
+    } else if !options.refine {
         "factory model only".to_owned()
     } else if report.inliers >= 12 && report.residual_median_px < options.inlier_px {
         "refined".to_owned()

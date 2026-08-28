@@ -23,6 +23,7 @@ use crate::source::{
 };
 
 pub mod cache;
+pub mod calibration_cache;
 pub mod database;
 pub mod overlay;
 mod worker;
