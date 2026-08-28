@@ -32,11 +32,18 @@ tab controls whether caching is enabled, its size limit, and cache clearing.
 Persistent settings are stored in the platform configuration directory as
 `chiaro/gallery.json`.
 
+An inspectable `gallery.sqlite3` database beside `gallery.json` indexes capture
+identity hashes, source and thumbnail paths, and successful exports. Thumbnail
+files are split across two hash-prefix directory levels so large collections do
+not put thousands of files in one directory.
+
 ## Exporting
 
 Select cards with their checkbox or non-image area; Shift-click extends the
 current selection range. Starting an export clears the selection. Additional
 exports can be added while another job is running and are processed in order.
+Cards that have been exported successfully show a teal check in their
+upper-right corner; the state persists through `gallery.sqlite3`.
 
 Available pipelines:
 

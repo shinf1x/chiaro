@@ -365,6 +365,9 @@ fn run_job(
                 monitor.update(|progress| {
                     progress.outputs_written += written;
                     progress.completed += 1;
+                    if let Some(identity) = &target.identity {
+                        progress.succeeded_hashes.push(identity.hash.clone());
+                    }
                 });
             }
             Err(error) => {
@@ -583,6 +586,7 @@ mod tests {
         ExportTarget {
             name: "x.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x.lri")),
+            identity: None,
             frames,
         }
     }
@@ -709,6 +713,7 @@ mod tests {
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.outputs_written, 6);
         assert!(progress.failures.is_empty(), "{:?}", progress.failures);
+        assert_eq!(progress.succeeded_hashes.len(), 2);
         for camera in ["A1", "A2", "B1"] {
             for number in 1..=2 {
                 let png = output.join(camera).join(format!("L16_0000{number}.png"));

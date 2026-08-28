@@ -23,7 +23,10 @@ use crate::source::{
 };
 
 pub mod cache;
+pub mod database;
 mod worker;
+
+use database::{CaptureIdentity, GalleryDatabase};
 
 use worker::{camera_worker, preview_is_current, worker};
 
@@ -33,6 +36,9 @@ pub struct GalleryItem {
     pub id: u64,
     pub preview_revision: u64,
     pub source: SourceItem,
+    /// Stable capture identity used by export history.
+    pub capture_hash: Option<String>,
+    pub exported: bool,
     pub state: ItemState,
 }
 
@@ -263,6 +269,8 @@ pub struct PreviewLoader {
     results: Receiver<WorkerResult>,
     generation: Arc<AtomicU64>,
     gallery_queue: Arc<GalleryQueueState>,
+    database: Option<Arc<GalleryDatabase>>,
+    exported_hashes: Mutex<HashSet<String>>,
     promoted_gallery: Mutex<HashSet<(u64, u64, u64)>>,
     active_modals: Arc<Mutex<HashSet<u64>>>,
 }
@@ -281,7 +289,7 @@ struct CameraWorkerQueues {
 }
 
 impl PreviewLoader {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: egui::Context, database: Option<Arc<GalleryDatabase>>) -> Self {
         let (task_tx, task_rx) = mpsc::channel::<Task>();
         let (priority_tx, priority_rx) = mpsc::channel::<Task>();
         let (modal_tx, modal_rx) = mpsc::channel::<Task>();
@@ -293,9 +301,13 @@ impl PreviewLoader {
         let modal_rx = Arc::new(Mutex::new(modal_rx));
         let generation = Arc::new(AtomicU64::new(0));
         let gallery_queue = Arc::new(GalleryQueueState {
-            thumbnails: cache::ThumbnailCache::platform().map(Arc::new),
+            thumbnails: cache::ThumbnailCache::platform(database.clone()).map(Arc::new),
             ..GalleryQueueState::default()
         });
+        let exported_hashes = database
+            .as_ref()
+            .and_then(|database| database.exported_hashes().ok())
+            .unwrap_or_default();
         let active_modals = Arc::new(Mutex::new(HashSet::new()));
         let queues = WorkerQueues {
             tasks: task_rx,
@@ -348,6 +360,8 @@ impl PreviewLoader {
             results: result_rx,
             generation,
             gallery_queue,
+            database,
+            exported_hashes: Mutex::new(exported_hashes),
             promoted_gallery: Mutex::new(HashSet::new()),
             active_modals,
         }
@@ -403,10 +417,20 @@ impl PreviewLoader {
         let mut items = Vec::with_capacity(sources.len());
         for (offset, source) in sources.into_iter().enumerate() {
             let state = ItemState::Idle;
+            let identity = CaptureIdentity::for_capture(&source.capture);
+            let capture_hash = identity.map(|identity| identity.hash);
+            let exported = capture_hash.as_ref().is_some_and(|hash| {
+                self.exported_hashes
+                    .lock()
+                    .expect("exported hash set poisoned")
+                    .contains(hash)
+            });
             items.push(GalleryItem {
                 id: first_id + offset as u64,
                 preview_revision: 0,
                 source,
+                capture_hash,
+                exported,
                 state,
             });
         }
@@ -504,6 +528,17 @@ impl PreviewLoader {
     /// The on-disk thumbnail cache, if one is in use.
     pub fn thumbnail_cache(&self) -> Option<&Arc<cache::ThumbnailCache>> {
         self.gallery_queue.thumbnails.as_ref()
+    }
+
+    pub fn database(&self) -> Option<&Arc<GalleryDatabase>> {
+        self.database.as_ref()
+    }
+
+    pub fn mark_exported(&self, hashes: impl IntoIterator<Item = String>) {
+        self.exported_hashes
+            .lock()
+            .expect("exported hash set poisoned")
+            .extend(hashes);
     }
 
     /// Flag exports raise while transferring from the camera; see

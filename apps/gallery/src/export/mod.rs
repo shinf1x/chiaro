@@ -26,7 +26,7 @@ use std::{
 use chiaro::lri::{SensorPattern, parse_raw_layout};
 use eframe::egui;
 
-use crate::source::CaptureLocator;
+use crate::{gallery::database::CaptureIdentity, source::CaptureLocator};
 
 pub mod disk;
 mod fusion;
@@ -41,6 +41,8 @@ pub struct ExportTarget {
     /// Display name, normally the LRI file name.
     pub name: String,
     pub capture: CaptureLocator,
+    /// Cheap stable identity used by the export-history catalog.
+    pub identity: Option<CaptureIdentity>,
     /// RAW frames in the capture when they could be probed cheaply. `None`
     /// for remote captures that would require a full download to inspect.
     pub frames: Option<Vec<FrameInfo>>,
@@ -50,6 +52,7 @@ impl ExportTarget {
     /// Build a target from a gallery item, probing local files for their
     /// RAW layout so estimates can be exact.
     pub fn new(name: String, capture: CaptureLocator) -> Self {
+        let identity = CaptureIdentity::for_capture(&capture);
         let frames = match &capture {
             CaptureLocator::Local(path) => probe_frames(path),
             CaptureLocator::Device(_) => None,
@@ -57,6 +60,7 @@ impl ExportTarget {
         Self {
             name,
             capture,
+            identity,
             frames,
         }
     }
@@ -135,6 +139,9 @@ pub struct ExportProgress {
     pub transfer: Option<(String, f32)>,
     pub outputs_written: usize,
     pub failures: Vec<(String, String)>,
+    /// Captures successfully processed or skipped because the requested
+    /// outputs already existed.
+    pub succeeded_hashes: Vec<String>,
     pub finished: bool,
     /// Fatal error that stopped the job before completion.
     pub fatal: Option<String>,
@@ -216,6 +223,8 @@ impl ExportMonitor {
 pub struct ExportJob {
     pub pipeline_label: &'static str,
     pub monitor: ExportMonitor,
+    pub history_targets: Vec<CaptureIdentity>,
+    pub output_dir: PathBuf,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -470,6 +479,12 @@ impl PendingExport {
 
     pub fn start(self, ctx: &egui::Context, transport_hold: Arc<AtomicBool>) -> ExportJob {
         let pipeline_label = self.pipeline.label();
+        let output_dir = self.pipeline.output_dir();
+        let history_targets = self
+            .targets
+            .iter()
+            .filter_map(|target| target.identity.clone())
+            .collect();
         let monitor = ExportMonitor::new(
             ExportProgress {
                 total: self.targets.len(),
@@ -482,6 +497,8 @@ impl PendingExport {
         ExportJob {
             pipeline_label,
             monitor,
+            history_targets,
+            output_dir,
             handle: Some(handle),
         }
     }
@@ -700,12 +717,14 @@ mod tests {
         let target = ExportTarget {
             name: "L16_04480.lri".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x/L16_04480.lri")),
+            identity: None,
             frames: None,
         };
         assert_eq!(target.stem(), "L16_04480");
         let odd = ExportTarget {
             name: "night sky (1).LRI".to_owned(),
             capture: CaptureLocator::Local(PathBuf::from("/x/y")),
+            identity: None,
             frames: None,
         };
         assert_eq!(odd.stem(), "night_sky__1_");

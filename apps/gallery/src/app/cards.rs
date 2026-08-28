@@ -176,6 +176,9 @@ impl GalleryApp {
                 response.clone().on_hover_text(error);
             }
         }
+        if item.exported {
+            paint_exported_badge(ui, image_rect);
+        }
 
         let name_rect = egui::Rect::from_min_max(
             egui::pos2(content.left(), image_rect.bottom() + 9.0),
@@ -234,9 +237,35 @@ impl GalleryApp {
         } else {
             None
         };
-        response.on_hover_text(&item.source.location_label);
+        response.on_hover_text(if item.exported {
+            format!("{}\nExported previously", item.source.location_label)
+        } else {
+            item.source.location_label.clone()
+        });
         action
     }
+}
+
+/// A calm teal check is distinct from selection blue and error/warning colors.
+fn paint_exported_badge(ui: &egui::Ui, image_rect: egui::Rect) {
+    let rect = egui::Rect::from_min_size(
+        image_rect.right_top() + Vec2::new(-32.0, 8.0),
+        Vec2::splat(24.0),
+    );
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        Color32::from_rgb(36, 126, 112),
+        Stroke::new(1.0_f32, Color32::from_rgb(104, 218, 195)),
+        StrokeKind::Inside,
+    );
+    let left = rect.left_top() + Vec2::new(5.5, 12.0);
+    let middle = rect.left_top() + Vec2::new(10.0, 16.0);
+    let right = rect.left_top() + Vec2::new(18.5, 7.5);
+    let stroke = Stroke::new(2.2_f32, Color32::WHITE);
+    painter.line_segment([left, middle], stroke);
+    painter.line_segment([middle, right], stroke);
 }
 
 fn paint_checkbox(

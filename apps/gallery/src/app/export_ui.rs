@@ -249,7 +249,35 @@ impl GalleryApp {
             job.join();
             let progress = job.progress();
             let label = job.pipeline_label;
-            let summary = if let Some(error) = &progress.fatal {
+            let succeeded = progress
+                .succeeded_hashes
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let exported = job
+                .history_targets
+                .iter()
+                .filter(|identity| succeeded.contains(&identity.hash))
+                .cloned()
+                .collect::<Vec<_>>();
+            let database = self.loader.database().cloned();
+            let mut catalog_error = None;
+            if let Some(database) = database {
+                for identity in &exported {
+                    if let Err(error) = database.record_export(identity, label, &job.output_dir) {
+                        catalog_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            let exported_hashes = exported
+                .iter()
+                .map(|identity| identity.hash.clone())
+                .collect::<HashSet<_>>();
+            self.loader.mark_exported(exported_hashes.iter().cloned());
+            self.mark_exported_cards(&exported_hashes);
+
+            let mut summary = if let Some(error) = &progress.fatal {
                 format!("{label}: export failed - {error}")
             } else if job.monitor.cancelled() {
                 format!(
@@ -268,6 +296,9 @@ impl GalleryApp {
                     progress.failures.len()
                 )
             };
+            if let Some(error) = catalog_error {
+                summary.push_str(&format!("; could not update gallery.sqlite3: {error}"));
+            }
             self.current_view.status = Some(summary);
             ctx.request_repaint();
         }
@@ -278,6 +309,24 @@ impl GalleryApp {
             self.export_job = Some(pending.start(ctx, hold));
             self.current_view.status = None;
             ctx.request_repaint();
+        }
+    }
+
+    fn mark_exported_cards(&mut self, hashes: &HashSet<String>) {
+        let mark = |view: &mut TabViewState| {
+            for item in &mut view.items {
+                if item
+                    .capture_hash
+                    .as_ref()
+                    .is_some_and(|hash| hashes.contains(hash))
+                {
+                    item.exported = true;
+                }
+            }
+        };
+        mark(&mut self.current_view);
+        for view in self.saved_views.values_mut() {
+            mark(view);
         }
     }
 

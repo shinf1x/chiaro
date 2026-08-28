@@ -39,6 +39,11 @@ pub fn settings_path() -> Option<PathBuf> {
     Some(base.join("chiaro").join("gallery.json"))
 }
 
+/// Inspectable SQLite catalog beside [`settings_path`].
+pub fn database_path() -> Option<PathBuf> {
+    settings_path().map(|path| path.with_file_name("gallery.sqlite3"))
+}
+
 impl Settings {
     pub fn load() -> Self {
         settings_path()
@@ -89,6 +94,13 @@ impl GalleryApp {
                         .color(Color32::from_gray(150))
                         .size(12.0),
                 );
+                if let Some(database) = self.loader.database() {
+                    ui.label(
+                        RichText::new(format!("Catalog: {}", database.path().display()))
+                            .color(Color32::from_gray(150))
+                            .size(12.0),
+                    );
+                }
                 ui.checkbox(
                     &mut self.settings.thumbnail_cache_enabled,
                     "Keep decoded thumbnails on disk so cards load instantly next time",
@@ -153,6 +165,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), settings);
         assert!(
             settings_path().is_none_or(|p| p.ends_with(Path::new("chiaro").join("gallery.json")))
+        );
+        assert!(
+            database_path()
+                .is_none_or(|p| { p.ends_with(Path::new("chiaro").join("gallery.sqlite3")) })
         );
     }
 }

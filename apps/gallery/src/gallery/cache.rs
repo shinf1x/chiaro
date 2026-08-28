@@ -4,20 +4,18 @@
 //! LRI prefix plus sparse metadata reads: seconds per capture over USB, and a
 //! long wait for a full card. Decoded previews are therefore persisted under
 //! the platform cache directory (`$XDG_CACHE_HOME/chiaro/thumbnails`, or the
-//! Windows/macOS equivalents) as a JPEG (quality 92, ~100 KB) plus a JSON
+//! Windows/macOS equivalents) as a JPEG (quality 80, ~100 KB) plus a JSON
 //! sidecar with the card metadata. A later session that lists the same captures is served from
 //! disk without touching the camera's image data.
 //!
-//! Entries are keyed by a SHA-256 of what identifies a capture without
-//! reading it: the source (camera serial, or folder path), file name, size,
-//! and for local files the modification time, plus the decode parameters and
-//! a format version so changes to the preview pipeline invalidate old entries.
+//! SQLite indexes the source identity and sharded paths, avoiding a cache-tree
+//! scan during normal startup and making the catalog inspectable by users.
 
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -28,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::source::{CaptureLocator, ObjectLocator, PreviewLocator};
+
+use super::database::{CaptureIdentity, GalleryDatabase, ThumbnailIndexEntry};
 
 /// Bump when the preview pipeline changes what a thumbnail looks like.
 const FORMAT_VERSION: u32 = 3;
@@ -54,28 +54,34 @@ pub fn thumbnail_dir() -> Option<PathBuf> {
 }
 
 /// Identity of a cached preview.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ThumbnailKey(String);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThumbnailKey {
+    value: String,
+    capture: CaptureIdentity,
+}
 
 impl ThumbnailKey {
     /// Key for a gallery preview decoded at `max_edge` pixels. Returns `None`
     /// when the source cannot be identified cheaply.
     pub fn for_preview(
         source: &PreviewLocator,
-        capture: &CaptureLocator,
+        capture_locator: &CaptureLocator,
         max_edge: usize,
     ) -> Option<Self> {
+        let capture = CaptureIdentity::for_capture(capture_locator)?;
         let mut hasher = Sha256::new();
         hasher.update(FORMAT_VERSION.to_le_bytes());
         hasher.update(max_edge.to_le_bytes());
-        match capture {
+        // Preserve the pre-database key algorithm so existing thumbnails can
+        // move into deeper shards without being regenerated.
+        match capture_locator {
             CaptureLocator::Local(path) => {
                 let metadata = fs::metadata(path).ok()?;
                 let modified = metadata
                     .modified()
                     .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_secs());
                 hasher.update(b"local");
                 hasher.update(
                     path.canonicalize()
@@ -109,11 +115,18 @@ impl ThumbnailKey {
                 hasher.update(jpeg.size.to_le_bytes());
             }
         }
-        Some(Self(hex(&hasher.finalize())))
+        Some(Self {
+            value: hex(&hasher.finalize()),
+            capture,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
+    }
+
+    pub fn capture(&self) -> &CaptureIdentity {
+        &self.capture
     }
 }
 
@@ -199,6 +212,7 @@ pub struct CacheUsage {
 #[derive(Debug)]
 pub struct ThumbnailCache {
     root: PathBuf,
+    database: Option<Arc<GalleryDatabase>>,
     enabled: AtomicBool,
     limit_bytes: AtomicU64,
     /// Usage as last scanned plus everything stored since; `None` until the
@@ -208,17 +222,75 @@ pub struct ThumbnailCache {
 
 impl ThumbnailCache {
     /// The default platform cache, or `None` when it cannot be located.
-    pub fn platform() -> Option<Self> {
-        thumbnail_dir().map(Self::at)
+    pub fn platform(database: Option<Arc<GalleryDatabase>>) -> Option<Self> {
+        thumbnail_dir().map(|root| Self::with_database(root, database))
     }
 
+    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
+        Self::with_database(root, None)
+    }
+
+    pub fn with_database(root: impl Into<PathBuf>, database: Option<Arc<GalleryDatabase>>) -> Self {
+        let root = root.into();
+        let cache = Self {
+            root,
+            database,
             enabled: AtomicBool::new(true),
             limit_bytes: AtomicU64::new(DEFAULT_LIMIT_BYTES),
             usage: Mutex::new(None),
+        };
+        cache.initialize_index();
+        cache
+    }
+
+    fn initialize_index(&self) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        if !database.thumbnail_index_initialized().unwrap_or(false) {
+            if let Err(error) = self.rebuild_index() {
+                eprintln!("thumbnail database migration: {error}");
+                return;
+            }
+            if let Err(error) = database.set_thumbnail_index_initialized() {
+                eprintln!("thumbnail database migration: {error}");
+            }
         }
+        if let Ok((bytes, entries)) = database.thumbnail_usage() {
+            *self.usage.lock().expect("cache usage poisoned") = Some(CacheUsage { bytes, entries });
+        }
+    }
+
+    fn rebuild_index(&self) -> std::io::Result<()> {
+        let Some(database) = &self.database else {
+            return Ok(());
+        };
+        for (path, used, size) in self.entries() {
+            let Some(key) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if key.len() < 4 {
+                continue;
+            }
+            let (image_path, metadata_path) = self.paths_for_str(key);
+            if path != image_path {
+                fs::create_dir_all(image_path.parent().expect("cache entry has a parent"))?;
+                if image_path.exists() {
+                    let _ = fs::remove_file(&path);
+                } else {
+                    fs::rename(&path, &image_path)?;
+                }
+                let old_metadata = path.with_extension("json");
+                if old_metadata.exists() && !metadata_path.exists() {
+                    fs::rename(old_metadata, &metadata_path)?;
+                }
+            }
+            database
+                .upsert_thumbnail(key, None, &image_path, &metadata_path, size, used)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -261,6 +333,9 @@ impl ThumbnailCache {
         if self.root.exists() {
             fs::remove_dir_all(&self.root)?;
         }
+        if let Some(database) = &self.database {
+            database.clear_thumbnails().map_err(std::io::Error::other)?;
+        }
         *self.usage.lock().expect("cache usage poisoned") = Some(CacheUsage::default());
         Ok(())
     }
@@ -268,15 +343,17 @@ impl ThumbnailCache {
     /// `(image path, last use, bytes of image + sidecar)` for every entry.
     fn entries(&self) -> Vec<(PathBuf, SystemTime, u64)> {
         let mut out = Vec::new();
-        let Ok(shards) = fs::read_dir(&self.root) else {
-            return out;
-        };
-        for shard in shards.flatten() {
-            let Ok(files) = fs::read_dir(shard.path()) else {
+        let mut directories = vec![self.root.clone()];
+        while let Some(directory) = directories.pop() {
+            let Ok(files) = fs::read_dir(directory) else {
                 continue;
             };
             for file in files.flatten() {
                 let path = file.path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
                 if path.extension().is_none_or(|e| e != "jpg") {
                     continue;
                 }
@@ -297,30 +374,53 @@ impl ThumbnailCache {
         if self.usage().bytes <= limit {
             return;
         }
-        let mut entries = self.entries();
-        entries.sort_by_key(|(_, used, _)| *used);
-        let mut total = CacheUsage {
-            bytes: entries.iter().map(|e| e.2).sum(),
-            entries: entries.len(),
-        };
-        for (path, _, size) in entries {
+        let indexed = self
+            .database
+            .as_ref()
+            .and_then(|database| database.thumbnails_oldest_first().ok());
+        let entries = indexed.unwrap_or_else(|| {
+            let mut entries = self.entries();
+            entries.sort_by_key(|(_, used, _)| *used);
+            entries
+                .into_iter()
+                .map(|(image_path, _, size_bytes)| ThumbnailIndexEntry {
+                    key: image_path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    metadata_path: image_path.with_extension("json"),
+                    image_path,
+                    size_bytes,
+                })
+                .collect()
+        });
+        let mut total = self.usage();
+        for entry in entries {
             if total.bytes <= limit {
                 break;
             }
-            let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(path.with_extension("json"));
-            total.bytes = total.bytes.saturating_sub(size);
+            let _ = fs::remove_file(&entry.image_path);
+            let _ = fs::remove_file(&entry.metadata_path);
+            if let Some(database) = &self.database {
+                let _ = database.remove_thumbnail(&entry.key);
+            }
+            total.bytes = total.bytes.saturating_sub(entry.size_bytes);
             total.entries = total.entries.saturating_sub(1);
         }
         *self.usage.lock().expect("cache usage poisoned") = Some(total);
     }
 
     fn paths(&self, key: &ThumbnailKey) -> (PathBuf, PathBuf) {
-        // Two-character fan-out keeps directories small with thousands of entries.
-        let dir = self.root.join(&key.as_str()[..2]);
+        self.paths_for_str(key.as_str())
+    }
+
+    fn paths_for_str(&self, key: &str) -> (PathBuf, PathBuf) {
+        // Two pairs keep even very large caches spread across small directories.
+        let dir = self.root.join(&key[..2]).join(&key[2..4]);
         (
-            dir.join(format!("{}.jpg", key.as_str())),
-            dir.join(format!("{}.json", key.as_str())),
+            dir.join(format!("{key}.jpg")),
+            dir.join(format!("{key}.json")),
         )
     }
 
@@ -330,16 +430,56 @@ impl ThumbnailCache {
         if !self.is_enabled() {
             return None;
         }
-        let (image_path, json_path) = self.paths(key);
+        let mut indexed = self
+            .database
+            .as_ref()
+            .and_then(|database| database.thumbnail(key.as_str()).ok().flatten());
+        let (mut image_path, mut json_path) = indexed
+            .as_ref()
+            .map(|record| (record.image_path.clone(), record.metadata_path.clone()))
+            .unwrap_or_else(|| self.paths(key));
+        if !image_path.is_file() || !json_path.is_file() {
+            if indexed.is_some()
+                && let Some(database) = &self.database
+            {
+                let _ = database.remove_thumbnail(key.as_str());
+            }
+            indexed = None;
+            (image_path, json_path) = self.paths(key);
+            if !image_path.is_file() || !json_path.is_file() {
+                return None;
+            }
+        }
         if let Ok(file) = fs::File::options().append(true).open(&image_path) {
             let _ = file.set_modified(SystemTime::now());
         }
-        let sidecar: ThumbnailSidecar = serde_json::from_slice(&fs::read(json_path).ok()?).ok()?;
+        if let Some(database) = &self.database {
+            match indexed.as_ref() {
+                Some(record) if record.capture_hash.is_none() => {
+                    let _ = database.link_thumbnail(key.as_str(), key.capture());
+                }
+                None => {
+                    let size = fs::metadata(&image_path).map_or(0, |metadata| metadata.len())
+                        + fs::metadata(&json_path).map_or(0, |metadata| metadata.len());
+                    let _ = database.upsert_thumbnail(
+                        key.as_str(),
+                        Some(key.capture()),
+                        &image_path,
+                        &json_path,
+                        size,
+                        SystemTime::now(),
+                    );
+                }
+                Some(_) => {}
+            }
+            let _ = database.touch_thumbnail(key.as_str());
+        }
+        let sidecar: ThumbnailSidecar = serde_json::from_slice(&fs::read(&json_path).ok()?).ok()?;
         if sidecar.version != FORMAT_VERSION {
             return None;
         }
         let image = image::load_from_memory_with_format(
-            &fs::read(image_path).ok()?,
+            &fs::read(&image_path).ok()?,
             image::ImageFormat::Jpeg,
         )
         .ok()?
@@ -363,6 +503,8 @@ impl ThumbnailCache {
             return Ok(());
         }
         let (image_path, json_path) = self.paths(key);
+        let previous = fs::metadata(&image_path).map_or(0, |metadata| metadata.len())
+            + fs::metadata(&json_path).map_or(0, |metadata| metadata.len());
         fs::create_dir_all(image_path.parent().expect("cache entry has a parent"))?;
         let temporary = image_path.with_extension("jpg.part");
         {
@@ -387,11 +529,25 @@ impl ThumbnailCache {
         fs::rename(&temporary, &image_path)?;
         let added = fs::metadata(&image_path).map_or(0, |m| m.len())
             + fs::metadata(&json_path).map_or(0, |m| m.len());
+        if let Some(database) = &self.database {
+            database
+                .upsert_thumbnail(
+                    key.as_str(),
+                    Some(key.capture()),
+                    &image_path,
+                    &json_path,
+                    added,
+                    SystemTime::now(),
+                )
+                .map_err(std::io::Error::other)?;
+        }
         {
             let mut usage = self.usage.lock().expect("cache usage poisoned");
             let current = usage.get_or_insert_with(CacheUsage::default);
-            current.bytes += added;
-            current.entries += 1;
+            current.bytes = current.bytes.saturating_sub(previous) + added;
+            if previous == 0 {
+                current.entries += 1;
+            }
         }
         self.evict_to_limit();
         Ok(())
@@ -435,6 +591,17 @@ pub fn crop_to_framing(preview: &mut PreviewImage) {
 mod tests {
     use super::*;
 
+    fn key(value: String) -> ThumbnailKey {
+        ThumbnailKey {
+            value,
+            capture: CaptureIdentity {
+                hash: "12".repeat(32),
+                source_path: "/captures/L16_00001.lri".to_owned(),
+                name: "L16_00001.lri".to_owned(),
+            },
+        }
+    }
+
     fn sample_preview() -> PreviewImage {
         // A smooth gradient: JPEG keeps it within a few codes.
         PreviewImage {
@@ -466,7 +633,7 @@ mod tests {
     fn store_and_load_round_trip_pixels_and_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ThumbnailCache::at(dir.path());
-        let key = ThumbnailKey("ab".repeat(32));
+        let key = key("ab".repeat(32));
         assert!(cache.load(&key).is_none());
         let preview = sample_preview();
         cache.store(&key, &preview).unwrap();
@@ -486,9 +653,63 @@ mod tests {
         assert!(
             dir.path()
                 .join("ab")
+                .join("ab")
                 .join(format!("{}.json", key.as_str()))
                 .is_file()
         );
+    }
+
+    #[test]
+    fn sqlite_index_survives_cache_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("thumbnails");
+        let database = Arc::new(GalleryDatabase::open(dir.path().join("gallery.sqlite3")).unwrap());
+        let key = key("abcd".repeat(16));
+        {
+            let cache = ThumbnailCache::with_database(&root, Some(Arc::clone(&database)));
+            cache.store(&key, &sample_preview()).unwrap();
+            assert_eq!(cache.usage().entries, 1);
+        }
+
+        let cache = ThumbnailCache::with_database(&root, Some(Arc::clone(&database)));
+        assert_eq!(cache.usage().entries, 1);
+        assert!(cache.load(&key).is_some());
+        let indexed = database.thumbnail(key.as_str()).unwrap().unwrap();
+        assert!(
+            indexed.image_path.ends_with(
+                Path::new("ab")
+                    .join("cd")
+                    .join(format!("{}.jpg", key.as_str()))
+            )
+        );
+        assert_eq!(
+            indexed.capture_hash.as_deref(),
+            Some(key.capture().hash.as_str())
+        );
+        cache.clear().unwrap();
+        assert_eq!(database.thumbnail_usage().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn first_database_open_migrates_legacy_single_shard_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("thumbnails");
+        let key = key("abcd".repeat(16));
+        let plain = ThumbnailCache::at(&root);
+        plain.store(&key, &sample_preview()).unwrap();
+        let (new_image, new_metadata) = plain.paths(&key);
+        let legacy_dir = root.join("ab");
+        let legacy_image = legacy_dir.join(format!("{}.jpg", key.as_str()));
+        let legacy_metadata = legacy_dir.join(format!("{}.json", key.as_str()));
+        fs::rename(&new_image, &legacy_image).unwrap();
+        fs::rename(&new_metadata, &legacy_metadata).unwrap();
+
+        let database = Arc::new(GalleryDatabase::open(dir.path().join("gallery.sqlite3")).unwrap());
+        let cache = ThumbnailCache::with_database(&root, Some(Arc::clone(&database)));
+        assert!(!legacy_image.exists());
+        assert!(new_image.is_file());
+        assert!(cache.load(&key).is_some());
+        assert_eq!(database.thumbnail_usage().unwrap().1, 1);
     }
 
     #[test]
@@ -497,7 +718,7 @@ mod tests {
         let cache = ThumbnailCache::at(dir.path());
         let preview = sample_preview();
         let keys = (0..6)
-            .map(|i| ThumbnailKey(format!("{i:02x}").repeat(32)))
+            .map(|i| key(format!("{i:02x}").repeat(32)))
             .collect::<Vec<_>>();
         cache.store(&keys[0], &preview).unwrap();
         let one = cache.usage();
