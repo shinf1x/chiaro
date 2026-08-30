@@ -186,6 +186,87 @@ pub struct CaptureLayout {
     pub cameras: Vec<RawCamera>,
 }
 
+/// Encoding used by one captured RAW surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawEncoding {
+    Packed10,
+    BayerJpeg,
+}
+
+/// Linear signal-dependent noise variance parameters (`variance = a * signal + b`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NoiseChannelModel {
+    pub a: f32,
+    pub b: f32,
+}
+
+/// One gain-specific variance-stabilising/noise model embedded by the camera.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoiseModel {
+    /// Gain in ISO-like hundredths (for example `775` for an analog gain of `7.75`).
+    pub gain: u32,
+    pub threshold: f32,
+    pub scale: f32,
+    pub red: NoiseChannelModel,
+    pub green: NoiseChannelModel,
+    pub blue: NoiseChannelModel,
+    pub panchromatic: NoiseChannelModel,
+}
+
+/// Characterisation shared by modules using the same sensor family.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensorNoiseProfile {
+    pub sensor_type: u64,
+    pub black_level: f32,
+    pub white_level: f32,
+    pub cliff_slope: f32,
+    pub models: Vec<NoiseModel>,
+}
+
+impl SensorNoiseProfile {
+    /// Model nearest to the frame's total gain.
+    pub fn nearest_model(&self, analog_gain: f32, digital_gain: f32) -> Option<&NoiseModel> {
+        let gain = (analog_gain.max(0.0) * digital_gain.max(0.0) * 100.0).round() as u32;
+        self.models
+            .iter()
+            .min_by_key(|model| model.gain.abs_diff(gain))
+    }
+}
+
+/// One exact temporal surface, including repeated frames from a night capture.
+#[derive(Clone, Debug)]
+pub struct RawFrame {
+    pub camera: RawCamera,
+    pub frame_index: u64,
+    pub encoding: RawEncoding,
+    pub sensor_type: u64,
+}
+
+/// All addressable RAW frames and the sensor models needed to merge them.
+#[derive(Clone, Debug)]
+pub struct FrameLayout {
+    pub frames: Vec<RawFrame>,
+    pub sensor_profiles: HashMap<u64, SensorNoiseProfile>,
+    /// IMU packets in capture order. Some night captures incorrectly label
+    /// every packet as frame zero, so consumers should use ordering when the
+    /// declared indices are not unique.
+    pub motion_sequences: Vec<MotionSequence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionSample {
+    /// Sensor row at which this sample applies.
+    pub row: u32,
+    pub vector: [f32; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MotionSequence {
+    pub declared_frame_index: u32,
+    pub accelerometer: Vec<MotionSample>,
+    pub gyroscope: Vec<MotionSample>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LelrBlockDescriptor {
     pub block_offset: usize,
@@ -248,6 +329,8 @@ struct Capture {
     colors: HashMap<u64, Vec<ColorCalibration>>,
     sensor_types: HashMap<u64, u64>,
     sensor_levels: HashMap<u64, (f32, f32)>,
+    sensor_profiles: HashMap<u64, SensorNoiseProfile>,
+    motion_sequences: Vec<MotionSequence>,
     focal_length_mm: Option<i32>,
     captured_at: Option<CaptureDateTime>,
     image_gain: Option<f32>,
@@ -359,6 +442,224 @@ pub fn parse_raw_layout(
         }
     }
     Ok(CaptureLayout { cameras })
+}
+
+/// Locate every decodable RAW surface, preserving repeated temporal frames.
+///
+/// Unlike [`parse_raw_layout`], this accepts both packed RAW10 and Bayer-JPEG
+/// and does not collapse frames belonging to the same physical camera.
+pub fn parse_frame_layout(
+    data: &[u8],
+    pattern_overrides: &HashMap<String, SensorPattern>,
+) -> Result<FrameLayout, LriError> {
+    let capture = parse_capture(data)?;
+    let mut modules = capture
+        .modules
+        .iter()
+        .filter(|module| {
+            module.enabled && matches!(module.format, RAW_PACKED_10BPP | RAW_BAYER_JPEG)
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by_key(|module| (module.camera, module.frame_index));
+
+    let mut frames = Vec::with_capacity(modules.len());
+    for module in modules {
+        let Some(name) = CAMERA_NAMES.get(module.camera as usize).copied() else {
+            return Err(format_error(format!(
+                "invalid Light L16 camera id {}",
+                module.camera
+            )));
+        };
+        let sensor_type = capture
+            .sensor_types
+            .get(&module.camera)
+            .copied()
+            .unwrap_or(0);
+        let pattern = resolve_pattern(module, sensor_type, name, pattern_overrides)?;
+        let encoding = match module.format {
+            RAW_PACKED_10BPP => RawEncoding::Packed10,
+            RAW_BAYER_JPEG => RawEncoding::BayerJpeg,
+            _ => unreachable!(),
+        };
+        let byte_len = raw_payload_len(data, module, encoding)?;
+        let (black_level, white_level) = capture
+            .sensor_levels
+            .get(&sensor_type)
+            .copied()
+            .unwrap_or((42.0, 1023.0));
+        // Bayer-JPEG stores 8-bit samples after the camera's own RAW-domain
+        // compression, so use its actual code range for normalisation.
+        let (black_level, white_level) = if encoding == RawEncoding::BayerJpeg {
+            (black_level.min(254.0), 255.0)
+        } else {
+            (black_level, white_level)
+        };
+        frames.push(RawFrame {
+            camera: RawCamera {
+                id: module.camera as usize,
+                name: name.to_owned(),
+                width: module.width,
+                height: module.height,
+                row_stride: module.row_stride,
+                absolute_offset: module.payload_offset,
+                byte_len,
+                pattern,
+                sensor_temperature_c: module.sensor_temperature_c,
+                analog_gain: module.analog_gain,
+                digital_gain: module.digital_gain,
+                exposure_ns: module.sensor_exposure_ns,
+                black_level,
+                white_level,
+            },
+            frame_index: module.frame_index,
+            encoding,
+            sensor_type,
+        });
+    }
+    Ok(FrameLayout {
+        frames,
+        sensor_profiles: capture.sensor_profiles,
+        motion_sequences: capture.motion_sequences,
+    })
+}
+
+/// Decode an exact temporal surface to linear integer samples in Light's
+/// decoded stream order. Bayer-JPEG expands to its native 8-bit code values;
+/// packed RAW10 expands to 10-bit values.
+pub fn decode_raw_frame(data: &[u8], frame: &RawFrame) -> Result<Vec<u16>, LriError> {
+    let module = CapturedModule {
+        camera: frame.camera.id as u64,
+        enabled: true,
+        width: frame.camera.width,
+        height: frame.camera.height,
+        format: match frame.encoding {
+            RawEncoding::Packed10 => RAW_PACKED_10BPP,
+            RawEncoding::BayerJpeg => RAW_BAYER_JPEG,
+        },
+        row_stride: frame.camera.row_stride,
+        payload_offset: frame.camera.absolute_offset,
+        payload_limit: frame
+            .camera
+            .absolute_offset
+            .checked_add(frame.camera.byte_len)
+            .ok_or_else(|| format_error("RAW payload span overflow"))?,
+        frame_index: frame.frame_index,
+        ..Default::default()
+    };
+    match frame.encoding {
+        RawEncoding::BayerJpeg => {
+            // Bayer-JPEG uses the opposite scan direction from packed RAW10.
+            // Normalise it here so downstream correction always receives the
+            // same decoded-stream orientation and factory defect maps align.
+            let mut raw = decode_bayer_jpeg(data, &module)?;
+            raw.reverse();
+            Ok(raw.into_iter().map(u16::from).collect())
+        }
+        RawEncoding::Packed10 => decode_packed10(data, &module),
+    }
+}
+
+fn resolve_pattern(
+    module: &CapturedModule,
+    sensor: u64,
+    name: &str,
+    overrides: &HashMap<String, SensorPattern>,
+) -> Result<SensorPattern, LriError> {
+    if let Some(pattern) = overrides.get(name) {
+        return Ok(*pattern);
+    }
+    if matches!(sensor, 3 | 5) || module.bayer_red.is_some_and(|red| !valid_bayer(Some(red))) {
+        return Ok(SensorPattern::Mono);
+    }
+    match module.bayer_red {
+        Some((red_x, red_y)) => Ok(match (red_x & 1, red_y & 1) {
+            (0, 0) => SensorPattern::Rggb,
+            (1, 0) => SensorPattern::Grbg,
+            (0, 1) => SensorPattern::Gbrg,
+            _ => SensorPattern::Bggr,
+        }),
+        None => Err(format_error(format!(
+            "no Bayer pattern is available for {name}; pass an explicit pattern override"
+        ))),
+    }
+}
+
+fn raw_payload_len(
+    data: &[u8],
+    module: &CapturedModule,
+    encoding: RawEncoding,
+) -> Result<usize, LriError> {
+    match encoding {
+        RawEncoding::Packed10 => {
+            let byte_len = module
+                .row_stride
+                .checked_mul(module.height)
+                .ok_or_else(|| format_error("RAW byte span overflow"))?;
+            module
+                .payload_offset
+                .checked_add(byte_len)
+                .filter(|end| *end <= module.payload_limit && *end <= data.len())
+                .ok_or_else(|| format_error("packed RAW surface escapes its LRI block"))?;
+            Ok(byte_len)
+        }
+        RawEncoding::BayerJpeg => {
+            let header_end = module
+                .payload_offset
+                .checked_add(BAYER_JPEG_HEADER_SIZE)
+                .filter(|end| *end <= module.payload_limit && *end <= data.len())
+                .ok_or_else(|| format_error("Bayer-JPEG header escapes its LRI block"))?;
+            let header = &data[module.payload_offset..header_end];
+            if &header[..4] != b"BJPG" {
+                return Err(format_error("invalid Bayer-JPEG magic"));
+            }
+            let byte_len = [8..12, 12..16, 16..20, 20..24].into_iter().try_fold(
+                BAYER_JPEG_HEADER_SIZE,
+                |total, range| {
+                    total
+                        .checked_add(read_u32(&header[range])? as usize)
+                        .ok_or_else(|| format_error("Bayer-JPEG payload length overflow"))
+                },
+            )?;
+            module
+                .payload_offset
+                .checked_add(byte_len)
+                .filter(|end| *end <= module.payload_limit && *end <= data.len())
+                .ok_or_else(|| format_error("Bayer-JPEG surface escapes its LRI block"))?;
+            Ok(byte_len)
+        }
+    }
+}
+
+fn decode_packed10(data: &[u8], module: &CapturedModule) -> Result<Vec<u16>, LriError> {
+    let sample_count = module
+        .width
+        .checked_mul(module.height)
+        .ok_or_else(|| format_error("RAW dimensions overflow"))?;
+    if !sample_count.is_multiple_of(4) {
+        return Err(format_error("packed RAW10 has a partial sample group"));
+    }
+    let byte_len = sample_count / 4 * 5;
+    let end = module
+        .payload_offset
+        .checked_add(byte_len)
+        .filter(|end| *end <= module.payload_limit && *end <= data.len())
+        .ok_or_else(|| format_error("truncated packed RAW10 payload"))?;
+    let packed = &data[module.payload_offset..end];
+    let mut output = Vec::with_capacity(sample_count);
+    for chunk in packed.rchunks_exact(5) {
+        let word = ((chunk[4] as u64) << 32)
+            | ((chunk[3] as u64) << 24)
+            | ((chunk[2] as u64) << 16)
+            | ((chunk[1] as u64) << 8)
+            | u64::from(chunk[0]);
+        output.extend_from_slice(&[
+            ((word >> 30) & 1023) as u16,
+            ((word >> 20) & 1023) as u16,
+            ((word >> 10) & 1023) as u16,
+            (word & 1023) as u16,
+        ]);
+    }
+    Ok(output)
 }
 
 /// Inspect metadata messages obtained through sparse remote reads, without
@@ -1042,6 +1343,29 @@ fn parse_light_header(
     for sensor in &header.sensor_data {
         parse_sensor_data(sensor, capture);
     }
+    for imu in &header.imu_data {
+        let samples = |values: &[chiaro_proto::imu_data::imudata::Sample]| {
+            values
+                .iter()
+                .filter_map(|sample| {
+                    let point = sample.data.as_ref()?;
+                    Some(MotionSample {
+                        row: sample.row_idx.unwrap_or(0),
+                        vector: [
+                            point.x.unwrap_or(0.0),
+                            point.y.unwrap_or(0.0),
+                            point.z.unwrap_or(0.0),
+                        ],
+                    })
+                })
+                .collect()
+        };
+        capture.motion_sequences.push(MotionSequence {
+            declared_frame_index: imu.frame_index.unwrap_or(0),
+            accelerometer: samples(&imu.accelerometer),
+            gyroscope: samples(&imu.gyroscope),
+        });
+    }
     if let Some(hardware) = header.hw_info.as_ref() {
         parse_hardware_info(hardware, capture);
     }
@@ -1234,14 +1558,16 @@ fn parse_hardware_info(message: &HwInfo, capture: &mut Capture) {
 }
 
 fn parse_sensor_data(message: &SensorData, capture: &mut Capture) {
-    if let (Some(sensor), Some(levels)) = (
+    if let (Some(sensor), Some(data)) = (
         message.type_.map(|value| enum_number(value.value())),
-        message
-            .data
-            .as_ref()
-            .and_then(parse_sensor_characterization),
+        message.data.as_ref(),
     ) {
-        capture.sensor_levels.insert(sensor, levels);
+        if let Some(levels) = parse_sensor_characterization(data) {
+            capture.sensor_levels.insert(sensor, levels);
+        }
+        if let Some(profile) = parse_sensor_noise_profile(sensor, data) {
+            capture.sensor_profiles.insert(sensor, profile);
+        }
     }
 }
 
@@ -1250,6 +1576,43 @@ fn parse_sensor_characterization(message: &SensorCharacterization) -> Option<(f3
         .black_level
         .zip(message.white_level)
         .filter(|(black, white)| white > black)
+}
+
+fn parse_sensor_noise_profile(
+    sensor_type: u64,
+    message: &SensorCharacterization,
+) -> Option<SensorNoiseProfile> {
+    let (black_level, white_level) = parse_sensor_characterization(message)?;
+    let channel = |model: Option<
+        &chiaro_proto::sensor_characterization::sensor_characterization::vst_noise_model::VstModel,
+    >| {
+        model.map(|model| NoiseChannelModel {
+            a: model.a.unwrap_or(0.0),
+            b: model.b.unwrap_or(0.0),
+        })
+    };
+    let models = message
+        .vst_model
+        .iter()
+        .filter_map(|model| {
+            Some(NoiseModel {
+                gain: model.gain?,
+                threshold: model.threshold.unwrap_or(0.0),
+                scale: model.scale.unwrap_or(1.0),
+                red: channel(model.red.as_ref())?,
+                green: channel(model.green.as_ref())?,
+                blue: channel(model.blue.as_ref())?,
+                panchromatic: channel(model.panchromatic.as_ref())?,
+            })
+        })
+        .collect();
+    Some(SensorNoiseProfile {
+        sensor_type,
+        black_level,
+        white_level,
+        cliff_slope: message.cliff_slope.unwrap_or(0.0),
+        models,
+    })
 }
 
 fn parse_channel_gains(message: &ChannelGain) -> Option<[f32; 3]> {
@@ -1844,6 +2207,14 @@ mod tests {
         assert_eq!(layout.cameras[0].absolute_offset, LELR_HEADER_SIZE);
         assert_eq!(layout.cameras[0].byte_len, raw.len());
         assert_eq!(layout.cameras[0].pattern, SensorPattern::Grbg);
+        let frames = parse_frame_layout(&lri, &HashMap::new()).unwrap();
+        assert_eq!(frames.frames.len(), 1);
+        assert_eq!(frames.frames[0].encoding, RawEncoding::Packed10);
+        assert_eq!(frames.frames[0].frame_index, 0);
+        assert_eq!(
+            decode_raw_frame(&lri, &frames.frames[0]).unwrap(),
+            [100, 200, 300, 400, 500, 600, 700, 800]
+        );
 
         assert!(
             try_decode_reference_preview_prefix(&lri[..lri.len() - 1], 320)

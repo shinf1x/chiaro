@@ -202,6 +202,12 @@ pub struct AlignInput<'a> {
     pub nominal_focal_px: f64,
 }
 
+#[derive(Clone, Copy)]
+pub struct AlignmentSeed<'a> {
+    pub warp: &'a Warp,
+    pub name: &'static str,
+}
+
 /// Depth used for the rotation-only initialisation (calibration units).
 const FAR_DEPTH: f64 = 1.0e8;
 
@@ -211,6 +217,18 @@ pub fn align_module(
     reference: &AlignInput<'_>,
     target: &AlignInput<'_>,
     options: &AlignOptions,
+) -> Result<ModuleAlignment> {
+    align_module_seeded(reference, target, options, None)
+}
+
+/// [`align_module`] with an optional externally predicted reference-to-target
+/// warp. Temporal burst processing uses an IMU rotation here; correlation
+/// still refines the seed and decides whether the result is trustworthy.
+pub fn align_module_seeded(
+    reference: &AlignInput<'_>,
+    target: &AlignInput<'_>,
+    options: &AlignOptions,
+    seed: Option<AlignmentSeed<'_>>,
 ) -> Result<ModuleAlignment> {
     let (width, height) = (reference.width, reference.height);
     let mut report = AlignmentReport {
@@ -237,8 +255,12 @@ pub fn align_module(
     // (iterative undistortion) is too slow to evaluate per pixel, and the
     // mapping is smooth, so bilinear interpolation of an 8 px grid is exact
     // to well under 0.01 px.
-    let initial_grid = match (reference.camera, target.camera) {
-        (Some(reference_camera), Some(target_camera)) => {
+    let initial_grid = match (seed, reference.camera, target.camera) {
+        (Some(seed), _, _) => {
+            report.initialised_from = seed.name;
+            seed.warp.clone()
+        }
+        (None, Some(reference_camera), Some(target_camera)) => {
             report.initialised_from = "calibration";
             Warp::from_fn(width, height, 8, |p| {
                 target_camera
@@ -246,7 +268,7 @@ pub fn align_module(
                     .filter(|q| q[0].is_finite() && q[1].is_finite())
             })
         }
-        _ => {
+        (None, _, _) => {
             report.initialised_from = "nominal focal group";
             let scale = target.nominal_focal_px / reference.nominal_focal_px;
             let (cx, cy) = ((width as f64 - 1.0) / 2.0, (height as f64 - 1.0) / 2.0);

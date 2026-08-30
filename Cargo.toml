@@ -4,11 +4,13 @@ members = [
     "crates/chiaro-proto",
     "crates/chiaro-hotpixel-core",
     "crates/chiaro-fusion",
+    "crates/chiaro-stack",
     "apps/gallery",
     "apps/hotpixel",
     "apps/fuse",
+    "apps/stack",
 ]
-default-members = ["apps/gallery", "apps/hotpixel", "apps/fuse"]
+default-members = ["apps/gallery", "apps/hotpixel", "apps/fuse", "apps/stack"]
 resolver = "3"
 
 [workspace.package]
@@ -31,6 +33,7 @@ chiaro = { path = "crates/chiaro" }
 chiaro-proto = { path = "crates/chiaro-proto" }
 chiaro-hotpixel-core = { path = "crates/chiaro-hotpixel-core" }
 chiaro-fusion = { path = "crates/chiaro-fusion" }
+chiaro-stack = { path = "crates/chiaro-stack" }
 memmap2 = "0.9.10"
 mtp-rs = "0.25.0"
 nusb = { version = "0.2.5", default-features = false }

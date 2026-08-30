@@ -150,6 +150,7 @@ fn module_color(
     let mut color = ModuleColor::default();
     if let Some(profile) = profile {
         color.forward = profile.forward_matrix.map(|row| row.map(|v| v as f32));
+        color.calibrated = true;
     }
     color.wb_gains = match (recorded_wb, profile, reference_profile) {
         (Some(wb), Some(p), Some(r)) => [
@@ -453,8 +454,9 @@ pub fn fuse(
         }
     }
 
-    // Colour per module: its own D65 forward matrix, and the recorded white
-    // balance transferred from the reference through the D65 grey ratios.
+    // Colour per module: its own D50-output DNG forward matrix, and the
+    // recorded white balance transferred from the reference through the D65
+    // calibration grey ratios. Synthesis adapts the blended D50 XYZ to D65.
     let reference_calibration = calibration.cameras.get(&reference_name);
     let recorded_wb = awb_gains(&messages).map(|g| [g[0] as f32, g[1] as f32, g[2] as f32]);
     let module_colors = modules

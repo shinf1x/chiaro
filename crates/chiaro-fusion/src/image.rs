@@ -133,6 +133,27 @@ impl Mosaic {
         self.sample_rgb_with_white(x, y).map(|(rgb, _)| rgb)
     }
 
+    /// Sample one normalised CFA colour plane without demosaicing. This is
+    /// useful for temporal RAW stacking: alignment may be sub-pixel, while
+    /// each output mosaic position must remain a measurement of one colour.
+    pub fn sample_channel(&self, x: f32, y: f32, channel: usize) -> Option<f32> {
+        if !(x >= 0.0 && y >= 0.0 && x <= (self.width - 1) as f32 && y <= (self.height - 1) as f32)
+        {
+            return None;
+        }
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        let value = if self.is_mono() {
+            self.bilinear_plane(x, y, 0, 0, 1)
+        } else {
+            let (row, column) = (0..2usize)
+                .flat_map(|row| (0..2usize).map(move |column| (row, column)))
+                .find(|&(row, column)| self.pattern.color_at(row, column) == channel)
+                .unwrap_or((0, 0));
+            self.bilinear_plane(x, y, column, row, 2)
+        };
+        Some(((value - self.black_q6) / range).max(0.0) * self.flat_field(x, y))
+    }
+
     /// Bilinear interpolation on the lattice `(ox + i*step, oy + j*step)`.
     fn bilinear_plane(&self, x: f32, y: f32, ox: usize, oy: usize, step: usize) -> f32 {
         let step_f = step as f32;

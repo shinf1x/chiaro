@@ -629,6 +629,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "chiaro-stack"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "chiaro",
+ "chiaro-fusion",
+ "chiaro-hotpixel-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "chiaro-stack-app"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "chiaro",
+ "chiaro-hotpixel-core",
+ "chiaro-stack",
+ "clap",
+ "serde_json",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -27,10 +27,11 @@ use crate::image::Mosaic;
 /// Output colour handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OutputColor {
-    /// Linear camera RGB after white balance, scaled so sensor white is 1.
+    /// Linear sRGB after white balance and D50-to-D65 adaptation.
     Linear,
-    /// White balance, forward matrix to XYZ, XYZ to sRGB, exposure to the
-    /// reference's 99.5th percentile and the sRGB transfer curve.
+    /// White balance, forward matrix to D50 XYZ, chromatic adaptation to D65,
+    /// XYZ to sRGB, exposure to the reference's 99.5th percentile and the
+    /// sRGB transfer curve.
     #[default]
     Display,
 }
@@ -113,12 +114,15 @@ impl CropWindow {
 }
 
 /// Colour handling of one module: white balance in its own camera space and
-/// its forward matrix to XYZ.
+/// its DNG forward matrix to the D50 XYZ profile connection space.
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleColor {
     pub wb_gains: [f32; 3],
-    /// Camera RGB -> XYZ (D65), or identity.
+    /// Camera RGB -> XYZ (D50), or identity when calibration is unavailable.
     pub forward: [[f32; 3]; 3],
+    /// Whether `forward` is a real camera colour calibration. Uncalibrated
+    /// Bayer modules may contribute luminance, but never unreliable chroma.
+    pub calibrated: bool,
 }
 
 impl Default for ModuleColor {
@@ -126,6 +130,7 @@ impl Default for ModuleColor {
         Self {
             wb_gains: [1.0; 3],
             forward: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            calibrated: false,
         }
     }
 }
@@ -221,8 +226,24 @@ const XYZ_TO_SRGB: [[f32; 3]; 3] = [
     [-0.969_266, 1.876_010_8, 0.041_556],
     [0.055_643_4, -0.204_025_9, 1.057_225_2],
 ];
-/// XYZ of the D65 white (Y = 1), used for luminance-only content.
-const D65_WHITE: [f32; 3] = [0.950_47, 1.0, 1.088_83];
+/// ICC/DNG profile connection-space white (Y = 1).
+const D50_WHITE: [f32; 3] = [0.964_22, 1.0, 0.825_21];
+
+/// Bradford chromatic adaptation from D50 XYZ to the D65 white used by sRGB.
+const D50_TO_D65: [[f32; 3]; 3] = [
+    [0.955_576_6, -0.023_039_3, 0.063_163_6],
+    [-0.028_289_5, 1.009_941_6, 0.021_007_7],
+    [0.012_298_2, -0.020_483, 1.329_909_8],
+];
+
+fn adapt_d50_to_d65(xyz: [f32; 3]) -> [f32; 3] {
+    let m = &D50_TO_D65;
+    [
+        m[0][0] * xyz[0] + m[0][1] * xyz[1] + m[0][2] * xyz[2],
+        m[1][0] * xyz[0] + m[1][1] * xyz[1] + m[1][2] * xyz[2],
+        m[2][0] * xyz[0] + m[2][1] * xyz[1] + m[2][2] * xyz[2],
+    ]
+}
 
 fn srgb_transfer(linear: f32) -> f32 {
     let v = linear.clamp(0.0, 1.0);
@@ -235,6 +256,7 @@ fn srgb_transfer(linear: f32) -> f32 {
 
 impl ColorPipeline {
     fn apply(&self, xyz: [f32; 3], color: OutputColor) -> [f32; 3] {
+        let xyz = adapt_d50_to_d65(xyz);
         let m = &XYZ_TO_SRGB;
         let linear = [
             m[0][0] * xyz[0] + m[0][1] * xyz[1] + m[0][2] * xyz[2],
@@ -426,7 +448,7 @@ pub fn synthesize(
                         let field = source
                             .gain_field
                             .at(q[0], q[1], mosaic.width, mosaic.height);
-                        if mosaic.is_mono() {
+                        if mosaic.is_mono() || !source.color.calibrated {
                             let y = (gain * (rgb[1] - offset)).max(0.0) * field[1];
                             luminance += weight * y;
                             luminance_weight += weight;
@@ -458,10 +480,10 @@ pub fn synthesize(
                             if mean[1] > 1e-6 {
                                 mean.map(|v| v * target_luminance / mean[1])
                             } else {
-                                D65_WHITE.map(|v| v * target_luminance)
+                                D50_WHITE.map(|v| v * target_luminance)
                             }
                         } else {
-                            D65_WHITE.map(|v| v * target_luminance)
+                            D50_WHITE.map(|v| v * target_luminance)
                         };
                         let rgb = color.apply(blended, options.color);
                         for c in 0..3 {
@@ -586,7 +608,7 @@ pub fn photometric_match(
             {
                 let rv = reference_color.xyz_for_output(r, r_white, highlight_correction)[1];
                 // A mono sample is already luminance in its own units.
-                let tv = if target.is_mono() {
+                let tv = if target.is_mono() || !target_color.calibrated {
                     t[1]
                 } else {
                     target_color.xyz_for_output(t, t_white, highlight_correction)[1]
@@ -657,7 +679,7 @@ pub fn photometric_field(
                     .clamp(0.0, (rows - 1) as f32) as usize;
                 let cell = &mut ratios[row * columns + column];
                 let r_xyz = reference_color.xyz_for_output(r, r_white, highlight_correction);
-                if target.is_mono() {
+                if target.is_mono() || !target_color.calibrated {
                     let tv = (gain * (t[1] - offset)).max(0.0);
                     if r_xyz[1] > 0.01 && tv > 0.01 && r_xyz[1] < 0.95 && tv < 0.95 {
                         cell[1].push(r_xyz[1] / tv);
@@ -691,7 +713,7 @@ pub fn photometric_field(
                     any = true;
                 }
             }
-            if target.is_mono() {
+            if target.is_mono() || !target_color.calibrated {
                 out[0] = out[1];
                 out[2] = out[1];
             }
@@ -798,5 +820,14 @@ mod tests {
         };
         let raw = [0.2, 0.35, 0.3];
         assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), color.to_xyz(raw));
+    }
+
+    #[test]
+    fn d50_profile_white_maps_to_neutral_srgb() {
+        let pipeline = ColorPipeline::default();
+        let rgb = pipeline.apply(D50_WHITE, OutputColor::Linear);
+        for channel in rgb {
+            assert!((channel - 1.0).abs() < 2e-4, "channel was {channel}");
+        }
     }
 }

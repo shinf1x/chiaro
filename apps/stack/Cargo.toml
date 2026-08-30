@@ -1,0 +1,18 @@
+[package]
+name = "chiaro-stack-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stack repeated Light L16 night frames into a motion-safe denoised image"
+
+[[bin]]
+name = "chiaro-stack"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+chiaro.workspace = true
+chiaro-hotpixel-core.workspace = true
+chiaro-stack.workspace = true
+serde_json.workspace = true

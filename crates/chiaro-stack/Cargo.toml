@@ -1,0 +1,17 @@
+[package]
+name = "chiaro-stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Motion-aware temporal RAW burst stacking for Light L16 night captures"
+
+[dependencies]
+anyhow.workspace = true
+chiaro.workspace = true
+chiaro-fusion.workspace = true
+chiaro-hotpixel-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

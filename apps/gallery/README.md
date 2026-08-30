@@ -66,8 +66,9 @@ Available pipelines:
 
 Exports report progress, can be cancelled, check available disk space, and
 record failures in `export-log.txt`. Night-mode captures are not currently
-accepted by either export pipeline; use the Hotpixel CLI for per-camera
-night-frame extraction.
+accepted by either Gallery export pipeline; use
+[`chiaro-stack`](../stack/README.md) for gyro-seeded temporal denoising and
+calibrated multi-camera night fusion.
 
 ### Camera calibration
 

@@ -14,6 +14,8 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
   astrophotography and stacking workflows.
 - **Chiaro Fuse** aligns the modules of a capture and synthesises one
   high-resolution frame.
+- **Chiaro Stack** denoises every temporal camera burst and combines the
+  resulting modules through calibrated multi-camera fusion.
 
 ## Feature comparison
 
@@ -27,6 +29,7 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Captures without companion `.lris` files | ✅ Builds a colour-calibrated preview from LRI RAW data | ❌ Not detected or processed |
 | Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
 | Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks | ❌ Not exposed |
+| Night-mode denoising | 🟡 Gyro-seeded, motion-aware temporal and multi-camera fusion CLI | ✅ Integrated night processing |
 | Computational fusion | 🟡 Calibrated far-scene alignment and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
 | Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |
 | Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
@@ -34,7 +37,7 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 
 The fusion pipeline currently assumes distant scenes. Near subjects may show
 parallax or ghosting, and depth-aware fusion is not yet implemented. Night
-captures are best processed as per-camera stacks with Chiaro Hotpixel.
+captures can be processed with temporal and multi-camera fusion in Chiaro Stack.
 
 ## Installation
 
@@ -46,6 +49,7 @@ applications with Cargo:
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-gallery
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-hotpixel
 cargo install --git https://github.com/shinf1x/chiaro.git chiaro-fuse
+cargo install --git https://github.com/shinf1x/chiaro.git chiaro-stack-app
 ```
 
 To build the complete workspace:
@@ -63,9 +67,11 @@ The resulting binaries are written to `target/release/`.
 | [`chiaro-gallery`](apps/gallery/README.md) | Native gallery and export application |
 | [`chiaro-hotpixel`](apps/hotpixel/README.md) | Per-camera extraction and correction CLI |
 | [`chiaro-fuse`](apps/fuse/README.md) | Multi-camera fusion CLI |
+| [`chiaro-stack`](apps/stack/README.md) | Motion-aware night-frame stacking CLI |
 | [`chiaro`](crates/chiaro/README.md) | Shared LRI parsing, metadata, and preview decoding |
 | [`chiaro-hotpixel-core`](crates/chiaro-hotpixel-core/README.md) | Reusable RAW correction pipeline |
 | [`chiaro-fusion`](crates/chiaro-fusion/README.md) | Alignment and synthesis library |
+| [`chiaro-stack`](crates/chiaro-stack/README.md) | Temporal RAW denoising library |
 | [`chiaro-proto`](crates/chiaro-proto/README.md) | Recovered Light metadata bindings |
 
 ## Acknowledgements
