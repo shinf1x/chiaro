@@ -480,6 +480,7 @@ pub fn fuse(
                 &modules[index].mosaic,
                 &module_colors[index],
                 &alignments[index].warp,
+                options.synth.highlight_correction,
             );
             alignments[index].gain = gain;
             alignments[index].offset = offset;
@@ -503,6 +504,7 @@ pub fn fuse(
                     offset,
                     columns,
                     rows,
+                    options.synth.highlight_correction,
                 );
             }
         }
@@ -574,7 +576,11 @@ pub fn fuse(
         fraction: 0.55,
     });
     let color = ColorPipeline {
-        exposure: auto_exposure(&reference.mosaic, &module_colors[reference_index]),
+        exposure: auto_exposure(
+            &reference.mosaic,
+            &module_colors[reference_index],
+            options.synth.highlight_correction,
+        ),
     };
     let sources = modules
         .iter()

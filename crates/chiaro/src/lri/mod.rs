@@ -1656,9 +1656,7 @@ fn tone_map(
     for pixel in raw.iter_mut() {
         let mut corrected = pixel.map(|value| ((value - black) / range).max(0.0));
         if is_color {
-            for channel in 0..3 {
-                corrected[channel] *= gains[channel];
-            }
+            corrected = white_balance_with_common_white(corrected, gains, [1.0; 3]);
             if let Some(profile) = calibration {
                 corrected = camera_to_srgb(corrected, &profile.forward_matrix);
             }
@@ -1684,6 +1682,26 @@ fn tone_map(
         }
     }
     rgb
+}
+
+/// Apply white balance while bringing all channels to the lowest resulting
+/// sensor-white point. Without the common ceiling, a neutral highlight whose
+/// green samples have saturated first becomes artificially magenta.
+fn white_balance_with_common_white(
+    rgb: [f32; 3],
+    gains: [f32; 3],
+    sensor_white: [f32; 3],
+) -> [f32; 3] {
+    let balanced = [rgb[0] * gains[0], rgb[1] * gains[1], rgb[2] * gains[2]];
+    let common_white = (0..3)
+        .map(|channel| sensor_white[channel] * gains[channel])
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    if common_white.is_finite() {
+        balanced.map(|value| value.min(common_white))
+    } else {
+        balanced
+    }
 }
 
 fn camera_to_srgb(camera: [f32; 3], forward: &[f32; 9]) -> [f32; 3] {
@@ -2022,6 +2040,19 @@ mod tests {
         }
         let gains = decode_proto::<ChannelGain>(&gains, "ChannelGain").unwrap();
         assert_eq!(parse_channel_gains(&gains), Some([1.9, 1.0, 1.4]));
+    }
+
+    #[test]
+    fn preview_white_balance_neutralises_unequally_clipped_highlights() {
+        let gains = [2.0, 1.0, 1.5];
+        assert_eq!(
+            white_balance_with_common_white([0.8, 1.0, 0.9], gains, [1.0; 3]),
+            [1.0; 3]
+        );
+        assert_eq!(
+            white_balance_with_common_white([0.2, 0.35, 0.3], gains, [1.0; 3]),
+            [0.4, 0.35, 0.450_000_02]
+        );
     }
 
     fn pack_10bit(samples: &[u16]) -> Vec<u8> {

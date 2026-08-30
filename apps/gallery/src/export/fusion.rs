@@ -48,6 +48,7 @@ pub struct FusionExport {
     crop_to_framing: bool,
     color: OutputColor,
     include_mono: bool,
+    highlight_correction: bool,
     fast_compression: bool,
     skip_existing: bool,
 }
@@ -67,6 +68,7 @@ impl Default for FusionExport {
             crop_to_framing: true,
             color: OutputColor::Display,
             include_mono: true,
+            highlight_correction: true,
             fast_compression: false,
             skip_existing: false,
         }
@@ -99,6 +101,7 @@ impl FusionExport {
         };
         options.synth.color = self.color;
         options.synth.include_mono = self.include_mono;
+        options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
             1
         } else {
@@ -247,6 +250,14 @@ impl ExportPipeline for FusionExport {
         )
         .on_hover_text(
             "Panchromatic modules (A2, C6) sharpen luminance; colour comes from the Bayer modules.",
+        );
+        ui.checkbox(
+            &mut self.highlight_correction,
+            "Neutralize false colour in clipped highlights",
+        )
+        .on_hover_text(
+            "Enabled by default for display-ready output. Disable to preserve unequal clipped \
+             raw-channel colour for processing elsewhere.",
         );
         ui.checkbox(
             &mut self.skip_existing,
@@ -400,12 +411,13 @@ fn run_job(
     let _ = fs::write(
         output_root.join("export-log.txt"),
         format!(
-            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}\n\n{}\n",
+            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, highlight correction: {}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
             export.canvas,
             export.crop_to_framing,
+            export.highlight_correction,
             log.join("\n")
         ),
     );

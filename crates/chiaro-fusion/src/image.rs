@@ -73,10 +73,12 @@ impl Mosaic {
         f32::from(self.samples[y * self.width + x])
     }
 
-    /// Linear RGB (black-subtracted, normalised so white = 1) at a fractional
-    /// calibration-raster position, or `None` outside the sensor. Mono
-    /// modules return the same value in all three channels.
-    pub fn sample_rgb(&self, x: f32, y: f32) -> Option<[f32; 3]> {
+    /// Linear RGB and the corresponding per-channel sensor-white response at
+    /// a fractional calibration-raster position. Both include the same
+    /// flat-field and crosstalk corrections, which lets colour processing
+    /// distinguish genuine colour from unequal channel clipping after white
+    /// balance. Mono modules return equal RGB and white values.
+    pub fn sample_rgb_with_white(&self, x: f32, y: f32) -> Option<([f32; 3], [f32; 3])> {
         if !(x >= 0.0 && y >= 0.0 && x <= (self.width - 1) as f32 && y <= (self.height - 1) as f32)
         {
             return None;
@@ -86,7 +88,7 @@ impl Mosaic {
         let normalise = |v: f32| ((v - self.black_q6) / range).max(0.0) * flat;
         if self.is_mono() {
             let v = normalise(self.bilinear_plane(x, y, 0, 0, 1));
-            return Some([v, v, v]);
+            return Some(([v, v, v], [flat; 3]));
         }
         // Each colour lives on a stride-2 lattice: red, the green in the red
         // row, the green in the blue row, and blue.
@@ -101,22 +103,34 @@ impl Mosaic {
             self.bilinear_plane(x, y, 1 - red_col, 1 - red_row, 2),
         ]
         .map(|v| v - self.black_q6);
+        let mut white_planes = [range; 4];
         if let Some(crosstalk) = &self.crosstalk {
             let m = crosstalk.matrix(x, y, self.width, self.height);
-            let input = planes;
-            for (row, value) in planes.iter_mut().enumerate() {
-                *value = m[row * 4] * input[0]
-                    + m[row * 4 + 1] * input[1]
-                    + m[row * 4 + 2] * input[2]
-                    + m[row * 4 + 3] * input[3];
+            for values in [&mut planes, &mut white_planes] {
+                let input = *values;
+                for (row, value) in values.iter_mut().enumerate() {
+                    *value = m[row * 4] * input[0]
+                        + m[row * 4 + 1] * input[1]
+                        + m[row * 4 + 2] * input[2]
+                        + m[row * 4 + 3] * input[3];
+                }
             }
         }
         let scale = flat / range;
-        Some([
-            (planes[0] * scale).max(0.0),
-            ((planes[1] + planes[2]) * 0.5 * scale).max(0.0),
-            (planes[3] * scale).max(0.0),
-        ])
+        let to_rgb = |values: [f32; 4]| {
+            [
+                (values[0] * scale).max(0.0),
+                ((values[1] + values[2]) * 0.5 * scale).max(0.0),
+                (values[3] * scale).max(0.0),
+            ]
+        };
+        Some((to_rgb(planes), to_rgb(white_planes)))
+    }
+
+    /// Linear RGB (black-subtracted and normalised) at a fractional
+    /// calibration-raster position, or `None` outside the sensor.
+    pub fn sample_rgb(&self, x: f32, y: f32) -> Option<[f32; 3]> {
+        self.sample_rgb_with_white(x, y).map(|(rgb, _)| rgb)
     }
 
     /// Bilinear interpolation on the lattice `(ox + i*step, oy + j*step)`.

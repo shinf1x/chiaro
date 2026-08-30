@@ -71,6 +71,10 @@ struct Cli {
     #[arg(long)]
     exclude_mono: bool,
 
+    /// Preserve unequal clipped-channel colour for downstream processing.
+    #[arg(long)]
+    no_highlight_correction: bool,
+
     /// Keep the factory geometry without correlation refinement (diagnostics).
     #[arg(long)]
     no_refine: bool,
@@ -138,6 +142,7 @@ fn main() -> Result<()> {
             })?),
         };
     options.synth.include_mono = !cli.exclude_mono;
+    options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;
     options.synth.color = match cli.color {
