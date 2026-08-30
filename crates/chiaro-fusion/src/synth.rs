@@ -56,6 +56,10 @@ pub struct SynthOptions {
     pub color: OutputColor,
     /// Include monochrome modules (as luminance).
     pub include_mono: bool,
+    /// Neutralise false colour caused by unequal raw-channel clipping after
+    /// white balance. Disable when preserving the unmodified channel response
+    /// for a downstream raw processor.
+    pub highlight_correction: bool,
     /// Worker threads for rendering (`0` = all cores).
     pub threads: usize,
     /// PNG deflate level.
@@ -69,6 +73,7 @@ impl Default for SynthOptions {
             feather_px: 120.0,
             color: OutputColor::Display,
             include_mono: true,
+            highlight_correction: true,
             threads: 0,
             png_level: chiaro_hotpixel_core::png16::DEFAULT_DEFLATE_LEVEL,
         }
@@ -127,24 +132,74 @@ impl Default for ModuleColor {
 
 impl ModuleColor {
     #[inline]
+    fn balanced_to_xyz(&self, balanced: [f32; 3]) -> [f32; 3] {
+        let f = &self.forward;
+        [
+            f[0][0] * balanced[0] + f[0][1] * balanced[1] + f[0][2] * balanced[2],
+            f[1][0] * balanced[0] + f[1][1] * balanced[1] + f[1][2] * balanced[2],
+            f[2][0] * balanced[0] + f[2][1] * balanced[1] + f[2][2] * balanced[2],
+        ]
+    }
+
+    #[inline]
     pub fn to_xyz(&self, rgb: [f32; 3]) -> [f32; 3] {
-        let b = [
+        self.balanced_to_xyz([
+            rgb[0] * self.wb_gains[0],
+            rgb[1] * self.wb_gains[1],
+            rgb[2] * self.wb_gains[2],
+        ])
+    }
+
+    /// Convert camera RGB to XYZ while giving every white-balanced channel a
+    /// common clipping point. Raw channels saturate before white balance at
+    /// different scene intensities; without this step a clipped neutral
+    /// highlight becomes magenta when green reaches its lower balanced white
+    /// point first.
+    #[inline]
+    pub fn to_xyz_clipped(&self, rgb: [f32; 3], sensor_white: [f32; 3]) -> [f32; 3] {
+        let mut balanced = [
             rgb[0] * self.wb_gains[0],
             rgb[1] * self.wb_gains[1],
             rgb[2] * self.wb_gains[2],
         ];
-        let f = &self.forward;
-        [
-            f[0][0] * b[0] + f[0][1] * b[1] + f[0][2] * b[2],
-            f[1][0] * b[0] + f[1][1] * b[1] + f[1][2] * b[2],
-            f[2][0] * b[0] + f[2][1] * b[1] + f[2][2] * b[2],
-        ]
+        let balanced_white = [
+            sensor_white[0] * self.wb_gains[0],
+            sensor_white[1] * self.wb_gains[1],
+            sensor_white[2] * self.wb_gains[2],
+        ];
+        let common_white = balanced_white
+            .into_iter()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .fold(f32::INFINITY, f32::min);
+        if common_white.is_finite() {
+            balanced = balanced.map(|value| value.min(common_white));
+        }
+        self.balanced_to_xyz(balanced)
     }
 
     /// Luminance (XYZ Y) of a camera RGB sample.
     #[inline]
     pub fn luminance(&self, rgb: [f32; 3]) -> f32 {
         self.to_xyz(rgb)[1]
+    }
+
+    #[inline]
+    pub fn luminance_clipped(&self, rgb: [f32; 3], sensor_white: [f32; 3]) -> f32 {
+        self.to_xyz_clipped(rgb, sensor_white)[1]
+    }
+
+    #[inline]
+    fn xyz_for_output(
+        &self,
+        rgb: [f32; 3],
+        sensor_white: [f32; 3],
+        highlight_correction: bool,
+    ) -> [f32; 3] {
+        if highlight_correction {
+            self.to_xyz_clipped(rgb, sensor_white)
+        } else {
+            self.to_xyz(rgb)
+        }
     }
 }
 
@@ -267,6 +322,8 @@ pub struct SynthReport {
     pub modules: Vec<String>,
     /// Fraction of canvas pixels with at least one contribution.
     pub covered: f32,
+    /// Whether unequal clipped-channel colour was neutralised.
+    pub highlight_correction: bool,
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -348,7 +405,8 @@ pub fn synthesize(
                             continue;
                         };
                         let mosaic = source.mosaic;
-                        let Some(rgb) = mosaic.sample_rgb(q[0], q[1]) else {
+                        let Some((rgb, sensor_white)) = mosaic.sample_rgb_with_white(q[0], q[1])
+                        else {
                             continue;
                         };
                         let border = q[0]
@@ -373,9 +431,14 @@ pub fn synthesize(
                             luminance += weight * y;
                             luminance_weight += weight;
                         } else {
-                            let mut matched = source
-                                .color
-                                .to_xyz(rgb.map(|v| (gain * (v - offset)).max(0.0)));
+                            let matched_rgb = rgb.map(|v| (gain * (v - offset)).max(0.0));
+                            let matched_white =
+                                sensor_white.map(|v| (gain * (v - offset)).max(0.0));
+                            let mut matched = source.color.xyz_for_output(
+                                matched_rgb,
+                                matched_white,
+                                options.highlight_correction,
+                            );
                             for c in 0..3 {
                                 matched[c] *= field[c];
                                 xyz[c] += weight * matched[c];
@@ -425,6 +488,7 @@ pub fn synthesize(
         modules: modules.into_iter().map(|(name, _)| name).collect(),
         covered: covered.load(std::sync::atomic::Ordering::Relaxed) as f32
             / (width * height) as f32,
+        highlight_correction: options.highlight_correction,
     })
 }
 
@@ -473,15 +537,15 @@ fn smoothstep(t: f32) -> f32 {
 
 /// Exposure that maps the reference module's bright percentile to 0.92, as
 /// the gallery previews do, from a subsample of the mosaic.
-pub fn auto_exposure(reference: &Mosaic, color: &ModuleColor) -> f32 {
+pub fn auto_exposure(reference: &Mosaic, color: &ModuleColor, highlight_correction: bool) -> f32 {
     let mut luminance = Vec::new();
     let step = 16;
     let mut y = 1;
     while y < reference.height - 2 {
         let mut x = 1;
         while x < reference.width - 2 {
-            if let Some(rgb) = reference.sample_rgb(x as f32, y as f32) {
-                luminance.push(color.luminance(rgb));
+            if let Some((rgb, sensor_white)) = reference.sample_rgb_with_white(x as f32, y as f32) {
+                luminance.push(color.xyz_for_output(rgb, sensor_white, highlight_correction)[1]);
             }
             x += step;
         }
@@ -508,6 +572,7 @@ pub fn photometric_match(
     target: &Mosaic,
     target_color: &ModuleColor,
     warp: &crate::align::Warp,
+    highlight_correction: bool,
 ) -> (f32, f32) {
     let mut pairs: Vec<(f32, f32)> = Vec::new();
     let step = 24usize;
@@ -516,15 +581,15 @@ pub fn photometric_match(
         let mut x = step;
         while x + step < reference.width {
             if let Some(q) = warp.map(x as f32, y as f32)
-                && let Some(t) = target.sample_rgb(q[0], q[1])
-                && let Some(r) = reference.sample_rgb(x as f32, y as f32)
+                && let Some((t, t_white)) = target.sample_rgb_with_white(q[0], q[1])
+                && let Some((r, r_white)) = reference.sample_rgb_with_white(x as f32, y as f32)
             {
-                let rv = reference_color.luminance(r);
+                let rv = reference_color.xyz_for_output(r, r_white, highlight_correction)[1];
                 // A mono sample is already luminance in its own units.
                 let tv = if target.is_mono() {
                     t[1]
                 } else {
-                    target_color.luminance(t)
+                    target_color.xyz_for_output(t, t_white, highlight_correction)[1]
                 };
                 if rv > 0.005 && tv > 0.005 && rv < 0.9 && tv < 0.9 {
                     pairs.push((tv, rv));
@@ -571,6 +636,7 @@ pub fn photometric_field(
     offset: f32,
     columns: usize,
     rows: usize,
+    highlight_correction: bool,
 ) -> GainField {
     let (columns, rows) = (columns.max(1), rows.max(1));
     let mut ratios: Vec<[Vec<f32>; 3]> = (0..columns * rows)
@@ -582,22 +648,25 @@ pub fn photometric_field(
         let mut x = step;
         while x + step < reference.width {
             if let Some(q) = warp.map(x as f32, y as f32)
-                && let Some(t) = target.sample_rgb(q[0], q[1])
-                && let Some(r) = reference.sample_rgb(x as f32, y as f32)
+                && let Some((t, t_white)) = target.sample_rgb_with_white(q[0], q[1])
+                && let Some((r, r_white)) = reference.sample_rgb_with_white(x as f32, y as f32)
             {
                 let column = ((q[0] / target.width as f32) * columns as f32)
                     .clamp(0.0, (columns - 1) as f32) as usize;
                 let row = ((q[1] / target.height as f32) * rows as f32)
                     .clamp(0.0, (rows - 1) as f32) as usize;
                 let cell = &mut ratios[row * columns + column];
-                let r_xyz = reference_color.to_xyz(r);
+                let r_xyz = reference_color.xyz_for_output(r, r_white, highlight_correction);
                 if target.is_mono() {
                     let tv = (gain * (t[1] - offset)).max(0.0);
                     if r_xyz[1] > 0.01 && tv > 0.01 && r_xyz[1] < 0.95 && tv < 0.95 {
                         cell[1].push(r_xyz[1] / tv);
                     }
                 } else {
-                    let t_xyz = target_color.to_xyz(t.map(|v| (gain * (v - offset)).max(0.0)));
+                    let matched = t.map(|v| (gain * (v - offset)).max(0.0));
+                    let matched_white = t_white.map(|v| (gain * (v - offset)).max(0.0));
+                    let t_xyz =
+                        target_color.xyz_for_output(matched, matched_white, highlight_correction);
                     for c in 0..3 {
                         if r_xyz[c] > 0.01 && t_xyz[c] > 0.01 && r_xyz[c] < 0.95 && t_xyz[c] < 0.95
                         {
@@ -695,5 +764,39 @@ pub fn photometric_field(
         columns,
         rows,
         gains: smooth,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_balanced_white_removes_magenta_from_clipped_neutral() {
+        let color = ModuleColor {
+            wb_gains: [2.0, 1.0, 1.5],
+            ..ModuleColor::default()
+        };
+
+        // Green has reached sensor white while red and blue continue towards
+        // their higher post-WB white points: the unhandled result is magenta.
+        let raw = [0.8, 1.0, 0.9];
+        assert_eq!(color.to_xyz(raw), [1.6, 1.0, 1.349_999_9]);
+        assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), [1.0; 3]);
+        assert_eq!(color.xyz_for_output(raw, [1.0; 3], true), [1.0; 3]);
+        assert_eq!(
+            color.xyz_for_output(raw, [1.0; 3], false),
+            color.to_xyz(raw)
+        );
+    }
+
+    #[test]
+    fn common_balanced_white_preserves_unclipped_color() {
+        let color = ModuleColor {
+            wb_gains: [2.0, 1.0, 1.5],
+            ..ModuleColor::default()
+        };
+        let raw = [0.2, 0.35, 0.3];
+        assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), color.to_xyz(raw));
     }
 }

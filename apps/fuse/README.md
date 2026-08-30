@@ -35,6 +35,8 @@ Common options include:
 - `--no-crop` renders the full reference view instead of the framed field;
 - `--camera` selects modules and can be repeated;
 - `--exclude-mono` omits monochrome luminance;
+- `--no-highlight-correction` preserves unequal clipped-channel colour for
+  downstream processing;
 - `--color display|linear` controls output encoding; and
 - `--debug-dir` writes per-module alignment checkerboards.
 
