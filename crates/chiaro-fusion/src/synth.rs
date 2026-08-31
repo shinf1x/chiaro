@@ -9,6 +9,9 @@
 //!   resolution of an A module, so it carries 6x the weight where present);
 //! - fall off smoothly towards the module's border (feathering), so seams
 //!   between the narrow-field modules and the wide reference do not show;
+//! - retain fine structure from the reference unless another module reproduces
+//!   the same edge direction at least as sharply, preventing a stack of mildly
+//!   defocused or sub-pixel-misaligned samples from softening the result;
 //! - apply the alignment's photometric gain, so exposure differences between
 //!   modules do not create brightness steps.
 //!
@@ -60,9 +63,9 @@ pub struct SynthOptions {
     pub demosaic: DemosaicMethod,
     /// Include monochrome modules (as luminance).
     pub include_mono: bool,
-    /// Neutralise false colour caused by unequal raw-channel clipping after
-    /// white balance. Disable when preserving the unmodified channel response
-    /// for a downstream raw processor.
+    /// Smoothly reconstruct false colour caused by unequal raw-channel clipping
+    /// after white balance. Disable when preserving the unmodified channel
+    /// response for a downstream raw processor.
     pub highlight_correction: bool,
     /// Worker threads for rendering (`0` = all cores).
     pub threads: usize,
@@ -159,11 +162,12 @@ impl ModuleColor {
         ])
     }
 
-    /// Convert camera RGB to XYZ while giving every white-balanced channel a
-    /// common clipping point. Raw channels saturate before white balance at
-    /// different scene intensities; without this step a clipped neutral
-    /// highlight becomes magenta when green reaches its lower balanced white
-    /// point first.
+    /// Convert camera RGB to XYZ with a smooth highlight shoulder. Raw channels
+    /// saturate before white balance at different scene intensities; without
+    /// reconstruction, a neutral highlight becomes magenta when green reaches
+    /// sensor white first. Progressively blending camera RGB towards its median
+    /// white-balanced level removes that false chroma without the sharp boundary
+    /// and flat low ceiling produced by independently clamping channels.
     #[inline]
     pub fn to_xyz_clipped(&self, rgb: [f32; 3], sensor_white: [f32; 3]) -> [f32; 3] {
         let mut balanced = [
@@ -171,17 +175,19 @@ impl ModuleColor {
             rgb[1] * self.wb_gains[1],
             rgb[2] * self.wb_gains[2],
         ];
-        let balanced_white = [
-            sensor_white[0] * self.wb_gains[0],
-            sensor_white[1] * self.wb_gains[1],
-            sensor_white[2] * self.wb_gains[2],
-        ];
-        let common_white = balanced_white
+        let proximity = rgb
             .into_iter()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .fold(f32::INFINITY, f32::min);
-        if common_white.is_finite() {
-            balanced = balanced.map(|value| value.min(common_white));
+            .zip(sensor_white)
+            .filter_map(|(value, white)| {
+                (value.is_finite() && white.is_finite() && white > 0.0).then_some(value / white)
+            })
+            .fold(0.0f32, f32::max);
+        let reconstruction = smoothstep((proximity - 0.94) / 0.06);
+        if reconstruction > 0.0 {
+            let mut levels = balanced;
+            levels.sort_by(f32::total_cmp);
+            let neutral = levels[1];
+            balanced = balanced.map(|value| value + (neutral - value) * reconstruction);
         }
         self.balanced_to_xyz(balanced)
     }
@@ -326,6 +332,8 @@ impl GainField {
 pub struct SynthSource<'a> {
     pub mosaic: &'a Mosaic,
     pub alignment: &'a ModuleAlignment,
+    /// The reference module anchors edge ownership during robust blending.
+    pub reference: bool,
     /// Linear resolution relative to the reference (focal length ratio).
     pub magnification: f32,
     /// Alignment confidence, used to stop an uncertain high-resolution
@@ -348,9 +356,12 @@ pub struct SynthReport {
     pub modules: Vec<String>,
     /// Fraction of canvas pixels with at least one contribution.
     pub covered: f32,
-    /// Whether unequal clipped-channel colour was neutralised.
+    /// Whether unequal clipped-channel colour received smooth reconstruction.
     pub highlight_correction: bool,
     pub demosaic: DemosaicMethod,
+    /// Fraction of non-reference samples rejected as strong photometric or
+    /// local-detail contradictions. Agreeing modules remain fully blended.
+    pub edge_rejected_fraction: f32,
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -400,6 +411,8 @@ pub fn synthesize(
     let width = (crop.width * scale).round().max(1.0) as usize;
     let height = (crop.height * scale).round().max(1.0) as usize;
     let covered = std::sync::atomic::AtomicUsize::new(0);
+    let edge_checked = std::sync::atomic::AtomicUsize::new(0);
+    let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
 
     write_png16_streaming_atomic_with_level(
         output,
@@ -411,6 +424,8 @@ pub fn synthesize(
         |rows, bytes| {
             let mut band = vec![0u16; rows.len() * width * 3];
             let mut band_covered = 0usize;
+            let mut band_edge_checked = 0usize;
+            let mut band_edge_rejected = 0usize;
             // Modules whose footprint can reach this band. Narrow modules
             // cover a small part of the canvas, so most bands skip them.
             let band_sources = usable
@@ -421,12 +436,24 @@ pub fn synthesize(
                 let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
                 for u in 0..width {
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
+                    let reference_luminance = band_sources
+                        .iter()
+                        .find(|source| source.reference)
+                        .and_then(|source| source_luminance(source, rx, ry, options));
+                    let reference_structure = band_sources
+                        .iter()
+                        .find(|source| source.reference)
+                        .and_then(|source| source_log_luminance_structure(source, rx, ry, options));
                     // Chroma comes from colour modules (XYZ), luminance from
                     // every module including panchromatic ones.
                     let mut xyz = [0.0f32; 3];
                     let mut color_weight = 0.0f32;
                     let mut luminance = 0.0f32;
                     let mut luminance_weight = 0.0f32;
+                    let mut reference_xyz = [0.0f32; 3];
+                    let mut reference_color_weight = 0.0f32;
+                    let mut reference_luminance_sum = 0.0f32;
+                    let mut reference_luminance_weight = 0.0f32;
                     for source in &band_sources {
                         let Some(q) = source.alignment.warp.map(rx, ry) else {
                             continue;
@@ -441,10 +468,12 @@ pub fn synthesize(
                             .min((mosaic.width - 1) as f32 - q[0])
                             .min((mosaic.height - 1) as f32 - q[1]);
                         let feather = smoothstep(border / options.feather_px.max(1.0));
-                        if feather <= 0.0 {
+                        let local_confidence = source.alignment.warp.confidence(rx, ry);
+                        if feather <= 0.0 || local_confidence <= 0.0 {
                             continue;
                         }
                         let weight = feather
+                            * local_confidence
                             * source.magnification
                             * source.magnification
                             * source.confidence;
@@ -455,8 +484,34 @@ pub fn synthesize(
                             .at(q[0], q[1], mosaic.width, mosaic.height);
                         if mosaic.is_mono() || !source.color.calibrated {
                             let y = (gain * (rgb[1] - offset)).max(0.0) * field[1];
+                            let mut edge_weight =
+                                edge_consistency_weight(reference_luminance, y, source.reference)
+                                    * detail_consistency_weight(
+                                        reference_structure,
+                                        (!source.reference)
+                                            .then(|| {
+                                                source_log_luminance_structure(
+                                                    source, rx, ry, options,
+                                                )
+                                            })
+                                            .flatten(),
+                                        source.reference,
+                                    );
+                            let rejected = edge_weight < 0.1;
+                            if rejected {
+                                edge_weight = 0.0;
+                            }
+                            if !source.reference && reference_luminance.is_some() {
+                                band_edge_checked += 1;
+                                band_edge_rejected += usize::from(rejected);
+                            }
+                            let weight = weight * edge_weight;
                             luminance += weight * y;
                             luminance_weight += weight;
+                            if source.reference {
+                                reference_luminance_sum += weight * y;
+                                reference_luminance_weight += weight;
+                            }
                         } else {
                             let matched_rgb = rgb.map(|v| (gain * (v - offset)).max(0.0));
                             let matched_white =
@@ -468,11 +523,62 @@ pub fn synthesize(
                             );
                             for c in 0..3 {
                                 matched[c] *= field[c];
+                            }
+                            let mut edge_weight = edge_consistency_weight(
+                                reference_luminance,
+                                matched[1],
+                                source.reference,
+                            ) * detail_consistency_weight(
+                                reference_structure,
+                                (!source.reference)
+                                    .then(|| {
+                                        source_log_luminance_structure(source, rx, ry, options)
+                                    })
+                                    .flatten(),
+                                source.reference,
+                            );
+                            let rejected = edge_weight < 0.1;
+                            if rejected {
+                                edge_weight = 0.0;
+                            }
+                            if !source.reference && reference_luminance.is_some() {
+                                band_edge_checked += 1;
+                                band_edge_rejected += usize::from(rejected);
+                            }
+                            let weight = weight * edge_weight;
+                            for c in 0..3 {
                                 xyz[c] += weight * matched[c];
                             }
                             color_weight += weight;
                             luminance += weight * matched[1];
                             luminance_weight += weight;
+                            if source.reference {
+                                for c in 0..3 {
+                                    reference_xyz[c] += weight * matched[c];
+                                }
+                                reference_color_weight += weight;
+                                reference_luminance_sum += weight * matched[1];
+                                reference_luminance_weight += weight;
+                            }
+                        }
+                    }
+                    let other_scale = reference_detail_protection_scale(
+                        reference_structure,
+                        reference_luminance_weight,
+                        luminance_weight,
+                    );
+                    if other_scale < 1.0 {
+                        luminance = reference_luminance_sum
+                            + (luminance - reference_luminance_sum) * other_scale;
+                        luminance_weight = reference_luminance_weight
+                            + (luminance_weight - reference_luminance_weight) * other_scale;
+                        if reference_color_weight > 0.0 {
+                            for c in 0..3 {
+                                xyz[c] =
+                                    reference_xyz[c] + (xyz[c] - reference_xyz[c]) * other_scale;
+                            }
+                            color_weight = reference_color_weight
+                                + (color_weight - reference_color_weight) * other_scale;
                         }
                     }
                     let pixel =
@@ -498,6 +604,8 @@ pub fn synthesize(
                 }
             }
             covered.fetch_add(band_covered, std::sync::atomic::Ordering::Relaxed);
+            edge_checked.fetch_add(band_edge_checked, std::sync::atomic::Ordering::Relaxed);
+            edge_rejected.fetch_add(band_edge_rejected, std::sync::atomic::Ordering::Relaxed);
             samples_to_be_bytes(&band, bytes);
         },
     )?;
@@ -517,7 +625,168 @@ pub fn synthesize(
             / (width * height) as f32,
         highlight_correction: options.highlight_correction,
         demosaic: options.demosaic,
+        edge_rejected_fraction: fraction(
+            edge_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            edge_checked.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     })
+}
+
+fn fraction(count: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f32 / total as f32
+    }
+}
+
+fn source_luminance(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<f32> {
+    let q = source.alignment.warp.map(rx, ry)?;
+    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
+    let gain = source.alignment.gain;
+    let offset = source.alignment.offset;
+    let field = source
+        .gain_field
+        .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
+    if source.mosaic.is_mono() || !source.color.calibrated {
+        Some((gain * (rgb[1] - offset)).max(0.0) * field[1])
+    } else {
+        let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
+        let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
+        Some(
+            source
+                .color
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction)[1]
+                * field[1],
+        )
+    }
+}
+
+/// Reference-space log-luminance structure sampled through one module's warp.
+/// Mapping all four neighbours independently accounts for local scale,
+/// rotation, and distortion instead of assuming sensor axes match the canvas.
+/// The third component is centre-surround contrast: unlike a gradient, it is
+/// strong at the middle of a one-pixel dark twig surrounded by bright sky.
+fn source_log_luminance_structure(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<[f32; 3]> {
+    const RADIUS: f32 = 1.5;
+    let log_sample = |x, y| {
+        source_luminance(source, x, y, options).map(|value| (1.0 + 64.0 * value.max(0.0)).ln())
+    };
+    let (centre, left, right, above, below) = (
+        log_sample(rx, ry)?,
+        log_sample(rx - RADIUS, ry)?,
+        log_sample(rx + RADIUS, ry)?,
+        log_sample(rx, ry - RADIUS)?,
+        log_sample(rx, ry + RADIUS)?,
+    );
+    Some([
+        (right - left) / (2.0 * RADIUS),
+        (below - above) / (2.0 * RADIUS),
+        (left + right + above + below) * 0.25 - centre,
+    ])
+}
+
+/// Preserve reference detail while still accepting genuinely sharper samples.
+/// A source is penalised when its edge is weaker than the reference or points
+/// in a different direction. Extra contrast in the same direction is allowed,
+/// so a finer module can add detail instead of being forced to match the
+/// reference lens's modulation exactly.
+fn detail_consistency_weight(
+    reference: Option<[f32; 3]>,
+    sample: Option<[f32; 3]>,
+    is_reference: bool,
+) -> f32 {
+    if is_reference {
+        return 1.0;
+    }
+    let Some(reference) = reference else {
+        return 1.0;
+    };
+    let reference_gradient = reference[0].hypot(reference[1]);
+    let reference_ridge = reference[2].abs();
+    let reference_strength = reference_gradient.max(reference_ridge);
+    if reference_strength < 0.01 {
+        return 1.0;
+    }
+    let Some(sample) = sample else {
+        return 0.0;
+    };
+    let gradient_error = if reference_gradient >= 0.01 {
+        let unit = [
+            reference[0] / reference_gradient,
+            reference[1] / reference_gradient,
+        ];
+        let parallel = sample[0] * unit[0] + sample[1] * unit[1];
+        let perpendicular = sample[0] * unit[1] - sample[1] * unit[0];
+        (reference_gradient - parallel)
+            .max(0.0)
+            .hypot(perpendicular)
+    } else {
+        0.0
+    };
+    let ridge_error = if reference_ridge >= 0.01 {
+        let agreeing = sample[2] * reference[2].signum();
+        (reference_ridge - agreeing).max(0.0)
+    } else {
+        0.0
+    };
+    let error = gradient_error.hypot(ridge_error);
+    let tolerance = 0.012 + 0.30 * reference_strength;
+    let relative = error / tolerance;
+    1.0 / (1.0 + relative.powi(4))
+}
+
+/// Cap the *combined* weight of other lenses around strong reference detail.
+/// Per-source robust weights are insufficient when many small residual weights
+/// collectively outvote a one-pixel twig. Flat regions retain their full
+/// denoising average; a strong edge or ridge keeps at least two thirds of its
+/// weight from the reference module.
+fn reference_detail_protection_scale(
+    reference: Option<[f32; 3]>,
+    reference_weight: f32,
+    total_weight: f32,
+) -> f32 {
+    let Some(reference) = reference else {
+        return 1.0;
+    };
+    if reference_weight <= 0.0 || total_weight <= reference_weight {
+        return 1.0;
+    }
+    let strength = reference[0].hypot(reference[1]).max(reference[2].abs());
+    if strength <= 0.01 {
+        return 1.0;
+    }
+    let protection = smoothstep((strength - 0.01) / 0.08);
+    let maximum_other_ratio = 4.0 * (1.0 - protection) + 0.5 * protection;
+    let other_weight = total_weight - reference_weight;
+    (maximum_other_ratio * reference_weight / other_weight).min(1.0)
+}
+
+/// Preserve agreeing high-resolution samples while rejecting the opposite
+/// side of a misregistered edge. Log luminance makes the test relative across
+/// shadows and highlights; a 20% difference keeps almost all weight, whereas
+/// a twofold contradiction contributes only a few percent.
+fn edge_consistency_weight(reference: Option<f32>, sample: f32, is_reference: bool) -> f32 {
+    if is_reference {
+        return 1.0;
+    }
+    let Some(reference) = reference else {
+        return 1.0;
+    };
+    let difference =
+        ((1.0 + 64.0 * reference.max(0.0)).ln() - (1.0 + 64.0 * sample.max(0.0)).ln()).abs();
+    let relative = difference / 0.30;
+    1.0 / (1.0 + relative.powi(4))
 }
 
 /// Conservative test whether any canvas pixel of `rows` can map inside the
@@ -800,6 +1069,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edge_consistency_keeps_matches_and_rejects_contradictions() {
+        assert_eq!(edge_consistency_weight(Some(0.2), 0.2, false), 1.0);
+        assert!(edge_consistency_weight(Some(0.2), 0.24, false) > 0.8);
+        assert!(edge_consistency_weight(Some(0.1), 0.5, false) < 0.05);
+        assert_eq!(edge_consistency_weight(Some(0.1), 0.5, true), 1.0);
+    }
+
+    #[test]
+    fn detail_weight_preserves_reference_edges_but_accepts_sharper_agreement() {
+        let reference = Some([0.1, 0.0, 0.0]);
+        assert_eq!(
+            detail_consistency_weight(reference, Some([0.1, 0.0, 0.0]), true),
+            1.0
+        );
+        assert!(detail_consistency_weight(reference, Some([0.2, 0.0, 0.0]), false) > 0.99);
+        assert!(detail_consistency_weight(reference, Some([0.03, 0.0, 0.0]), false) < 0.2);
+        assert!(detail_consistency_weight(reference, Some([0.0, 0.1, 0.0]), false) < 0.1);
+        assert!(detail_consistency_weight(reference, Some([-0.1, 0.0, 0.0]), false) < 0.05);
+    }
+
+    #[test]
+    fn detail_weight_protects_a_thin_dark_line_with_zero_centre_gradient() {
+        let dark_line = Some([0.0, 0.0, 0.12]);
+        assert!(detail_consistency_weight(dark_line, Some([0.0, 0.0, 0.13]), false) > 0.99);
+        assert!(detail_consistency_weight(dark_line, Some([0.0, 0.0, 0.0]), false) < 0.05);
+        assert!(detail_consistency_weight(dark_line, Some([0.0, 0.0, -0.12]), false) < 0.01);
+    }
+
+    #[test]
+    fn combined_non_reference_weight_cannot_erase_strong_thin_detail() {
+        assert_eq!(
+            reference_detail_protection_scale(Some([0.0, 0.0, 0.0]), 1.0, 10.0),
+            1.0
+        );
+        let scale = reference_detail_protection_scale(Some([0.0, 0.0, 0.2]), 1.0, 10.0);
+        assert!((scale - 0.5 / 9.0).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn common_balanced_white_removes_magenta_from_clipped_neutral() {
         let color = ModuleColor {
             wb_gains: [2.0, 1.0, 1.5],
@@ -810,8 +1118,8 @@ mod tests {
         // their higher post-WB white points: the unhandled result is magenta.
         let raw = [0.8, 1.0, 0.9];
         assert_eq!(color.to_xyz(raw), [1.6, 1.0, 1.349_999_9]);
-        assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), [1.0; 3]);
-        assert_eq!(color.xyz_for_output(raw, [1.0; 3], true), [1.0; 3]);
+        assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), [1.349_999_9; 3]);
+        assert_eq!(color.xyz_for_output(raw, [1.0; 3], true), [1.349_999_9; 3]);
         assert_eq!(
             color.xyz_for_output(raw, [1.0; 3], false),
             color.to_xyz(raw)
@@ -826,6 +1134,16 @@ mod tests {
         };
         let raw = [0.2, 0.35, 0.3];
         assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), color.to_xyz(raw));
+    }
+
+    #[test]
+    fn highlight_reconstruction_has_a_smooth_shoulder() {
+        let color = ModuleColor::default();
+        let below = color.to_xyz_clipped([0.939, 0.5, 0.5], [1.0; 3]);
+        let entering = color.to_xyz_clipped([0.941, 0.5, 0.5], [1.0; 3]);
+        let clipped = color.to_xyz_clipped([1.0, 0.5, 0.5], [1.0; 3]);
+        assert!((below[0] - entering[0]).abs() < 0.003);
+        assert_eq!(clipped, [0.5; 3]);
     }
 
     #[test]

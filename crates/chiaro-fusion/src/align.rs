@@ -26,6 +26,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::depth::{DepthAlignmentReport, DepthOptions};
 use crate::geometry::ResolvedCamera;
 use crate::image::{Plane, match_patch};
 use crate::math::{Mat3, Vec2, apply_homography};
@@ -38,6 +39,9 @@ pub struct Warp {
     pub rows: usize,
     /// `columns * rows` target coordinates; NaN where the mapping is undefined.
     pub points: Vec<[f32; 2]>,
+    /// Local synthesis confidence at every grid node. Alignment-only warps use
+    /// one; depth ambiguity and occlusion may lower it towards zero.
+    pub confidence: Vec<f32>,
 }
 
 impl Warp {
@@ -52,13 +56,20 @@ impl Warp {
         let columns = width.div_ceil(step) + 1;
         let rows = height.div_ceil(step) + 1;
         let mut points = Vec::with_capacity(columns * rows);
+        let mut confidence = Vec::with_capacity(columns * rows);
         for row in 0..rows {
             for column in 0..columns {
                 let p = [(column * step) as f64, (row * step) as f64];
-                points.push(match map(p) {
-                    Some(q) => [q[0] as f32, q[1] as f32],
-                    None => [f32::NAN, f32::NAN],
-                });
+                match map(p) {
+                    Some(q) => {
+                        points.push([q[0] as f32, q[1] as f32]);
+                        confidence.push(1.0);
+                    }
+                    None => {
+                        points.push([f32::NAN, f32::NAN]);
+                        confidence.push(0.0);
+                    }
+                }
             }
         }
         Self {
@@ -66,6 +77,7 @@ impl Warp {
             columns,
             rows,
             points,
+            confidence,
         }
     }
 
@@ -96,6 +108,26 @@ impl Warp {
         } else {
             Some(out)
         }
+    }
+
+    /// Bilinearly interpolated local confidence for synthesis.
+    #[inline]
+    pub fn confidence(&self, x: f32, y: f32) -> f32 {
+        let fx = x / self.step as f32;
+        let fy = y / self.step as f32;
+        if fx < 0.0 || fy < 0.0 || self.confidence.len() != self.points.len() {
+            return 0.0;
+        }
+        let c0 = (fx.floor() as usize).min(self.columns - 1);
+        let r0 = (fy.floor() as usize).min(self.rows - 1);
+        let c1 = (c0 + 1).min(self.columns - 1);
+        let r1 = (r0 + 1).min(self.rows - 1);
+        let tx = fx - c0 as f32;
+        let ty = fy - r0 as f32;
+        let value = |column: usize, row: usize| self.confidence[row * self.columns + column];
+        let top = value(c0, r0) * (1.0 - tx) + value(c1, r0) * tx;
+        let bottom = value(c0, r1) * (1.0 - tx) + value(c1, r1) * tx;
+        (top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0)
     }
 
     /// Local magnification (target pixels per reference pixel) at a point,
@@ -143,6 +175,10 @@ pub struct AlignmentReport {
     /// model. Low consensus usually means competing scene depths or a false
     /// correlation, even when the inlier residual itself is small.
     pub inlier_ratio: f32,
+    /// Local calibrated inverse-depth refinement, when both camera models were
+    /// available and depth-aware alignment was enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<DepthAlignmentReport>,
     /// Whether synthesis may use this module.
     pub accepted: bool,
     pub status: String,
@@ -173,6 +209,8 @@ pub struct AlignOptions {
     pub min_inlier_ratio: f32,
     /// Skip refinement and keep the factory model (for diagnostics).
     pub refine: bool,
+    /// Conservative local parallax refinement after the global homography.
+    pub depth: DepthOptions,
 }
 
 impl Default for AlignOptions {
@@ -185,6 +223,7 @@ impl Default for AlignOptions {
             inlier_px: 3.0,
             min_inlier_ratio: 0.45,
             refine: true,
+            depth: DepthOptions::default(),
         }
     }
 }

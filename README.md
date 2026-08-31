@@ -30,15 +30,19 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
 | Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks; five demosaicing methods | ❌ Not exposed |
 | Night-mode denoising | 🟡 Gallery and CLI export with gyro-seeded, motion-aware temporal and multi-camera fusion | ✅ Integrated night processing |
-| Computational fusion | 🟡 Calibrated far-scene alignment and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
+| Computational fusion | 🟡 Calibrated global alignment, dense confidence-aware depth reconstruction, and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
 | Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |
 | Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
 | Best fit | Open browsing, inspection, research, and per-module workflows | Finished-photo fusion and depth editing |
 
-The fusion pipeline currently assumes distant scenes. Near subjects may show
-parallax or ghosting, and depth-aware fusion is not yet implemented. Night
-captures can be processed from Gallery or the Chiaro Stack CLI with temporal
-and multi-camera fusion.
+The fusion pipeline builds a calibrated multi-view cost field, uses
+semi-global matching to seed a finer direct-measurement pass, and accepts only
+finite depths reproduced by independent camera evidence. Distant, ambiguous,
+or unsupported regions safely retain the global warp rather than receiving
+completed depth. Per-camera local refinement and reference-guided robust
+blending protect object boundaries from double edges. Motion seen differently
+by every exposure can still lose detail. Night captures can be processed with
+temporal and multi-camera fusion in Gallery or Chiaro Stack.
 
 ## Installation
 

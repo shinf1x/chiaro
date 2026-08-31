@@ -97,13 +97,26 @@ struct Cli {
     #[arg(long)]
     exclude_mono: bool,
 
-    /// Preserve unequal clipped-channel colour for downstream processing.
+    /// Disable smooth clipped-highlight reconstruction for downstream processing.
     #[arg(long)]
     no_highlight_correction: bool,
 
     /// Keep the factory geometry without correlation refinement (diagnostics).
     #[arg(long)]
     no_refine: bool,
+
+    /// Disable calibrated local inverse-depth refinement and keep one global
+    /// homography per module.
+    #[arg(long)]
+    no_depth: bool,
+
+    /// Nearest depth considered by local parallax refinement, in millimetres.
+    #[arg(long, default_value_t = 500.0)]
+    depth_near: f64,
+
+    /// Farthest finite depth considered by local parallax refinement, in millimetres.
+    #[arg(long, default_value_t = 10_000_000.0)]
+    depth_far: f64,
 
     /// Focus calibration outside the measured Hall range.
     #[arg(long, value_enum, default_value = "linear-hall")]
@@ -156,6 +169,9 @@ fn main() -> Result<()> {
         ..FusionOptions::default()
     };
     options.align.refine = !cli.no_refine;
+    options.align.depth.enabled = !cli.no_depth;
+    options.align.depth.near_depth = cli.depth_near;
+    options.align.depth.far_depth = cli.depth_far;
     options.crop_to_framing = !cli.no_crop;
     options.synth.canvas =
         match cli.canvas.to_ascii_lowercase().as_str() {
@@ -216,6 +232,10 @@ fn main() -> Result<()> {
             module.status
         );
     }
+    println!(
+        "robust detail/edge rejection: {:.2}% of compared non-reference samples",
+        report.synthesis.edge_rejected_fraction * 100.0
+    );
     println!(
         "timings: load {:.1}s, hotpixel {:.1}s, align {:.1}s, synthesize {:.1}s",
         report.seconds.load,

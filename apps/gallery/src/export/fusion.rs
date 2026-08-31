@@ -273,8 +273,9 @@ impl ExportPipeline for FusionExport {
             "Neutralize false colour in clipped highlights",
         )
         .on_hover_text(
-            "Enabled by default for display-ready output. Disable to preserve unequal clipped \
-             raw-channel colour for processing elsewhere.",
+            "Enabled by default for display-ready output. It smoothly removes false magenta \
+             as raw channels approach clipping. Disable to preserve the unequal channel \
+             response for processing elsewhere.",
         );
         ui.checkbox(
             &mut self.skip_existing,

@@ -6,20 +6,20 @@
 //! 1. hot-pixel removal per module (`chiaro-hotpixel-core`);
 //! 2. alignment: the factory camera model ([`calibration`], [`geometry`])
 //!    predicts where every module lands in the reference frame, then a
-//!    coarse-to-fine correlation search refines one homography per module
-//!    ([`align`]);
+//!    coarse-to-fine correlation search refines a global homography and a
+//!    dense calibrated inverse-depth reconstruction corrects parallax
+//!    ([`align`], [`depth`]);
 //! 3. synthesis: every module is resampled onto a common high-resolution
 //!    canvas with resolution-aware, feathered weights and written as a linear
 //!    or display-referred 16-bit PNG ([`synth`]).
 //!
-//! The alignment model is a per-module homography, which is exact for distant
-//! scenes (pure rotation between bearings) and degrades gracefully into
-//! ghosting for near objects. Depth-aware warps are a planned extension and
-//! the stage boundaries are designed so they can replace the homography
-//! without touching hot-pixel removal or synthesis.
+//! Ambiguous depth and occlusion estimates reduce the affected module's local
+//! synthesis confidence, allowing the reference image to remain authoritative
+//! instead of averaging incompatible surfaces.
 
 pub mod align;
 pub mod calibration;
+pub mod depth;
 pub mod geometry;
 pub mod image;
 pub mod math;

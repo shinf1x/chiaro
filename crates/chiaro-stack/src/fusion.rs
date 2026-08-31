@@ -14,6 +14,7 @@ use chiaro_fusion::{
         CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, awb_gains,
         camera_name, image_focal_length_mm, module_states,
     },
+    depth::{DenseDepthMap, refine_multiview_depth},
     geometry::{CameraRefinement, ResolvedCamera},
     image::{Mosaic, Plane},
     pipeline::{group_equivalent_focal_mm, nominal_focal_px},
@@ -83,6 +84,10 @@ pub struct NightFusionReport {
     /// noise estimate, relative to the reference module.
     pub dark_noise_weights: Vec<(String, f32)>,
     pub synthesis: SynthReport,
+    /// Exact dense reconstruction control field, retained for optional image
+    /// diagnostics but omitted from the JSON report.
+    #[serde(skip)]
+    pub depth_map: Option<DenseDepthMap>,
 }
 
 struct LoadedModule {
@@ -291,6 +296,17 @@ pub fn fuse_night(
             .map(|handle| handle.join().expect("module alignment worker panicked"))
             .collect::<Result<Vec<_>>>()
     })?;
+    let depth_map = if options.module_align.refine && options.module_align.depth.enabled {
+        progress("refine shared multi-view depth");
+        refine_multiview_depth(
+            &inputs,
+            reference_index,
+            &mut alignments,
+            &options.module_align.depth,
+        )
+    } else {
+        None
+    };
 
     let reference_calibration = calibration.cameras.get(&reference_name);
     let recorded_wb = awb_gains(&messages).map(|gains| gains.map(|gain| gain as f32));
@@ -388,6 +404,7 @@ pub fn fuse_night(
             |(((module, alignment), (color, gain_field)), magnification)| SynthSource {
                 mosaic: &module.mosaic,
                 alignment,
+                reference: alignment.name == reference_name,
                 magnification: *magnification,
                 confidence: alignment_confidence(alignment, &reference_name, &options.module_align)
                     * noise_confidence(reference_noise, module.dark_noise_variance),
@@ -423,6 +440,7 @@ pub fn fuse_night(
             .collect(),
         dark_noise_weights,
         synthesis,
+        depth_map,
     };
     let report_path = output.with_extension("night-fusion.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)

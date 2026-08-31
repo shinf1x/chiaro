@@ -77,6 +77,18 @@ struct Cli {
     #[arg(long)]
     no_refine: bool,
 
+    /// Disable calibrated local inverse-depth refinement during cross-module fusion.
+    #[arg(long)]
+    no_depth: bool,
+
+    /// Nearest depth considered by cross-module refinement, in millimetres.
+    #[arg(long, default_value_t = 500.0)]
+    depth_near: f64,
+
+    /// Farthest finite depth considered by cross-module refinement, in millimetres.
+    #[arg(long, default_value_t = 10_000_000.0)]
+    depth_far: f64,
+
     /// Disable the row-indexed gyroscope rotation seed.
     #[arg(long)]
     no_gyro_seed: bool,
@@ -94,7 +106,7 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// Write the chosen reference and effective-frame-count images beside the output.
+    /// Write reference/contribution images and, for all-module fusion, depth maps.
     #[arg(long)]
     diagnostics: bool,
 }
@@ -117,17 +129,36 @@ fn main() -> Result<()> {
         };
         options.temporal_align.refine = !cli.no_refine;
         options.module_align.refine = !cli.no_refine;
+        options.module_align.depth.enabled = !cli.no_depth;
+        options.module_align.depth.near_depth = cli.depth_near;
+        options.module_align.depth.far_depth = cli.depth_far;
         options.synth.threads = cli.threads;
         options.synth.demosaic = cli.demosaic.into();
         set_output_color(&mut options, cli.linear);
         let report = fuse_night(&lri, &options, &cli.output, &mut |detail| {
             eprintln!("{detail}…");
         })?;
+        if cli.diagnostics
+            && let Some(depth_map) = &report.depth_map
+        {
+            let inverse_path = sibling(&cli.output, "depth-inverse", "png");
+            let provenance_path = sibling(&cli.output, "depth-provenance", "png");
+            let visualization_path = sibling(&cli.output, "depth-visualization", "png");
+            depth_map.write_diagnostics(&inverse_path, &provenance_path)?;
+            depth_map.write_visualization(&visualization_path)?;
+            eprintln!("inverse depth: {}", inverse_path.display());
+            eprintln!("depth provenance: {}", provenance_path.display());
+            eprintln!("depth visualization: {}", visualization_path.display());
+        }
         eprintln!(
             "wrote {} from {} stacked modules at common temporal frame {}",
             cli.output.display(),
             report.temporal.len(),
             report.reference_frame
+        );
+        eprintln!(
+            "robust detail/edge rejection: {:.2}% of compared non-reference samples",
+            report.synthesis.edge_rejected_fraction * 100.0
         );
         eprintln!(
             "report: {}",

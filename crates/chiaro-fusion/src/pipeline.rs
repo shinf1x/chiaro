@@ -27,6 +27,7 @@ use crate::calibration::{
     CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, awb_gains,
     image_focal_length_mm, module_states,
 };
+use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
 use crate::synth::{
@@ -430,8 +431,30 @@ pub fn fuse(
             .map(|handle| handle.join().expect("alignment worker panicked"))
             .collect::<Result<Vec<ModuleAlignment>>>()
     })?;
+    let depth_map = if options.align.refine && options.align.depth.enabled {
+        progress(Progress {
+            stage: "align",
+            detail: "multi-view local depth refinement".to_owned(),
+            fraction: 0.45,
+        });
+        refine_multiview_depth(
+            &inputs,
+            reference_index,
+            &mut alignments,
+            &options.align.depth,
+        )
+    } else {
+        None
+    };
     if let Some(debug_dir) = &options.debug_dir {
         fs::create_dir_all(debug_dir).with_context(|| format!("create {}", debug_dir.display()))?;
+        if let Some(depth_map) = &depth_map {
+            depth_map.write_diagnostics(
+                &debug_dir.join("depth-inverse.png"),
+                &debug_dir.join("depth-provenance.png"),
+            )?;
+            depth_map.write_visualization(&debug_dir.join("depth-visualization.png"))?;
+        }
         for (module, alignment) in modules.iter().zip(&alignments) {
             if module.raw.name == reference_name {
                 continue;
@@ -603,6 +626,7 @@ pub fn fuse(
         .map(|((module, alignment), (color, gain_field))| SynthSource {
             mosaic: &module.mosaic,
             alignment,
+            reference: alignment.name == reference_name,
             magnification: magnification(module),
             confidence: synthesis_confidence(alignment),
             color: *color,

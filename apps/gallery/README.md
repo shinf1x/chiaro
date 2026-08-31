@@ -100,9 +100,13 @@ without the remaining geometry and mirror-aiming data.
 
 ## Important limitations
 
-- Fusion uses one refined homography per module and is intended for distant
-  scenes. Near subjects can ghost because depth-dependent parallax is not yet
-  modelled.
+- Fusion combines a refined global homography with fine-grid direct
+  multi-camera depth measurements. Semi-global matching supplies search seeds
+  but cannot fill final gaps; distant or ambiguous regions retain global
+  alignment. Robust reference-guided blending suppresses contradictory double
+  edges, protects thin reference structures, and prevents weaker, misaligned
+  detail from softening the reference, but detail that moved differently in
+  every exposure cannot be reconstructed.
 - Disconnecting USB during an active PTP operation can leave some L16 cameras
   unresponsive. Recovery may require holding the camera power button for about
   30 seconds.
