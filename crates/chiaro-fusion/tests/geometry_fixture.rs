@@ -75,6 +75,9 @@ fn cameras(db: &CalibrationDatabase, states: &[ModuleState]) -> HashMap<String, 
 fn calibration_database_resolves_every_module_of_the_device() {
     let (db, _, _) = load();
     assert_eq!(db.cameras.len(), 16, "{:?}", db.cameras.keys());
+    let noise = db.sensor_noise_profiles.get(&2).unwrap();
+    assert_eq!(noise.models.first().unwrap().gain, 100);
+    assert_eq!(noise.models.last().unwrap().gain, 775);
     let a1 = db.camera("A1").unwrap();
     assert!(a1.canonical_pose.is_some() && a1.mirror.is_none() && a1.distortion.is_some());
     assert!(a1.intrinsics.len() >= 2);
@@ -104,6 +107,30 @@ fn calibration_overlays_are_rejected_across_physical_devices() {
     }
     let rejected = CalibrationDatabase::from_capture_and_overlays(&capture, &[overlay]);
     assert_eq!(rejected.cameras.len(), embedded.cameras.len());
+    assert_eq!(
+        rejected.sensor_noise_profiles,
+        embedded.sensor_noise_profiles
+    );
+}
+
+#[test]
+fn matching_overlay_supplies_missing_sensor_noise_profile() {
+    let mut capture =
+        LriMessages::parse(&fs::read(fixture_dir().join("L16_04366_headers.lri")).unwrap())
+            .unwrap();
+    for header in &mut capture.headers {
+        header.sensor_data.clear();
+    }
+    let overlay =
+        LriMessages::parse(&fs::read(fixture_dir().join("calibration.lri")).unwrap()).unwrap();
+
+    let embedded = CalibrationDatabase::from_capture_and_overlays(&capture, &[]);
+    assert!(embedded.sensor_noise_profiles.is_empty());
+
+    let supplemented = CalibrationDatabase::from_capture_and_overlays(&capture, &[overlay]);
+    let noise = supplemented.sensor_noise_profiles.get(&2).unwrap();
+    assert_eq!(noise.models.first().unwrap().gain, 100);
+    assert_eq!(noise.models.last().unwrap().gain, 775);
 }
 
 #[test]

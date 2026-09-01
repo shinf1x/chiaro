@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chiaro_fusion::calibration::{CalibrationDatabase, LriMessages};
 use chiaro_hotpixel_core::{
     demosaic::DemosaicMethod,
     hotpixel::HotpixelRec,
@@ -144,6 +145,22 @@ fn main() -> Result<()> {
         ..StackOptions::default()
     };
     options.align.refine = !cli.no_refine;
+    if !cli.overlays.is_empty() {
+        let capture = LriMessages::parse(&lri)?;
+        let overlays = cli
+            .overlays
+            .iter()
+            .map(|path| {
+                LriMessages::parse(
+                    &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+                )
+                .with_context(|| format!("parse {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        options.noise_profiles =
+            CalibrationDatabase::from_capture_and_overlays(&capture, &overlays)
+                .sensor_noise_profiles;
+    }
     if let Some(path) = &cli.hotpixel_rec {
         let camera_id = camera_index(&options.camera)
             .with_context(|| format!("unknown L16 camera {}", options.camera))?;

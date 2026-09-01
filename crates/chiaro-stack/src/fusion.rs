@@ -210,6 +210,7 @@ pub fn fuse_night(
             gyro_seed: options.gyro_seed,
             focal_px: Some(focal),
             motion_seeds,
+            noise_profiles: calibration.sensor_noise_profiles.clone(),
             demosaic: options.synth.demosaic,
             threads: options.threads,
         };

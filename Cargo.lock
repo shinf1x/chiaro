@@ -648,6 +648,7 @@ version = "0.3.4"
 dependencies = [
  "anyhow",
  "chiaro",
+ "chiaro-fusion",
  "chiaro-hotpixel-core",
  "chiaro-stack",
  "clap",

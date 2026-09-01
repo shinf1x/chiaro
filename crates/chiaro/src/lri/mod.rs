@@ -201,10 +201,12 @@ pub struct NoiseChannelModel {
 }
 
 /// One gain-specific variance-stabilising/noise model embedded by the camera.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoiseModel {
     /// Gain in ISO-like hundredths (for example `775` for an analog gain of `7.75`).
     pub gain: u32,
+    /// Factory variance-stabilising transform parameters. Direct variance
+    /// weighting uses the channel `a`/`b` models below instead.
     pub threshold: f32,
     pub scale: f32,
     pub red: NoiseChannelModel,
@@ -219,17 +221,87 @@ pub struct SensorNoiseProfile {
     pub sensor_type: u64,
     pub black_level: f32,
     pub white_level: f32,
+    /// Low-signal continuation slope for the factory VST.
     pub cliff_slope: f32,
     pub models: Vec<NoiseModel>,
 }
 
+/// Sensor-characterization family for a hardware sensor enum value.
+///
+/// Light stores one characterization for the colour silicon and includes a
+/// separate panchromatic channel model for the CFA-free variant. Hardware
+/// metadata nevertheless identifies those monochrome parts with their own
+/// enum values.
+pub fn sensor_characterization_type(sensor_type: u64) -> u64 {
+    match sensor_type {
+        3 => 2, // SENSOR_AR1335_MONO -> SENSOR_AR1335
+        5 => 4, // SENSOR_IMX386_MONO -> SENSOR_IMX386
+        other => other,
+    }
+}
+
 impl SensorNoiseProfile {
-    /// Model nearest to the frame's total gain.
-    pub fn nearest_model(&self, analog_gain: f32, digital_gain: f32) -> Option<&NoiseModel> {
+    /// Noise model at the frame's total gain.
+    ///
+    /// The factory table is sampled at gain intervals of 0.25. Interpolate
+    /// between the adjacent entries instead of snapping exposure metadata to
+    /// one side of an interval; gains beyond the calibrated range clamp to
+    /// the nearest endpoint.
+    pub fn model_for_gain(&self, analog_gain: f32, digital_gain: f32) -> Option<NoiseModel> {
         let gain = (analog_gain.max(0.0) * digital_gain.max(0.0) * 100.0).round() as u32;
-        self.models
+        let lower = self
+            .models
             .iter()
-            .min_by_key(|model| model.gain.abs_diff(gain))
+            .filter(|model| model.gain <= gain)
+            .max_by_key(|model| model.gain);
+        let upper = self
+            .models
+            .iter()
+            .filter(|model| model.gain >= gain)
+            .min_by_key(|model| model.gain);
+        match (lower, upper) {
+            (Some(left), Some(right)) if left.gain != right.gain => {
+                let t = (gain - left.gain) as f32 / (right.gain - left.gain) as f32;
+                Some(left.interpolate(*right, gain, t))
+            }
+            (Some(model), _) | (_, Some(model)) => Some(*model),
+            (None, None) => None,
+        }
+    }
+
+    /// Add calibration points absent from this profile, retaining the first
+    /// source at duplicate gains. Capture-embedded data can therefore take
+    /// priority while a device-matched calibration file fills any gaps.
+    pub fn merge_missing(&mut self, other: &Self) {
+        for model in &other.models {
+            if !self
+                .models
+                .iter()
+                .any(|existing| existing.gain == model.gain)
+            {
+                self.models.push(*model);
+            }
+        }
+        self.models.sort_by_key(|model| model.gain);
+    }
+}
+
+impl NoiseModel {
+    fn interpolate(self, other: Self, gain: u32, t: f32) -> Self {
+        let scalar = |left: f32, right: f32| left + (right - left) * t;
+        let channel = |left: NoiseChannelModel, right: NoiseChannelModel| NoiseChannelModel {
+            a: scalar(left.a, right.a),
+            b: scalar(left.b, right.b),
+        };
+        Self {
+            gain,
+            threshold: scalar(self.threshold, other.threshold),
+            scale: scalar(self.scale, other.scale),
+            red: channel(self.red, other.red),
+            green: channel(self.green, other.green),
+            blue: channel(self.blue, other.blue),
+            panchromatic: channel(self.panchromatic, other.panchromatic),
+        }
     }
 }
 
@@ -427,10 +499,20 @@ pub fn parse_raw_layout(
             black_level: capture
                 .sensor_levels
                 .get(&sensor)
+                .or_else(|| {
+                    capture
+                        .sensor_levels
+                        .get(&sensor_characterization_type(sensor))
+                })
                 .map_or(42.0, |levels| levels.0),
             white_level: capture
                 .sensor_levels
                 .get(&sensor)
+                .or_else(|| {
+                    capture
+                        .sensor_levels
+                        .get(&sensor_characterization_type(sensor))
+                })
                 .map_or(1023.0, |levels| levels.1),
         });
     }
@@ -485,6 +567,11 @@ pub fn parse_frame_layout(
         let (black_level, white_level) = capture
             .sensor_levels
             .get(&sensor_type)
+            .or_else(|| {
+                capture
+                    .sensor_levels
+                    .get(&sensor_characterization_type(sensor_type))
+            })
             .copied()
             .unwrap_or((42.0, 1023.0));
         // Bayer-JPEG stores 8-bit samples after the camera's own RAW-domain
@@ -1578,7 +1665,8 @@ fn parse_sensor_characterization(message: &SensorCharacterization) -> Option<(f3
         .filter(|(black, white)| white > black)
 }
 
-fn parse_sensor_noise_profile(
+/// Decode a sensor-family noise profile from one factory characterization.
+pub fn parse_sensor_noise_profile(
     sensor_type: u64,
     message: &SensorCharacterization,
 ) -> Option<SensorNoiseProfile> {
@@ -2411,6 +2499,86 @@ mod tests {
         }
         let gains = decode_proto::<ChannelGain>(&gains, "ChannelGain").unwrap();
         assert_eq!(parse_channel_gains(&gains), Some([1.9, 1.0, 1.4]));
+    }
+
+    #[test]
+    fn sensor_noise_profile_interpolates_gain_and_clamps_endpoints() {
+        let model = |gain, value| NoiseModel {
+            gain,
+            threshold: value,
+            scale: value * 2.0,
+            red: NoiseChannelModel {
+                a: value,
+                b: value + 1.0,
+            },
+            green: NoiseChannelModel {
+                a: value + 2.0,
+                b: value + 3.0,
+            },
+            blue: NoiseChannelModel {
+                a: value + 4.0,
+                b: value + 5.0,
+            },
+            panchromatic: NoiseChannelModel {
+                a: value + 6.0,
+                b: value + 7.0,
+            },
+        };
+        let profile = SensorNoiseProfile {
+            sensor_type: 2,
+            black_level: 42.0,
+            white_level: 1023.0,
+            cliff_slope: 2.0,
+            models: vec![model(200, 2.0), model(100, 1.0)],
+        };
+
+        assert_eq!(profile.model_for_gain(0.5, 1.0), Some(model(100, 1.0)));
+        assert_eq!(profile.model_for_gain(3.0, 1.0), Some(model(200, 2.0)));
+        assert_eq!(profile.model_for_gain(1.5, 1.0), Some(model(150, 1.5)));
+    }
+
+    #[test]
+    fn sensor_noise_profile_merge_retains_primary_duplicate() {
+        let channel = NoiseChannelModel { a: 1.0, b: 2.0 };
+        let model = |gain, scale| NoiseModel {
+            gain,
+            threshold: 0.0,
+            scale,
+            red: channel,
+            green: channel,
+            blue: channel,
+            panchromatic: channel,
+        };
+        let mut primary = SensorNoiseProfile {
+            sensor_type: 2,
+            black_level: 42.0,
+            white_level: 1023.0,
+            cliff_slope: 2.0,
+            models: vec![model(200, 2.0), model(100, 1.0)],
+        };
+        let supplement = SensorNoiseProfile {
+            models: vec![model(200, 99.0), model(150, 1.5)],
+            ..primary.clone()
+        };
+
+        primary.merge_missing(&supplement);
+
+        assert_eq!(
+            primary
+                .models
+                .iter()
+                .map(|model| (model.gain, model.scale))
+                .collect::<Vec<_>>(),
+            vec![(100, 1.0), (150, 1.5), (200, 2.0)]
+        );
+    }
+
+    #[test]
+    fn monochrome_sensor_variants_share_their_silicon_characterization() {
+        assert_eq!(sensor_characterization_type(2), 2);
+        assert_eq!(sensor_characterization_type(3), 2);
+        assert_eq!(sensor_characterization_type(4), 4);
+        assert_eq!(sensor_characterization_type(5), 4);
     }
 
     #[test]

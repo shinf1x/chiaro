@@ -22,6 +22,12 @@ seed. Correlation refines that seed, and the reference module's measured motion
 is projected into the remaining modules according to focal length. The same
 temporal reference is used throughout the device.
 
+Temporal rejection is normalized by the factory signal-dependent noise model
+for each frame's recorded gain. Models are interpolated between calibration
+points; monochrome modules use their panchromatic characterization. The
+capture's embedded table is preferred and a device-matched `calibration.lri`
+can fill missing entries, including in single-camera mode.
+
 ```bash
 chiaro-stack capture.lri --camera A1 --output A1-night.png --diagnostics
 ```

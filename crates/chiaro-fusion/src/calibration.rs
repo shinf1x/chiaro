@@ -19,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chiaro::lri::inspect_lelr_block_header;
+use chiaro::lri::{SensorNoiseProfile, inspect_lelr_block_header, parse_sensor_noise_profile};
 use chiaro_proto::{
     Message,
     geometric_calibration::geometric_calibration::MirrorType,
@@ -482,6 +482,9 @@ pub struct CalibrationDatabase {
     pub cameras: BTreeMap<String, CameraCalibration>,
     /// Sensor type enum value per camera from `hw_info`.
     pub sensor_types: HashMap<String, i32>,
+    /// Gain-indexed sensor noise profiles. Earlier headers take priority at a
+    /// duplicate gain; device-matched overlays supplement missing points.
+    pub sensor_noise_profiles: HashMap<u64, SensorNoiseProfile>,
 }
 
 impl CalibrationDatabase {
@@ -490,6 +493,29 @@ impl CalibrationDatabase {
         let mut db = Self::default();
         let mut seen_k = HashMap::<String, Vec<(Option<f64>, Mat3)>>::new();
         for header in headers {
+            for sensor in &header.sensor_data {
+                let Some(sensor_type) = sensor.type_.map(|value| value.value()) else {
+                    continue;
+                };
+                let Ok(sensor_type) = u64::try_from(sensor_type) else {
+                    continue;
+                };
+                let Some(profile) = sensor
+                    .data
+                    .as_ref()
+                    .and_then(|data| parse_sensor_noise_profile(sensor_type, data))
+                else {
+                    continue;
+                };
+                match db.sensor_noise_profiles.entry(sensor_type) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().merge_missing(&profile);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(profile);
+                    }
+                }
+            }
             if let Some(hw) = header.hw_info.as_ref() {
                 for item in &hw.camera {
                     if let (Some(id), Some(sensor)) = (item.id, item.sensor) {

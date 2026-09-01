@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 chiaro.workspace = true
+chiaro-fusion.workspace = true
 chiaro-hotpixel-core.workspace = true
 chiaro-stack.workspace = true
 serde_json.workspace = true

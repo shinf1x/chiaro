@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use chiaro::lri::{
-    MotionSequence, NoiseChannelModel, RawCamera, RawFrame, SensorPattern, decode_raw_frame,
-    parse_frame_layout,
+    MotionSequence, NoiseChannelModel, NoiseModel, RawCamera, RawFrame, SensorNoiseProfile,
+    SensorPattern, decode_raw_frame, parse_frame_layout, sensor_characterization_type,
 };
 use chiaro_fusion::{
     align::{AlignInput, AlignOptions, AlignmentReport, AlignmentSeed, Warp, align_module_seeded},
@@ -46,6 +46,10 @@ pub struct StackOptions {
     pub focal_px: Option<f64>,
     /// Refined rig-motion seeds from another module, keyed by temporal frame.
     pub motion_seeds: HashMap<u64, Warp>,
+    /// Device-matched noise profiles supplied by calibration overlays. The
+    /// capture's embedded points retain priority; these fill missing sensors
+    /// or gain entries.
+    pub noise_profiles: HashMap<u64, SensorNoiseProfile>,
     pub demosaic: DemosaicMethod,
     pub threads: usize,
 }
@@ -64,6 +68,7 @@ impl Default for StackOptions {
             gyro_seed: true,
             focal_px: None,
             motion_seeds: HashMap::new(),
+            noise_profiles: HashMap::new(),
             demosaic: DemosaicMethod::Lmmse,
             threads: 0,
         }
@@ -74,6 +79,7 @@ impl Default for StackOptions {
 pub struct FrameReport {
     pub frame_index: u64,
     pub sharpness: f32,
+    pub noise_model_gain: Option<u32>,
     pub is_reference: bool,
     pub accepted: bool,
     pub alignment: AlignmentReport,
@@ -124,6 +130,7 @@ struct PreparedFrame {
     mosaic: Mosaic,
     luminance: Plane,
     sharpness: f32,
+    noise_model: Option<NoiseModel>,
 }
 
 struct AlignedFrame {
@@ -178,8 +185,18 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
     if options.motion_sigma <= 0.0 || !options.motion_sigma.is_finite() {
         bail!("motion sigma must be finite and greater than zero");
     }
-    let layout =
+    let mut layout =
         parse_frame_layout(data, &HashMap::new()).map_err(|error| anyhow::anyhow!(error))?;
+    for (sensor, profile) in &options.noise_profiles {
+        match layout.sensor_profiles.entry(*sensor) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge_missing(profile);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(profile.clone());
+            }
+        }
+    }
     let motion_sequences = layout.motion_sequences.clone();
     let mut selected = layout
         .frames
@@ -235,6 +252,17 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
 
     let mut prepared = Vec::with_capacity(selected.len());
     for frame in selected {
+        let noise_model = layout
+            .sensor_profiles
+            .get(&frame.sensor_type)
+            .or_else(|| {
+                layout
+                    .sensor_profiles
+                    .get(&sensor_characterization_type(frame.sensor_type))
+            })
+            .and_then(|profile| {
+                profile.model_for_gain(frame.camera.analog_gain, frame.camera.digital_gain)
+            });
         let raw = decode_raw_frame(data, &frame).map_err(|error| anyhow::anyhow!(error))?;
         let corrected = pipeline
             .correct_raw(&frame.camera, raw, severity)
@@ -256,6 +284,7 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             mosaic,
             luminance,
             sharpness,
+            noise_model,
         });
     }
     let reference_index = match options.reference_frame {
@@ -353,16 +382,7 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         });
     }
 
-    let noise_model = layout
-        .sensor_profiles
-        .get(&reference.frame.sensor_type)
-        .and_then(|profile| {
-            profile.nearest_model(
-                reference.frame.camera.analog_gain,
-                reference.frame.camera.digital_gain,
-            )
-        });
-    let channel_noise = noise_model.map(|model| [model.red, model.green, model.blue]);
+    let noise_model = reference.noise_model;
     let width = reference.frame.camera.width;
     let height = reference.frame.camera.height;
     let pattern = reference.frame.camera.pattern;
@@ -391,17 +411,22 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
                     let Some(position) = alignment.warp.map(x as f32, y as f32) else {
                         continue;
                     };
-                    let Some(value) = frame
-                        .mosaic
-                        .sample_channel(position[0], position[1], channel)
-                        .map(|value| value * alignment.gain)
+                    let Some(target_value) =
+                        frame
+                            .mosaic
+                            .sample_channel(position[0], position[1], channel)
                     else {
                         continue;
                     };
+                    let value = target_value * alignment.gain;
                     let variance = pair_variance(
-                        reference_value.max(value),
-                        channel_noise.map(|models| models[channel]),
-                        frame.frame.camera.white_level,
+                        reference_value,
+                        noise_channel(noise_model, pattern, channel),
+                        raw_code_range(&reference.frame.camera),
+                        target_value,
+                        noise_channel(frame.noise_model, pattern, channel),
+                        raw_code_range(&frame.frame.camera),
+                        alignment.gain,
                     );
                     let residual = (value - reference_value).powi(2);
                     let ratio = residual / (sigma2 * variance).max(1e-9);
@@ -427,17 +452,11 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         .map(|count| *count as f64 / 16384.0)
         .sum::<f64>()
         / effective_count.len() as f64;
-    let dark_channel = noise_model.map(|model| {
-        if pattern == SensorPattern::Mono {
-            model.panchromatic
-        } else {
-            model.green
-        }
+    let dark_channel = noise_channel(noise_model, pattern, 1);
+    let dark_noise_variance = dark_channel.map(|channel| {
+        single_variance(0.05, Some(channel), raw_code_range(&reference.frame.camera))
+            / (mean_effective_frames as f32).max(1.0)
     });
-    let dark_noise_variance = Some(
-        single_variance(0.05, dark_channel, reference.frame.camera.white_level)
-            / (mean_effective_frames as f32).max(1.0),
-    );
     let fallback_fraction = effective_count
         .iter()
         .filter(|count| **count < 18432)
@@ -458,6 +477,7 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         .map(|(frame, alignment)| FrameReport {
             frame_index: alignment.frame_index,
             sharpness: frame.sharpness,
+            noise_model_gain: frame.noise_model.map(|model| model.gain),
             is_reference: frame.frame.frame_index == reference.frame.frame_index,
             accepted: alignment.accepted,
             alignment: alignment.report,
@@ -643,14 +663,44 @@ fn laplacian_energy(plane: &Plane) -> f32 {
     (sum / count.max(1) as f64) as f32
 }
 
-fn pair_variance(signal: f32, model: Option<NoiseChannelModel>, white_level: f32) -> f32 {
-    // Two independently noisy observations are compared. Quantisation is a
-    // conservative floor, especially important for 8-bit Bayer-JPEG bursts.
-    2.0 * single_variance(signal, model, white_level)
+fn noise_channel(
+    model: Option<NoiseModel>,
+    pattern: SensorPattern,
+    channel: usize,
+) -> Option<NoiseChannelModel> {
+    model.map(|model| {
+        if pattern == SensorPattern::Mono {
+            model.panchromatic
+        } else {
+            [model.red, model.green, model.blue][channel]
+        }
+    })
 }
 
-fn single_variance(signal: f32, model: Option<NoiseChannelModel>, white_level: f32) -> f32 {
-    let quantisation = 1.0 / white_level.max(1.0);
+fn raw_code_range(camera: &RawCamera) -> f32 {
+    (camera.white_level - camera.black_level).max(1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pair_variance(
+    reference_signal: f32,
+    reference_model: Option<NoiseChannelModel>,
+    reference_code_range: f32,
+    target_signal: f32,
+    target_model: Option<NoiseChannelModel>,
+    target_code_range: f32,
+    target_gain: f32,
+) -> f32 {
+    // Two independently noisy observations are compared. The target is
+    // photometrically scaled into reference units, so its variance scales by
+    // the square of the same gain. Quantisation remains a conservative floor,
+    // especially for 8-bit Bayer-JPEG burst frames.
+    single_variance(reference_signal, reference_model, reference_code_range)
+        + target_gain.powi(2) * single_variance(target_signal, target_model, target_code_range)
+}
+
+fn single_variance(signal: f32, model: Option<NoiseChannelModel>, code_range: f32) -> f32 {
+    let quantisation = 1.0 / code_range.max(1.0);
     model
         .map(|model| model.a * signal + model.b)
         .unwrap_or(quantisation * quantisation)
@@ -695,17 +745,46 @@ mod tests {
     #[test]
     fn noise_variance_has_a_quantisation_floor() {
         let model = NoiseChannelModel { a: 0.01, b: -1.0 };
-        let actual = pair_variance(0.5, Some(model), 255.0);
+        let actual = pair_variance(0.5, Some(model), 255.0, 0.5, Some(model), 255.0, 1.0);
         let expected = 2.0 / 255.0f32.powi(2);
         assert!((actual - expected).abs() < 1e-10);
     }
 
     #[test]
     fn a_four_sigma_outlier_gets_zero_weight() {
-        let variance = pair_variance(0.2, None, 255.0);
+        let variance = pair_variance(0.2, None, 255.0, 0.2, None, 255.0, 1.0);
         let residual = 16.0 * variance;
         let ratio = residual / (16.0 * variance);
         assert_eq!((1.0 - ratio).clamp(0.0, 1.0).powi(2), 0.0);
+    }
+
+    #[test]
+    fn target_noise_variance_follows_photometric_gain() {
+        let model = NoiseChannelModel { a: 0.01, b: 0.0 };
+        let actual = pair_variance(0.2, Some(model), 1023.0, 0.1, Some(model), 1023.0, 2.0);
+        assert!((actual - 0.006).abs() < 1e-8);
+    }
+
+    #[test]
+    fn monochrome_uses_the_panchromatic_noise_channel() {
+        let channel = |a| NoiseChannelModel { a, b: 0.0 };
+        let model = NoiseModel {
+            gain: 100,
+            threshold: 0.0,
+            scale: 1.0,
+            red: channel(1.0),
+            green: channel(2.0),
+            blue: channel(3.0),
+            panchromatic: channel(4.0),
+        };
+        assert_eq!(
+            noise_channel(Some(model), SensorPattern::Mono, 0),
+            Some(channel(4.0))
+        );
+        assert_eq!(
+            noise_channel(Some(model), SensorPattern::Rggb, 0),
+            Some(channel(1.0))
+        );
     }
 
     #[test]
