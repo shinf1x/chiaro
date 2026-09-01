@@ -12,10 +12,8 @@ use std::{collections::HashMap, env, path::Path, time::Instant};
 
 use chiaro::lri::{SensorPattern, parse_raw_layout};
 use chiaro_hotpixel_core::{
-    correct::{
-        correct_hot_pixels_threaded, correct_hot_pixels_with_forced_map, demosaic_bilinear,
-        demosaic_bilinear_threaded,
-    },
+    correct::{correct_hot_pixels_threaded, correct_hot_pixels_with_forced_map, demosaic_bilinear},
+    demosaic::{DemosaicMethod, demosaic},
     hotpixel::HotpixelRec,
     pipeline::{FramePipeline, OutputMode, extract_raw_plane, extract_raw_plane_threaded},
     png16::{write_gray16_native_atomic, write_rgb16_native_atomic},
@@ -129,10 +127,24 @@ fn main() -> anyhow::Result<()> {
         timed("demosaic (1 thread)", repeats, || {
             demosaic_bilinear(&glow, camera.width, camera.height, camera.pattern).unwrap()
         });
-        Some(timed("demosaic (all threads)", repeats, || {
-            demosaic_bilinear_threaded(&glow, camera.width, camera.height, camera.pattern, 0)
+        let mut default_rgb = None;
+        for method in DemosaicMethod::ALL {
+            let result = timed(&format!("demosaic {method} (all threads)"), repeats, || {
+                demosaic(
+                    &glow,
+                    camera.width,
+                    camera.height,
+                    camera.pattern,
+                    method,
+                    0,
+                )
                 .unwrap()
-        }))
+            });
+            if method == DemosaicMethod::default() {
+                default_rgb = Some(result);
+            }
+        }
+        default_rgb
     } else {
         None
     };

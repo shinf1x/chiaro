@@ -29,7 +29,7 @@ chiaro-stack capture.lri --camera A1 --output A1-night.png --diagnostics
 The factory hot-pixel file should come from the camera that made the capture.
 `--diagnostics` also writes the selected reference image, an effective-frame
 count map, and a JSON report with alignment quality. Use `--linear` to preserve
-linear camera RGB for downstream processing.
+linear camera RGB for downstream processing. `--demosaic` accepts `simple`, `amaze`, `rcd`, `lmmse`, or `igv`. AMaZE is the default.
 
 Temporal rejection is per pixel. Cross-module alignment currently uses one
 refined homography per physical module, so strong depth-dependent parallax can

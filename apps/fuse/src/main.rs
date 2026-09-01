@@ -6,6 +6,7 @@ use clap::{Parser, ValueEnum};
 use chiaro_fusion::calibration::IntrinsicsMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::synth::{CanvasMode, OutputColor};
+use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::scan::mmap_file;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -18,6 +19,27 @@ enum Color {
 enum Intrinsics {
     LinearHall,
     Clamp,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Demosaic {
+    Simple,
+    Amaze,
+    Rcd,
+    Lmmse,
+    Igv,
+}
+
+impl From<Demosaic> for DemosaicMethod {
+    fn from(value: Demosaic) -> Self {
+        match value {
+            Demosaic::Simple => Self::Simple,
+            Demosaic::Amaze => Self::Amaze,
+            Demosaic::Rcd => Self::Rcd,
+            Demosaic::Lmmse => Self::Lmmse,
+            Demosaic::Igv => Self::Igv,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -66,6 +88,10 @@ struct Cli {
 
     #[arg(long, value_enum, default_value = "display")]
     color: Color,
+
+    /// Bayer reconstruction method.
+    #[arg(long, value_enum, default_value = "amaze")]
+    demosaic: Demosaic,
 
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
@@ -142,6 +168,7 @@ fn main() -> Result<()> {
             })?),
         };
     options.synth.include_mono = !cli.exclude_mono;
+    options.synth.demosaic = cli.demosaic.into();
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;

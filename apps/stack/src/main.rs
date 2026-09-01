@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chiaro_hotpixel_core::{
+    demosaic::DemosaicMethod,
     hotpixel::HotpixelRec,
     png16::{write_gray16_native_atomic, write_rgb16_native_atomic},
     scan::mmap_file,
@@ -11,7 +12,28 @@ use chiaro_stack::{
     fusion::{NightFusionOptions, fuse_night, set_output_color},
     stack_burst,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Demosaic {
+    Simple,
+    Amaze,
+    Rcd,
+    Lmmse,
+    Igv,
+}
+
+impl From<Demosaic> for DemosaicMethod {
+    fn from(value: Demosaic) -> Self {
+        match value {
+            Demosaic::Simple => Self::Simple,
+            Demosaic::Amaze => Self::Amaze,
+            Demosaic::Rcd => Self::Rcd,
+            Demosaic::Lmmse => Self::Lmmse,
+            Demosaic::Igv => Self::Igv,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,6 +85,10 @@ struct Cli {
     #[arg(long)]
     linear: bool,
 
+    /// Bayer reconstruction method.
+    #[arg(long, value_enum, default_value = "amaze")]
+    demosaic: Demosaic,
+
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -91,6 +117,7 @@ fn main() -> Result<()> {
         options.temporal_align.refine = !cli.no_refine;
         options.module_align.refine = !cli.no_refine;
         options.synth.threads = cli.threads;
+        options.synth.demosaic = cli.demosaic.into();
         set_output_color(&mut options, cli.linear);
         let report = fuse_night(&lri, &options, &cli.output, &mut |detail| {
             eprintln!("{detail}…");
@@ -112,6 +139,7 @@ fn main() -> Result<()> {
         camera: camera.to_ascii_uppercase(),
         motion_sigma: cli.motion_sigma,
         gyro_seed: !cli.no_gyro_seed,
+        demosaic: cli.demosaic.into(),
         threads: cli.threads,
         ..StackOptions::default()
     };

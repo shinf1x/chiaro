@@ -53,6 +53,7 @@
 
 pub mod cleanup;
 pub mod correct;
+pub mod demosaic;
 pub mod hotpixel;
 pub mod parallel;
 pub mod pipeline;

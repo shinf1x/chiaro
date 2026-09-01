@@ -11,6 +11,7 @@ use chiaro_hotpixel_core::cleanup::{
     BuildCleanupProfileOptions, CleanupProfile, build_cleanup_profile,
 };
 use chiaro_hotpixel_core::correct::{CorrectionConfig, CorrectionMode};
+use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::hotpixel::HotpixelRec;
 use chiaro_hotpixel_core::pipeline::{CleanupStage, FramePipeline, OutputMode};
 use chiaro_hotpixel_core::scan::{discover_lri_files, mmap_file, parse_pattern_overrides};
@@ -19,11 +20,32 @@ use chiaro_hotpixel_core::universal_hotpixel::UniversalHotpixelProfile;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliOutputMode {
-    /// Bayer cameras become linear 16-bit RGB PNGs through simple bilinear demosaicing.
+    /// Bayer cameras become linear 16-bit RGB PNGs.
     /// Monochrome cameras remain 16-bit grayscale.
     Rgb,
     /// Preserve Bayer mosaics as linear 16-bit grayscale PNGs.
     Mosaic,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliDemosaic {
+    Simple,
+    Amaze,
+    Rcd,
+    Lmmse,
+    Igv,
+}
+
+impl From<CliDemosaic> for DemosaicMethod {
+    fn from(value: CliDemosaic) -> Self {
+        match value {
+            CliDemosaic::Simple => Self::Simple,
+            CliDemosaic::Amaze => Self::Amaze,
+            CliDemosaic::Rcd => Self::Rcd,
+            CliDemosaic::Lmmse => Self::Lmmse,
+            CliDemosaic::Igv => Self::Igv,
+        }
+    }
 }
 
 impl From<CliOutputMode> for OutputMode {
@@ -127,6 +149,10 @@ struct ExtractArgs {
     /// RGB is stacker-friendly. Mosaic preserves the corrected Bayer mosaic.
     #[arg(long, value_enum, default_value = "rgb")]
     mode: CliOutputMode,
+
+    /// Bayer reconstruction method for RGB output.
+    #[arg(long, value_enum, default_value = "amaze")]
+    demosaic: CliDemosaic,
 
     /// Factory severity at which a coordinate becomes a correction candidate.
     #[arg(long, default_value_t = 16)]
@@ -236,6 +262,7 @@ struct HotpixelManifest {
 #[derive(Debug, Serialize)]
 struct SettingsManifest {
     output_mode: OutputMode,
+    demosaic: DemosaicMethod,
     severity_threshold: u8,
     sigma_threshold: f64,
     absolute_threshold: i32,
@@ -510,8 +537,13 @@ fn process_frame(
     let started = Instant::now();
     let mmap = mmap_file(&job.source)?;
     let frame = pipeline.correct_lri(&mmap, &job.camera, severity_map)?;
-    let png_color_type =
-        frame.write_png_with_options(&output_path, mode, args.threads, args.png_level)?;
+    let png_color_type = frame.write_png_with_demosaic_options(
+        &output_path,
+        mode,
+        args.demosaic.into(),
+        args.threads,
+        args.png_level,
+    )?;
     let corrected_fraction = frame.corrected_fraction();
     let stats = frame.hotpixel;
     let universal_hotpixel_stats = frame.universal_hotpixel;
@@ -577,7 +609,7 @@ Universal temperature-conditioned sensor-glow subtraction: {}.\n\
 Optional camera-specific temperature defect/line cleanup: {}.\n\
 No white balance, color matrix, exposure normalization, gamma, stretch, sharpening,\n\
 flat-field correction, spatial denoising, or alignment has been applied.\n\
-Bayer output mode: {:?}. Bayer RGB output uses simple linear bilinear demosaicing.\n",
+Bayer output mode: {:?}. Bayer demosaicing: {:?}.\n",
         if args.no_universal_hotpixel_model {
             "disabled".to_owned()
         } else {
@@ -597,7 +629,8 @@ Bayer output mode: {:?}. Bayer RGB output uses simple linear bilinear demosaicin
         args.cleanup_profile
             .as_ref()
             .map_or_else(|| "disabled".to_owned(), |path| path.display().to_string()),
-        args.mode
+        args.mode,
+        args.demosaic
     );
     fs::write(args.output.join("README.txt"), text)?;
     Ok(())
@@ -806,6 +839,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         },
         settings: SettingsManifest {
             output_mode: OutputMode::from(args.mode),
+            demosaic: args.demosaic.into(),
             severity_threshold: args.severity_threshold,
             sigma_threshold: args.sigma_threshold,
             absolute_threshold: args.absolute_threshold,

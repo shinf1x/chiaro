@@ -34,6 +34,9 @@ Common options include:
 - `--max-megapixels` caps maximum-mode output;
 - `--no-crop` renders the full reference view instead of the framed field;
 - `--camera` selects modules and can be repeated;
+- `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction; AMaZE
+  is the default, RCD is intended for individual night photos, and LMMSE or IGV
+  can be used when preparing night-stack output;
 - `--exclude-mono` omits monochrome luminance;
 - `--no-highlight-correction` preserves unequal clipped-channel colour for
   downstream processing;

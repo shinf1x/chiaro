@@ -11,7 +11,7 @@ and Chiaro Gallery.
 - repair factory-listed hot and dead pixels with CFA-aware interpolation;
 - apply bundled condition-dependent hot-pixel and corner-glow models;
 - apply optional camera-specific cleanup profiles;
-- preserve Bayer mosaics or produce linear 16-bit RGB output; and
+- preserve Bayer mosaics or produce linear 16-bit RGB with selectable demosaicing; and
 - process and encode one frame across multiple CPU cores.
 
 The bundled sensor-family assets are compiled into the library. They contain no
@@ -59,6 +59,27 @@ a caller requests profile loading, PNG output, or cleanup-profile training.
 
 See [Chiaro Hotpixel](../../apps/hotpixel/README.md) for correction behavior,
 calibration requirements, and command-line usage.
+
+## Demosaicing
+
+`DemosaicMethod` is shared by Hotpixel, Fuse, Gallery, and Stack. AMaZE is the
+default for general photography. Simple uses bilinear path;
+RCD is intended for individual night photos; LMMSE and IGV trade more CPU time for noise-tolerant reconstruction of frames used in night stacks.
+
+These are clean-room Rust implementations based on the published algorithm
+descriptions. No GPL implementation code from RawTherapee, darktable, LibRaw, or the original reference releases is included in this MIT-licensed project.
+
+Representative B4 4160x3120 timings on the development machine, using all CPU cores, are:
+
+| Method | Time |
+| --- | ---: |
+| Simple | 18 ms |
+| AMaZE | 457 ms |
+| RCD | 284 ms |
+| LMMSE | 1.99 s |
+| IGV | 1.63 s |
+
+Reproduce the benchmark with `examples/bench_pipeline.rs`; timings depend on CPU, capture content, and build settings.
 
 ## Tests
 

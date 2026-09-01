@@ -59,10 +59,10 @@ Available pipelines:
 
 - **Hot-pixel corrected frames** writes linear 16-bit PNGs into one directory
   per physical camera. It uses the same correction pipeline as
-  [`chiaro-hotpixel`](../hotpixel/README.md).
+  [`chiaro-hotpixel`](../hotpixel/README.md). RGB export offers Simple, AMaZE, RCD, LMMSE, and IGV demosaicing. AMaZE is the default, RCD is intended for an individual night photo, and LMMSE or IGV can prepare frames for a night stack.
 - **Fused high-resolution frame** aligns the participating modules and writes
   one 16-bit PNG plus a `.fusion.json` diagnostic report per capture. It uses
-  the same pipeline as [`chiaro-fuse`](../fuse/README.md).
+  the same pipeline as [`chiaro-fuse`](../fuse/README.md) and exposes the same demosaicing choices. AMaZE is the default.
 
 Exports report progress, can be cancelled, check available disk space, and
 record failures in `export-log.txt`. Night-mode captures are not currently

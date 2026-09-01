@@ -21,8 +21,11 @@ use chiaro_fusion::{
     math::{self, Mat3},
 };
 use chiaro_hotpixel_core::{
-    correct::demosaic_bilinear_threaded, parallel::map_row_bands, pipeline::FramePipeline,
-    thermal::ThermalProfile, universal_hotpixel::UniversalHotpixelProfile,
+    demosaic::{DemosaicMethod, demosaic},
+    parallel::map_row_bands,
+    pipeline::FramePipeline,
+    thermal::ThermalProfile,
+    universal_hotpixel::UniversalHotpixelProfile,
 };
 use serde::Serialize;
 
@@ -43,6 +46,7 @@ pub struct StackOptions {
     pub focal_px: Option<f64>,
     /// Refined rig-motion seeds from another module, keyed by temporal frame.
     pub motion_seeds: HashMap<u64, Warp>,
+    pub demosaic: DemosaicMethod,
     pub threads: usize,
 }
 
@@ -60,6 +64,7 @@ impl Default for StackOptions {
             gyro_seed: true,
             focal_px: None,
             motion_seeds: HashMap::new(),
+            demosaic: DemosaicMethod::default(),
             threads: 0,
         }
     }
@@ -141,12 +146,20 @@ pub fn stack_burst(data: &[u8], options: &StackOptions) -> Result<StackResult> {
         )
     } else {
         (
-            demosaic_bilinear_threaded(&stacked.mosaic16, width, height, pattern, options.threads)?,
-            demosaic_bilinear_threaded(
+            demosaic(
+                &stacked.mosaic16,
+                width,
+                height,
+                pattern,
+                options.demosaic,
+                options.threads,
+            )?,
+            demosaic(
                 &stacked.reference_mosaic16,
                 width,
                 height,
                 pattern,
+                options.demosaic,
                 options.threads,
             )?,
         )

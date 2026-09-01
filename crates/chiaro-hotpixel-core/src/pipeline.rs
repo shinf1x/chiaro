@@ -27,9 +27,9 @@ use chiaro::lri::{RawCamera, SensorPattern};
 
 use crate::cleanup::{CleanupCameraProfile, CleanupCorrectionStats};
 use crate::correct::{
-    CorrectionConfig, CorrectionStats, correct_hot_pixels_threaded, demosaic_bilinear_threaded,
-    demosaic_rows,
+    CorrectionConfig, CorrectionStats, correct_hot_pixels_threaded, demosaic_rows,
 };
+use crate::demosaic::{DemosaicMethod, demosaic};
 use crate::png16::{
     DEFAULT_DEFLATE_LEVEL, PngColor, samples_to_be_bytes, write_png16_streaming_atomic_with_level,
 };
@@ -44,8 +44,8 @@ pub const Q6_SCALE: u16 = 64;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputMode {
-    /// Bayer cameras become linear 16-bit RGB through simple bilinear
-    /// demosaicing. Monochrome cameras remain 16-bit grayscale.
+    /// Bayer cameras become linear 16-bit RGB. Monochrome cameras remain
+    /// 16-bit grayscale.
     #[default]
     Rgb,
     /// Preserve Bayer mosaics as linear 16-bit grayscale.
@@ -65,7 +65,7 @@ impl OutputMode {
     /// Short description of the colour handling used for run manifests.
     pub fn color_processing(self) -> &'static str {
         match self {
-            OutputMode::Rgb => "Bayer cameras: bilinear demosaic only; mono: grayscale",
+            OutputMode::Rgb => "Bayer cameras: selectable demosaic; mono: grayscale",
             OutputMode::Mosaic => "corrected RAW mosaic/grayscale; no demosaic",
         }
     }
@@ -152,12 +152,18 @@ impl CorrectedFrame {
     /// Demosaic the corrected Bayer mosaic into interleaved linear 16-bit RGB.
     /// Fails for monochrome cameras, which need no demosaicing.
     pub fn to_rgb16(&self) -> Result<Vec<u16>> {
-        demosaic_bilinear_threaded(
+        self.to_rgb16_with_method(DemosaicMethod::default(), 0)
+    }
+
+    /// Demosaic using an explicit method and thread count (`0` = auto).
+    pub fn to_rgb16_with_method(&self, method: DemosaicMethod, threads: usize) -> Result<Vec<u16>> {
+        demosaic(
             &self.samples_q6,
             self.width,
             self.height,
             self.stream_pattern(),
-            0,
+            method,
+            threads,
         )
     }
 
@@ -196,29 +202,72 @@ impl CorrectedFrame {
         threads: usize,
         deflate_level: u32,
     ) -> Result<&'static str> {
+        self.write_png_with_demosaic_options(
+            path,
+            mode,
+            DemosaicMethod::default(),
+            threads,
+            deflate_level,
+        )
+    }
+
+    /// Write with an explicit Bayer reconstruction method.
+    pub fn write_png_with_demosaic_options(
+        &self,
+        path: &Path,
+        mode: OutputMode,
+        demosaic_method: DemosaicMethod,
+        threads: usize,
+        deflate_level: u32,
+    ) -> Result<&'static str> {
         let (width, height, pattern) = (self.width, self.height, self.pattern);
         if mode == OutputMode::Rgb && pattern != SensorPattern::Mono {
             let stream_pattern = self.stream_pattern();
-            write_png16_streaming_atomic_with_level(
-                path,
-                width,
-                height,
-                PngColor::Rgb16,
-                threads,
-                deflate_level,
-                |rows, bytes| {
-                    let mut band = vec![0u16; rows.len() * width * 3];
-                    demosaic_rows(
-                        &self.samples_q6,
-                        width,
-                        height,
-                        stream_pattern,
-                        rows,
-                        &mut band,
-                    );
-                    samples_to_be_bytes(&band, bytes);
-                },
-            )?;
+            if demosaic_method == DemosaicMethod::Simple {
+                write_png16_streaming_atomic_with_level(
+                    path,
+                    width,
+                    height,
+                    PngColor::Rgb16,
+                    threads,
+                    deflate_level,
+                    |rows, bytes| {
+                        let mut band = vec![0u16; rows.len() * width * 3];
+                        demosaic_rows(
+                            &self.samples_q6,
+                            width,
+                            height,
+                            stream_pattern,
+                            rows,
+                            &mut band,
+                        );
+                        samples_to_be_bytes(&band, bytes);
+                    },
+                )?;
+            } else {
+                let rgb = demosaic(
+                    &self.samples_q6,
+                    width,
+                    height,
+                    stream_pattern,
+                    demosaic_method,
+                    threads,
+                )?;
+                write_png16_streaming_atomic_with_level(
+                    path,
+                    width,
+                    height,
+                    PngColor::Rgb16,
+                    threads,
+                    deflate_level,
+                    |rows, bytes| {
+                        samples_to_be_bytes(
+                            &rgb[rows.start * width * 3..rows.end * width * 3],
+                            bytes,
+                        );
+                    },
+                )?;
+            }
         } else {
             write_png16_streaming_atomic_with_level(
                 path,

@@ -11,7 +11,7 @@ use chiaro_fusion::{
     pipeline::{FusionOptions, HotpixelStage, fuse},
     synth::{CanvasMode, OutputColor},
 };
-use chiaro_hotpixel_core::scan::mmap_file;
+use chiaro_hotpixel_core::{demosaic::DemosaicMethod, scan::mmap_file};
 use eframe::egui::{self, Color32, RichText};
 
 use super::{
@@ -47,6 +47,7 @@ pub struct FusionExport {
     canvas: CanvasChoice,
     crop_to_framing: bool,
     color: OutputColor,
+    demosaic: DemosaicMethod,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -67,6 +68,7 @@ impl Default for FusionExport {
             canvas: CanvasChoice::Native,
             crop_to_framing: true,
             color: OutputColor::Display,
+            demosaic: DemosaicMethod::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -100,6 +102,7 @@ impl FusionExport {
             },
         };
         options.synth.color = self.color;
+        options.synth.demosaic = self.demosaic;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -235,6 +238,20 @@ impl ExportPipeline for FusionExport {
                 "As many pixels as the finest module covering the view justifies: about \
                  2.5x the native resolution where the B modules cover, 5.5x for C.",
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Demosaicing");
+            egui::ComboBox::from_id_salt("fusion-demosaic")
+                .selected_text(self.demosaic.label())
+                .show_ui(ui, |ui| {
+                    for method in DemosaicMethod::ALL {
+                        ui.selectable_value(
+                            &mut self.demosaic,
+                            method,
+                            format!("{} — {}", method.label(), method.recommendation()),
+                        );
+                    }
+                });
         });
         ui.horizontal(|ui| {
             ui.radio_value(
@@ -411,12 +428,13 @@ fn run_job(
     let _ = fs::write(
         output_root.join("export-log.txt"),
         format!(
-            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, highlight correction: {}\n\n{}\n",
+            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, highlight correction: {}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
             export.canvas,
             export.crop_to_framing,
+            export.demosaic,
             export.highlight_correction,
             log.join("\n")
         ),

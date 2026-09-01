@@ -15,6 +15,7 @@ use chiaro::lri::{RawCamera, parse_raw_layout};
 use chiaro_hotpixel_core::{
     cleanup::CleanupProfile,
     correct::CorrectionConfig,
+    demosaic::DemosaicMethod,
     hotpixel::HotpixelRec,
     pipeline::{CleanupStage, FramePipeline, OutputMode},
     scan::mmap_file,
@@ -47,6 +48,7 @@ pub struct HotpixelExport {
     hotpixel_rec: CalibrationPath,
     cleanup_profile: String,
     output_mode: OutputMode,
+    demosaic: DemosaicMethod,
     universal_model: bool,
     glow_correction: bool,
     skip_existing: bool,
@@ -64,6 +66,7 @@ impl Default for HotpixelExport {
             hotpixel_rec: CalibrationPath::default(),
             cleanup_profile: String::new(),
             output_mode: OutputMode::Rgb,
+            demosaic: DemosaicMethod::default(),
             universal_model: true,
             glow_correction: true,
             skip_existing: false,
@@ -161,6 +164,22 @@ impl ExportPipeline for HotpixelExport {
                 "Bayer mosaic / grayscale (no demosaic)",
             );
         });
+        if self.output_mode == OutputMode::Rgb {
+            ui.horizontal(|ui| {
+                ui.label("Demosaicing");
+                egui::ComboBox::from_id_salt("hotpixel-demosaic")
+                    .selected_text(self.demosaic.label())
+                    .show_ui(ui, |ui| {
+                        for method in DemosaicMethod::ALL {
+                            ui.selectable_value(
+                                &mut self.demosaic,
+                                method,
+                                format!("{} — {}", method.label(), method.recommendation()),
+                            );
+                        }
+                    });
+            });
+        }
         ui.add_space(8.0);
 
         ui.label(RichText::new("Corrections").strong());
@@ -383,11 +402,12 @@ fn run_job(
     let notes = format!(
         "Chiaro Gallery hot-pixel export{}\n\
          hotpixel.rec: {} ({})\n\
-         output: {:?}; universal model: {}; glow correction: {}; cleanup profile: {}\n\n{}\n",
+         output: {:?}; demosaicing: {}; universal model: {}; glow correction: {}; cleanup profile: {}\n\n{}\n",
         if cancelled { " (cancelled)" } else { "" },
         options.hotpixel_rec.value.trim(),
         models.rec.sha256,
         options.output_mode,
+        options.demosaic,
         options.universal_model,
         options.glow_correction,
         if options.cleanup_profile.trim().is_empty() {
@@ -572,7 +592,13 @@ fn export_frame(
         .correct_lri(lri, camera, map)
         .map_err(|error| format!("{error:#}"))?;
     frame
-        .write_png_with_options(output, options.output_mode, 0, options.deflate_level())
+        .write_png_with_demosaic_options(
+            output,
+            options.output_mode,
+            options.demosaic,
+            0,
+            options.deflate_level(),
+        )
         .map_err(|error| format!("{error:#}"))?;
     Ok(true)
 }

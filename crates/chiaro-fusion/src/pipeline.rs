@@ -470,6 +470,17 @@ pub fn fuse(
         })
         .collect::<Vec<_>>();
 
+    // Advanced demosaicing is prepared only for geometrically accepted colour
+    // modules. This avoids allocating an RGB cache for rejected cameras.
+    for (module, alignment) in modules.iter_mut().zip(&alignments) {
+        if alignment.report.accepted && !module.mosaic.is_mono() {
+            module
+                .mosaic
+                .prepare_demosaic(options.synth.demosaic, options.threads)
+                .with_context(|| format!("demosaic {}", module.raw.name))?;
+        }
+    }
+
     // Photometric matching: a global luminance gain and offset against the
     // reference, then a coarse per-module gain field for the slow remainder
     // (mirror-path glare, colour shading).

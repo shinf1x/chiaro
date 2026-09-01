@@ -10,8 +10,10 @@ command-line application.
    hot-pixel and corner-glow correction pipeline.
 2. Resolve the factory camera model, project each module into a reference view,
    and refine the alignment with image correlation.
-3. Apply module-specific colour and flat-field calibration, match overlapping
-   modules photometrically, and blend them into a 16-bit PNG.
+3. Reconstruct Bayer colour with the selected demosaicing method, apply
+   module-specific colour and flat-field calibration, match overlapping
+   modules photometrically, and blend them into a 16-bit PNG. AMaZE is the
+   default; Simple, RCD, LMMSE, and IGV are also available.
 
 Every run also writes a `.fusion.json` report with alignment, coverage,
 photometric, and timing diagnostics.

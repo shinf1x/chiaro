@@ -28,7 +28,7 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Individual camera views | ✅ Contact sheet and full-resolution preview for every module | ❌ Not exposed |
 | Captures without companion `.lris` files | ✅ Builds a colour-calibrated preview from LRI RAW data | ❌ Not detected or processed |
 | Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
-| Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks | ❌ Not exposed |
+| Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks; five demosaicing methods | ❌ Not exposed |
 | Night-mode denoising | 🟡 Gyro-seeded, motion-aware temporal and multi-camera fusion CLI | ✅ Integrated night processing |
 | Computational fusion | 🟡 Calibrated far-scene alignment and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
 | Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |

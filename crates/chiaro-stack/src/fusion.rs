@@ -207,6 +207,7 @@ pub fn fuse_night(
             gyro_seed: options.gyro_seed,
             focal_px: Some(focal),
             motion_seeds,
+            demosaic: options.synth.demosaic,
             threads: options.threads,
         };
         let stack = stack_mosaic_burst(lri, &stack_options)?;
@@ -225,6 +226,7 @@ pub fn fuse_night(
             white_q6: 65535.0,
             vignetting: None,
             crosstalk: None,
+            demosaiced_rgb: None,
         };
         if options.flat_field
             && let Some(vignetting) = calibration
@@ -298,6 +300,14 @@ pub fn fuse_night(
             )
         })
         .collect::<Vec<_>>();
+    for (module, alignment) in modules.iter_mut().zip(&alignments) {
+        if alignment.report.accepted && !module.mosaic.is_mono() {
+            module
+                .mosaic
+                .prepare_demosaic(options.synth.demosaic, options.threads)
+                .with_context(|| format!("demosaic {}", module.raw.name))?;
+        }
+    }
     let mut gain_fields = vec![GainField::identity(); modules.len()];
     for index in 0..modules.len() {
         if index == reference_index || !alignments[index].report.accepted {

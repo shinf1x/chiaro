@@ -16,6 +16,7 @@
 //! canvas is never held in memory.
 
 use anyhow::{Result, bail};
+use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::png16::{
     PngColor, samples_to_be_bytes, write_png16_streaming_atomic_with_level,
 };
@@ -55,6 +56,8 @@ pub struct SynthOptions {
     /// Feather width at module borders, in module pixels.
     pub feather_px: f32,
     pub color: OutputColor,
+    /// Bayer reconstruction used before repeated warped sampling.
+    pub demosaic: DemosaicMethod,
     /// Include monochrome modules (as luminance).
     pub include_mono: bool,
     /// Neutralise false colour caused by unequal raw-channel clipping after
@@ -73,6 +76,7 @@ impl Default for SynthOptions {
             canvas: CanvasMode::Native,
             feather_px: 120.0,
             color: OutputColor::Display,
+            demosaic: DemosaicMethod::default(),
             include_mono: true,
             highlight_correction: true,
             threads: 0,
@@ -346,6 +350,7 @@ pub struct SynthReport {
     pub covered: f32,
     /// Whether unequal clipped-channel colour was neutralised.
     pub highlight_correction: bool,
+    pub demosaic: DemosaicMethod,
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -511,6 +516,7 @@ pub fn synthesize(
         covered: covered.load(std::sync::atomic::Ordering::Relaxed) as f32
             / (width * height) as f32,
         highlight_correction: options.highlight_correction,
+        demosaic: options.demosaic,
     })
 }
 

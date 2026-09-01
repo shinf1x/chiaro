@@ -10,6 +10,7 @@
 //!   resolution) with a box pyramid, used for correlation-based alignment.
 
 use chiaro::lri::SensorPattern;
+use chiaro_hotpixel_core::demosaic::{DemosaicMethod, demosaic};
 
 use crate::calibration::{CrosstalkMesh, VignettingMesh};
 
@@ -28,6 +29,9 @@ pub struct Mosaic {
     pub vignetting: Option<VignettingMesh>,
     /// Colour-crosstalk mesh, if calibrated (colour modules only).
     pub crosstalk: Option<CrosstalkMesh>,
+    /// Full-resolution interleaved RGB cache for advanced demosaicing. Simple
+    /// mode leaves this empty and retains the original on-demand sampler.
+    pub demosaiced_rgb: Option<Vec<u16>>,
 }
 
 impl Mosaic {
@@ -53,7 +57,74 @@ impl Mosaic {
             white_q6: white_level * 64.0,
             vignetting: None,
             crosstalk: None,
+            demosaiced_rgb: None,
         }
+    }
+
+    /// Prepare the selected Bayer reconstruction for repeated warped samples.
+    /// Advanced methods materialise one RGB16 image; Simple retains the
+    /// low-memory on-demand bilinear path.
+    pub fn prepare_demosaic(
+        &mut self,
+        method: DemosaicMethod,
+        threads: usize,
+    ) -> anyhow::Result<()> {
+        self.demosaiced_rgb = if self.is_mono() || method == DemosaicMethod::Simple {
+            None
+        } else {
+            // The factory mesh mixes the two green phases independently, so
+            // apply it while the four CFA lattices are still distinct. Doing
+            // this after RGB reconstruction would incorrectly collapse both
+            // green inputs into one value.
+            let corrected;
+            let input = if let Some(crosstalk) = &self.crosstalk {
+                let (red_row, red_col) = self.red_position();
+                let mut values_out = Vec::with_capacity(self.samples.len());
+                for y in 0..self.height {
+                    for x in 0..self.width {
+                        let values = [
+                            self.bilinear_plane(x as f32, y as f32, red_col, red_row, 2),
+                            self.bilinear_plane(x as f32, y as f32, 1 - red_col, red_row, 2),
+                            self.bilinear_plane(x as f32, y as f32, red_col, 1 - red_row, 2),
+                            self.bilinear_plane(x as f32, y as f32, 1 - red_col, 1 - red_row, 2),
+                        ]
+                        .map(|value| value - self.black_q6);
+                        let phase = match (y & 1 == red_row, x & 1 == red_col) {
+                            (true, true) => 0,
+                            (true, false) => 1,
+                            (false, true) => 2,
+                            (false, false) => 3,
+                        };
+                        let matrix = crosstalk.matrix(x as f32, y as f32, self.width, self.height);
+                        let value = (0..4)
+                            .map(|column| matrix[phase * 4 + column] * values[column])
+                            .sum::<f32>()
+                            + self.black_q6;
+                        values_out.push(value.round().clamp(0.0, 65535.0) as u16);
+                    }
+                }
+                corrected = values_out;
+                &corrected
+            } else {
+                &self.samples
+            };
+            Some(demosaic(
+                input,
+                self.width,
+                self.height,
+                self.pattern,
+                method,
+                threads,
+            )?)
+        };
+        Ok(())
+    }
+
+    fn red_position(&self) -> (usize, usize) {
+        (0..2usize)
+            .flat_map(|row| (0..2usize).map(move |column| (row, column)))
+            .find(|&(row, column)| self.pattern.color_at(row, column) == 0)
+            .unwrap_or((0, 0))
     }
 
     /// Flat-field gain at a raster position (1 without calibration).
@@ -92,21 +163,23 @@ impl Mosaic {
         }
         // Each colour lives on a stride-2 lattice: red, the green in the red
         // row, the green in the blue row, and blue.
-        let (red_row, red_col) = (0..2usize)
-            .flat_map(|r| (0..2usize).map(move |c| (r, c)))
-            .find(|&(r, c)| self.pattern.color_at(r, c) == 0)
-            .unwrap_or((0, 0));
-        let mut planes = [
-            self.bilinear_plane(x, y, red_col, red_row, 2),
-            self.bilinear_plane(x, y, 1 - red_col, red_row, 2),
-            self.bilinear_plane(x, y, red_col, 1 - red_row, 2),
-            self.bilinear_plane(x, y, 1 - red_col, 1 - red_row, 2),
-        ]
+        let (red_row, red_col) = self.red_position();
+        let mut planes = if let Some(rgb) = &self.demosaiced_rgb {
+            let [red, green, blue] = self.bilinear_rgb(rgb, x, y);
+            [red, green, green, blue]
+        } else {
+            [
+                self.bilinear_plane(x, y, red_col, red_row, 2),
+                self.bilinear_plane(x, y, 1 - red_col, red_row, 2),
+                self.bilinear_plane(x, y, red_col, 1 - red_row, 2),
+                self.bilinear_plane(x, y, 1 - red_col, 1 - red_row, 2),
+            ]
+        }
         .map(|v| v - self.black_q6);
         let mut white_planes = [range; 4];
         if let Some(crosstalk) = &self.crosstalk {
             let m = crosstalk.matrix(x, y, self.width, self.height);
-            for values in [&mut planes, &mut white_planes] {
+            let correct = |values: &mut [f32; 4]| {
                 let input = *values;
                 for (row, value) in values.iter_mut().enumerate() {
                     *value = m[row * 4] * input[0]
@@ -114,7 +187,11 @@ impl Mosaic {
                         + m[row * 4 + 2] * input[2]
                         + m[row * 4 + 3] * input[3];
                 }
+            };
+            if self.demosaiced_rgb.is_none() {
+                correct(&mut planes);
             }
+            correct(&mut white_planes);
         }
         let scale = flat / range;
         let to_rgb = |values: [f32; 4]| {
@@ -171,6 +248,23 @@ impl Mosaic {
         let top = px(i0, j0) * (1.0 - tx) + px(i1, j0) * tx;
         let bottom = px(i0, j1) * (1.0 - tx) + px(i1, j1) * tx;
         top * (1.0 - ty) + bottom * ty
+    }
+
+    fn bilinear_rgb(&self, rgb: &[u16], x: f32, y: f32) -> [f32; 3] {
+        let x0 = x.floor().clamp(0.0, (self.width - 1) as f32) as usize;
+        let y0 = y.floor().clamp(0.0, (self.height - 1) as f32) as usize;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let tx = (x - x0 as f32).clamp(0.0, 1.0);
+        let ty = (y - y0 as f32).clamp(0.0, 1.0);
+        let pixel = |px: usize, py: usize, channel: usize| {
+            f32::from(rgb[(py * self.width + px) * 3 + channel])
+        };
+        std::array::from_fn(|channel| {
+            let top = pixel(x0, y0, channel) * (1.0 - tx) + pixel(x1, y0, channel) * tx;
+            let bottom = pixel(x0, y1, channel) * (1.0 - tx) + pixel(x1, y1, channel) * tx;
+            top * (1.0 - ty) + bottom * ty
+        })
     }
 
     /// Half-resolution log-luminance plane for alignment: each 2x2 CFA cell

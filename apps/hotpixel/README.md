@@ -31,7 +31,7 @@ chiaro-hotpixel extract \
 
 `hotpixel.rec` must come from the same physical L16 as the captures. The
 default RGB mode writes demosaiced Bayer frames and grayscale monochrome
-frames. Output is organised by camera:
+frames. AMaZE is the default demosaicing method. Output is organised by camera:
 
 ```text
 night_frames/
@@ -56,6 +56,7 @@ modules have different optics, viewpoints, and sometimes sensor types.
 - `--camera NAME` restricts processing and can be repeated.
 - `--mode mosaic` preserves corrected Bayer mosaics as grayscale PNGs. Generic
   PNG readers do not know their CFA pattern, so RGB is the safer default.
+- `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction. AMaZE is the default, RCD is intended for individual night photos, and LMMSE or IGV can be used for frames destined for night stacks.
 - `--continue-on-error` processes remaining frames and exits nonzero afterward.
 - `--threads` and `--png-level` control CPU use and compression.
 - `--pattern CAMERA=PATTERN` overrides missing or unusual sensor metadata.
