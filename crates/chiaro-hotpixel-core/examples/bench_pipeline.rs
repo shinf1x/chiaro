@@ -2,7 +2,7 @@
 //!
 //! ```bash
 //! cargo run -p chiaro-hotpixel-core --release --example bench_pipeline -- \
-//!     capture.lri hotpixel.rec [camera] [repeats]
+//!     capture.lri hotpixel.rec [camera] [repeats] [demosaic-method]
 //! ```
 //!
 //! Prints the median wall time of every stage so optimisation work can be
@@ -45,6 +45,9 @@ fn main() -> anyhow::Result<()> {
     let rec = args.next().expect("hotpixel.rec");
     let camera_name = args.next().unwrap_or_else(|| "A1".to_owned());
     let repeats: usize = args.next().map(|v| v.parse().unwrap()).unwrap_or(3);
+    let selected_demosaic = args
+        .next()
+        .map(|value| value.parse::<DemosaicMethod>().unwrap());
 
     let data = mmap_file(Path::new(&lri))?;
     let layout = parse_raw_layout(&data, &HashMap::new())?;
@@ -127,8 +130,11 @@ fn main() -> anyhow::Result<()> {
         timed("demosaic (1 thread)", repeats, || {
             demosaic_bilinear(&glow, camera.width, camera.height, camera.pattern).unwrap()
         });
-        let mut default_rgb = None;
-        for method in DemosaicMethod::ALL {
+        let mut output_rgb = None;
+        for method in DemosaicMethod::ALL
+            .into_iter()
+            .filter(|method| selected_demosaic.is_none_or(|selected| selected == *method))
+        {
             let result = timed(&format!("demosaic {method} (all threads)"), repeats, || {
                 demosaic(
                     &glow,
@@ -140,11 +146,11 @@ fn main() -> anyhow::Result<()> {
                 )
                 .unwrap()
             });
-            if method == DemosaicMethod::default() {
-                default_rgb = Some(result);
+            if selected_demosaic.is_some() || method == DemosaicMethod::default() {
+                output_rgb = Some(result);
             }
         }
-        default_rgb
+        output_rgb
     } else {
         None
     };

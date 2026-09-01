@@ -74,12 +74,21 @@ Representative B4 4160x3120 timings on the development machine, using all CPU co
 | Method | Time |
 | --- | ---: |
 | Simple | 18 ms |
-| AMaZE | 457 ms |
+| AMaZE | 69 ms |
 | RCD | 284 ms |
 | LMMSE | 1.99 s |
 | IGV | 1.63 s |
 
 Reproduce the benchmark with `examples/bench_pipeline.rs`; timings depend on CPU, capture content, and build settings.
+The AMaZE timing uses the runtime-selected AVX2 kernel. AVX2 is not a build or
+runtime requirement: unsupported x86 CPUs and non-x86 targets use the portable
+scalar implementation. AArch64 remains compatible and can gain a separate NEON
+kernel without changing the public API or x86 dispatch.
+
+For one portable x86-64 binary, use the ordinary release build (optionally with
+`--target x86_64-unknown-linux-gnu`) and do not set `target-cpu=native`. The
+baseline and AVX2 implementations are linked into the same executable and the
+CPU feature check selects between them at runtime.
 
 ## Tests
 
