@@ -615,6 +615,7 @@ mod tests {
             identity: None,
             device_id: None,
             frames,
+            night_mode: false,
         }
     }
 

@@ -64,7 +64,7 @@ impl Default for StackOptions {
             gyro_seed: true,
             focal_px: None,
             motion_seeds: HashMap::new(),
-            demosaic: DemosaicMethod::default(),
+            demosaic: DemosaicMethod::Lmmse,
             threads: 0,
         }
     }
@@ -686,6 +686,11 @@ fn gray_to_rgb(gray: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporal_stack_defaults_to_lmmse() {
+        assert_eq!(StackOptions::default().demosaic, DemosaicMethod::Lmmse);
+    }
 
     #[test]
     fn noise_variance_has_a_quantisation_floor() {

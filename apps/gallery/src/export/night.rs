@@ -1,5 +1,4 @@
-//! Fused high-resolution frame per capture, powered by `chiaro-fusion`:
-//! hot-pixel removal -> alignment -> synthesis.
+//! Motion-aware temporal and multi-camera fusion for night-mode captures.
 
 use std::{
     fs,
@@ -7,16 +6,14 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use chiaro_fusion::{
-    pipeline::{FusionOptions, HotpixelStage, fuse},
-    synth::{CanvasMode, OutputColor},
-};
+use chiaro_fusion::synth::{CanvasMode, OutputColor};
 use chiaro_hotpixel_core::{demosaic::DemosaicMethod, scan::mmap_file};
+use chiaro_stack::fusion::{NightFusionOptions, fuse_night};
 use eframe::egui::{self, Color32, RichText};
 
 use super::{
-    CalibrationPath, ExportEstimate, ExportMonitor, ExportPipeline, ExportTarget, ExportUiServices,
-    PathRow, PickField, PickKind, calibration_status, path_row,
+    CalibrationPath, CaptureRequirement, ExportEstimate, ExportMonitor, ExportPipeline,
+    ExportTarget, ExportUiServices, PathRow, PickField, PickKind, calibration_status, path_row,
 };
 use crate::source::{CaptureData, CaptureLocator, read_capture_with_updates};
 
@@ -25,12 +22,9 @@ const FIELD_HOTPIXEL_REC: PickField = 2;
 const FIELD_CALIBRATION: PickField = 3;
 const FIELD_ZOOM_CALIBRATION: PickField = 4;
 
-/// Native sensor resolution, the size of a "native" canvas.
 const NATIVE_PIXELS: u64 = 4160 * 3120;
-/// Cap for the "maximum detail" canvas.
 const MAX_MEGAPIXELS: f32 = 64.0;
 
-/// Canvas choices offered in the dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanvasChoice {
     Native,
@@ -38,12 +32,17 @@ enum CanvasChoice {
 }
 
 #[derive(Clone, Debug)]
-pub struct FusionExport {
+pub struct NightStackExport {
     output_dir: String,
     hotpixel_rec: CalibrationPath,
     calibration: CalibrationPath,
     zoom_calibration: CalibrationPath,
     hotpixel_enabled: bool,
+    motion_sigma: f32,
+    gyro_seed: bool,
+    refine_alignment: bool,
+    flat_field: bool,
+    local_photometric: bool,
     canvas: CanvasChoice,
     crop_to_framing: bool,
     color: OutputColor,
@@ -54,10 +53,10 @@ pub struct FusionExport {
     skip_existing: bool,
 }
 
-impl Default for FusionExport {
+impl Default for NightStackExport {
     fn default() -> Self {
         let output_dir = std::env::home_dir()
-            .map(|home| home.join("chiaro-fused"))
+            .map(|home| home.join("chiaro-night-stacks"))
             .map_or_else(String::new, |path| path.display().to_string());
         Self {
             output_dir,
@@ -65,10 +64,15 @@ impl Default for FusionExport {
             calibration: CalibrationPath::default(),
             zoom_calibration: CalibrationPath::default(),
             hotpixel_enabled: true,
+            motion_sigma: 4.0,
+            gyro_seed: true,
+            refine_alignment: true,
+            flat_field: true,
+            local_photometric: true,
             canvas: CanvasChoice::Native,
             crop_to_framing: true,
             color: OutputColor::Display,
-            demosaic: DemosaicMethod::default(),
+            demosaic: DemosaicMethod::Lmmse,
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -77,24 +81,26 @@ impl Default for FusionExport {
     }
 }
 
-impl FusionExport {
-    fn options(&self) -> FusionOptions {
-        let mut options = FusionOptions {
+impl NightStackExport {
+    fn options(&self) -> NightFusionOptions {
+        let mut options = NightFusionOptions {
             overlays: [&self.calibration, &self.zoom_calibration]
                 .iter()
                 .filter_map(|field| field.path())
                 .collect(),
-            hotpixel: (self.hotpixel_enabled)
+            hotpixel_rec: self
+                .hotpixel_enabled
                 .then(|| self.hotpixel_rec.path())
-                .flatten()
-                .map(|rec| HotpixelStage {
-                    rec,
-                    universal_model: true,
-                    glow_correction: true,
-                }),
-            ..FusionOptions::default()
+                .flatten(),
+            motion_sigma: self.motion_sigma,
+            gyro_seed: self.gyro_seed,
+            flat_field: self.flat_field,
+            local_photometric: self.local_photometric,
+            crop_to_framing: self.crop_to_framing,
+            ..NightFusionOptions::default()
         };
-        options.crop_to_framing = self.crop_to_framing;
+        options.temporal_align.refine = self.refine_alignment;
+        options.module_align.refine = self.refine_alignment;
         options.synth.canvas = match self.canvas {
             CanvasChoice::Native => CanvasMode::Native,
             CanvasChoice::Maximum => CanvasMode::Maximum {
@@ -114,17 +120,21 @@ impl FusionExport {
     }
 }
 
-impl ExportPipeline for FusionExport {
+impl ExportPipeline for NightStackExport {
     fn clone_box(&self) -> Box<dyn ExportPipeline> {
         Box::new(self.clone())
     }
 
     fn label(&self) -> &'static str {
-        "Fused high-resolution frame"
+        "Night stack"
     }
 
     fn description(&self) -> &'static str {
-        "Align every camera and synthesise one frame per capture (far scenes)"
+        "Motion-aware temporal denoising and calibrated multi-camera fusion"
+    }
+
+    fn capture_requirement(&self) -> CaptureRequirement {
+        CaptureRequirement::Night
     }
 
     fn options_ui(&mut self, ui: &mut egui::Ui, services: &mut ExportUiServices<'_>) {
@@ -143,18 +153,18 @@ impl ExportPipeline for FusionExport {
             &mut self.output_dir,
             PathRow {
                 field: FIELD_OUTPUT,
-                hint: "Folder for one fused PNG (and report) per capture",
-                title: "Choose the export folder",
+                hint: "Folder for one stacked PNG and report per night capture",
+                title: "Choose the night-stack export folder",
                 kind: PickKind::Folder,
                 clearable: false,
             },
         );
         ui.add_space(8.0);
 
-        ui.label(RichText::new("Hot-pixel removal").strong());
+        ui.label(RichText::new("Camera calibration").strong());
         ui.checkbox(
             &mut self.hotpixel_enabled,
-            "Remove factory-listed hot pixels first",
+            "Remove factory-listed hot pixels from every temporal frame",
         );
         if self.hotpixel_enabled {
             path_row(
@@ -173,18 +183,6 @@ impl ExportPipeline for FusionExport {
             );
             calibration_status(ui, services, &self.hotpixel_rec, "hotpixel.rec");
         }
-        ui.add_space(8.0);
-
-        ui.label(RichText::new("Geometric calibration").strong());
-        ui.label(
-            RichText::new(
-                "Captures embed only part of the camera's calibration. The device files supply \
-                 mirror aiming data and complete the geometry; without them, cross-module \
-                 alignment is likely to be poor.",
-            )
-            .color(muted)
-            .size(12.0),
-        );
         path_row(
             ui,
             services,
@@ -217,14 +215,34 @@ impl ExportPipeline for FusionExport {
         calibration_status(ui, services, &self.zoom_calibration, "zoom_calib_v0.lri");
         ui.add_space(8.0);
 
+        ui.label(RichText::new("Motion and alignment").strong());
+        ui.horizontal(|ui| {
+            ui.label("Motion rejection");
+            ui.add(
+                egui::Slider::new(&mut self.motion_sigma, 1.0..=8.0)
+                    .fixed_decimals(1)
+                    .suffix(" σ"),
+            )
+            .on_hover_text(
+                "Lower values reject more moving or misaligned samples; higher values retain \
+                 more frames for denoising.",
+            );
+        });
+        ui.checkbox(&mut self.gyro_seed, "Seed alignment from gyroscope data");
+        ui.checkbox(
+            &mut self.refine_alignment,
+            "Refine temporal and cross-camera alignment from image content",
+        );
+        ui.checkbox(
+            &mut self.local_photometric,
+            "Match local brightness between camera modules",
+        );
+        ui.add_space(8.0);
+
         ui.label(RichText::new("Output").strong());
         ui.checkbox(
             &mut self.crop_to_framing,
-            "Crop to the framed field of view (the focal length set on the camera)",
-        )
-        .on_hover_text(
-            "The crop is relative to the capture's reference group: 28 mm for A, 70 mm for B, \
-             or 150 mm for C. Unchecked renders the whole reference frame.",
+            "Crop to the field of view framed on the camera",
         );
         ui.horizontal(|ui| {
             ui.label("Resolution");
@@ -233,15 +251,11 @@ impl ExportPipeline for FusionExport {
                 &mut self.canvas,
                 CanvasChoice::Maximum,
                 format!("Maximum detail (up to {MAX_MEGAPIXELS:.0} MP)"),
-            )
-            .on_hover_text(
-                "As many pixels as the finest module covering the view justifies: about \
-                 2.5x the native resolution where the B modules cover, 5.5x for C.",
             );
         });
         ui.horizontal(|ui| {
             ui.label("Demosaicing");
-            egui::ComboBox::from_id_salt("fusion-demosaic")
+            egui::ComboBox::from_id_salt("night-stack-demosaic")
                 .selected_text(self.demosaic.label())
                 .show_ui(ui, |ui| {
                     for method in DemosaicMethod::ALL {
@@ -264,21 +278,15 @@ impl ExportPipeline for FusionExport {
         ui.checkbox(
             &mut self.include_mono,
             "Use monochrome modules for luminance detail",
-        )
-        .on_hover_text(
-            "Panchromatic modules (A2, C6) sharpen luminance; colour comes from the Bayer modules.",
         );
+        ui.checkbox(&mut self.flat_field, "Apply factory flat-field correction");
         ui.checkbox(
             &mut self.highlight_correction,
             "Neutralize false colour in clipped highlights",
-        )
-        .on_hover_text(
-            "Enabled by default for display-ready output. Disable to preserve unequal clipped \
-             raw-channel colour for processing elsewhere.",
         );
         ui.checkbox(
             &mut self.skip_existing,
-            "Skip captures whose fused PNG already exists",
+            "Skip captures whose night-stack PNG already exists",
         );
         ui.checkbox(
             &mut self.fast_compression,
@@ -286,9 +294,9 @@ impl ExportPipeline for FusionExport {
         );
         ui.label(
             RichText::new(
-                "Alignment fits one homography per module, exact for distant scenes; near \
-                 objects may ghost. A .fusion.json report with per-module residuals is \
-                 written beside each frame.",
+                "Only captures marked as night mode are included. Each output combines temporal \
+                 frames first, then aligns the denoised physical camera modules. A \
+                 .night-fusion.json diagnostic report is written beside the PNG.",
             )
             .color(muted)
             .size(12.0),
@@ -311,6 +319,9 @@ impl ExportPipeline for FusionExport {
         }
         if Path::new(self.output_dir.trim()).is_file() {
             return Err("The destination is an existing file".to_owned());
+        }
+        if !self.motion_sigma.is_finite() || !(1.0..=8.0).contains(&self.motion_sigma) {
+            return Err("Motion rejection must be between 1 and 8 sigma".to_owned());
         }
         if self.hotpixel_enabled {
             match self.hotpixel_rec.path() {
@@ -351,7 +362,7 @@ impl ExportPipeline for FusionExport {
             bytes: pixels * 6 * targets.len() as u64,
             approximate: self.canvas == CanvasChoice::Maximum,
             detail: format!(
-                "{} frames of up to {:.0} MP 16-bit RGB, uncompressed upper bound; PNG compression usually needs half",
+                "{} night-stack outputs of up to {:.0} MP 16-bit RGB, plus JSON reports",
                 targets.len(),
                 pixels as f64 / 1.0e6
             ),
@@ -361,7 +372,7 @@ impl ExportPipeline for FusionExport {
     fn start(&self, targets: Vec<ExportTarget>, monitor: ExportMonitor) -> JoinHandle<()> {
         let export = self.clone();
         thread::Builder::new()
-            .name("chiaro-export-fusion".to_owned())
+            .name("chiaro-export-night-stack".to_owned())
             .spawn(move || {
                 let outcome = run_job(&export, &targets, &monitor);
                 monitor.hold_transport(false);
@@ -373,15 +384,18 @@ impl ExportPipeline for FusionExport {
                     progress.current.clear();
                 });
             })
-            .expect("failed to start fusion export")
+            .expect("failed to start night-stack export")
     }
 }
 
 fn run_job(
-    export: &FusionExport,
+    export: &NightStackExport,
     targets: &[ExportTarget],
     monitor: &ExportMonitor,
 ) -> Result<(), String> {
+    if targets.iter().any(|target| !target.night_mode) {
+        return Err("night-stack export received a standard capture".to_owned());
+    }
     let output_root = export.output_dir();
     fs::create_dir_all(&output_root)
         .map_err(|error| format!("create {}: {error}", output_root.display()))?;
@@ -395,22 +409,28 @@ fn run_job(
             progress.current = target.name.clone();
             progress.current_fraction = 0.0;
         });
-        let output = output_root.join(format!("{}_fused.png", target.stem()));
-        let result = if export.skip_existing && output.is_file() {
+        let output = output_root.join(format!("{}_night.png", target.stem()));
+        let report = output.with_extension("night-fusion.json");
+        let result = if export.skip_existing && output.is_file() && report.is_file() {
             Ok(false)
         } else {
-            fuse_capture(&options, target, &output, monitor).map(|()| true)
+            stack_capture(&options, target, &output, monitor).map(|()| true)
         };
         match result {
             Ok(written) => {
                 log.push(format!(
                     "{}: {}",
                     target.name,
-                    if written { "fused" } else { "skipped (exists)" }
+                    if written {
+                        "stacked"
+                    } else {
+                        "skipped (exists)"
+                    }
                 ));
                 monitor.update(|progress| {
                     progress.outputs_written += usize::from(written);
                     progress.completed += 1;
+                    progress.current_fraction = 0.0;
                     if let Some(identity) = &target.identity {
                         progress.succeeded_hashes.push(identity.hash.clone());
                     }
@@ -421,29 +441,35 @@ fn run_job(
                 monitor.update(|progress| {
                     progress.failures.push((target.name.clone(), error));
                     progress.completed += 1;
+                    progress.current_fraction = 0.0;
                 });
             }
         }
     }
     let _ = fs::write(
-        output_root.join("export-log.txt"),
+        output_root.join("night-export-log.txt"),
         format!(
-            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, highlight correction: {}\n\n{}\n",
+            "Chiaro Gallery night-stack export\nhotpixel.rec: {}\ncalibration: {} / {}\n\
+             motion rejection: {:.1} sigma, gyro seed: {}, refinement: {}\n\
+             canvas: {:?}, crop to framing: {}, demosaicing: {}, output color: {:?}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
+            export.motion_sigma,
+            export.gyro_seed,
+            export.refine_alignment,
             export.canvas,
             export.crop_to_framing,
             export.demosaic,
-            export.highlight_correction,
+            export.color,
             log.join("\n")
         ),
     );
     Ok(())
 }
 
-fn fuse_capture(
-    options: &FusionOptions,
+fn stack_capture(
+    options: &NightFusionOptions,
     target: &ExportTarget,
     output: &Path,
     monitor: &ExportMonitor,
@@ -470,6 +496,9 @@ fn fuse_capture(
         monitor.update(|progress| progress.transfer = None);
     }
     let data = data?;
+    if monitor.cancelled() {
+        return Err("cancelled".to_owned());
+    }
     let mapped;
     let bytes: &[u8] = match &data {
         CaptureData::Local(path) => {
@@ -479,10 +508,21 @@ fn fuse_capture(
         CaptureData::Memory(bytes) => bytes,
     };
     let name = target.name.clone();
-    fuse(bytes, options, output, &mut |progress| {
-        monitor.update(|state| {
-            state.current = format!("{name} - {}: {}", progress.stage, progress.detail);
-            state.current_fraction = progress.fraction;
+    let mut temporal_modules = 0usize;
+    fuse_night(bytes, options, output, &mut |detail| {
+        let fraction = if detail.starts_with("temporal stack ") {
+            temporal_modules += 1;
+            (0.08 + temporal_modules as f32 * 0.04).min(0.60)
+        } else if detail == "align denoised modules" {
+            0.68
+        } else if detail == "synthesise all-module night image" {
+            0.88
+        } else {
+            0.05
+        };
+        monitor.update(|progress| {
+            progress.current = format!("{name} - {detail}");
+            progress.current_fraction = fraction;
         });
     })
     .map(|_| ())
@@ -493,60 +533,110 @@ fn fuse_capture(
 mod tests {
     use super::*;
 
+    fn target(night_mode: bool) -> ExportTarget {
+        ExportTarget::new(
+            "L16_00001.lri".to_owned(),
+            CaptureLocator::Local(PathBuf::from("/x/L16_00001.lri")),
+        )
+        .with_night_mode(night_mode)
+    }
+
     #[test]
-    fn estimate_scales_with_canvas_size() {
-        let export = FusionExport::default();
-        let target = ExportTarget {
-            name: "x.lri".to_owned(),
-            capture: CaptureLocator::Local(PathBuf::from("/x.lri")),
-            identity: None,
-            device_id: None,
-            frames: None,
-            night_mode: false,
-        };
-        assert_eq!(
-            export.estimate(std::slice::from_ref(&target)).bytes,
-            4160 * 3120 * 6
+    fn pipeline_accepts_only_night_captures() {
+        let export = NightStackExport::default();
+        assert_eq!(export.demosaic, DemosaicMethod::Lmmse);
+        assert_eq!(export.capture_requirement(), CaptureRequirement::Night);
+        assert!(
+            export
+                .capture_requirement()
+                .accepts(target(true).night_mode)
         );
-        let big = FusionExport {
-            canvas: CanvasChoice::Maximum,
-            ..FusionExport::default()
-        };
-        assert_eq!(
-            big.estimate(&[target.clone(), target]).bytes,
-            2 * 64_000_000 * 6
+        assert!(
+            !export
+                .capture_requirement()
+                .accepts(target(false).night_mode)
         );
     }
 
     #[test]
-    fn validation_allows_skipping_hot_pixels_and_checks_overlays() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut export = FusionExport {
-            output_dir: dir.path().join("out").display().to_string(),
-            ..FusionExport::default()
+    fn estimate_scales_with_canvas_size() {
+        let export = NightStackExport::default();
+        assert_eq!(export.estimate(&[target(true)]).bytes, NATIVE_PIXELS * 6);
+        let maximum = NightStackExport {
+            canvas: CanvasChoice::Maximum,
+            ..NightStackExport::default()
         };
-        assert!(export.validate().unwrap_err().contains("hotpixel.rec"));
-        export.hotpixel_enabled = false;
+        assert_eq!(maximum.estimate(&[target(true)]).bytes, 64_000_000 * 6);
+        assert!(maximum.estimate(&[target(true)]).approximate);
+    }
+
+    #[test]
+    fn validation_checks_motion_and_calibration_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut export = NightStackExport {
+            output_dir: dir.path().join("out").display().to_string(),
+            hotpixel_enabled: false,
+            ..NightStackExport::default()
+        };
         assert!(export.validate().is_ok());
+        export.motion_sigma = 0.0;
+        assert!(export.validate().unwrap_err().contains("Motion rejection"));
+        export.motion_sigma = 4.0;
         export.calibration.value = dir.path().join("missing.lri").display().to_string();
         assert!(export.validate().unwrap_err().contains("calibration.lri"));
     }
 
     #[test]
-    fn job_fuses_mock_captures() {
-        use chiaro::mock::MockCapture;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("L16_00001.lri");
-        fs::write(&path, MockCapture::small().encode().unwrap()).unwrap();
-        let export = FusionExport {
-            output_dir: dir.path().join("fused").display().to_string(),
+    fn settings_are_forwarded_to_the_stack_pipeline() {
+        let export = NightStackExport {
             hotpixel_enabled: false,
-            ..FusionExport::default()
+            motion_sigma: 2.5,
+            gyro_seed: false,
+            refine_alignment: false,
+            flat_field: false,
+            local_photometric: false,
+            canvas: CanvasChoice::Maximum,
+            crop_to_framing: false,
+            color: OutputColor::Linear,
+            demosaic: DemosaicMethod::Igv,
+            include_mono: false,
+            highlight_correction: false,
+            fast_compression: true,
+            ..NightStackExport::default()
         };
-        let targets = vec![ExportTarget::new(
-            "L16_00001.lri".to_owned(),
-            CaptureLocator::Local(path),
-        )];
+        let options = export.options();
+        assert_eq!(options.motion_sigma, 2.5);
+        assert!(!options.gyro_seed);
+        assert!(!options.temporal_align.refine);
+        assert!(!options.module_align.refine);
+        assert!(!options.flat_field);
+        assert!(!options.local_photometric);
+        assert!(!options.crop_to_framing);
+        assert_eq!(
+            options.synth.canvas,
+            CanvasMode::Maximum {
+                max_megapixels: MAX_MEGAPIXELS
+            }
+        );
+        assert_eq!(options.synth.color, OutputColor::Linear);
+        assert_eq!(options.synth.demosaic, DemosaicMethod::Igv);
+        assert!(!options.synth.include_mono);
+        assert!(!options.synth.highlight_correction);
+        assert_eq!(options.synth.png_level, 1);
+    }
+
+    #[test]
+    fn runner_rejects_standard_captures_defensively() {
+        let export = NightStackExport {
+            output_dir: tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join("out")
+                .display()
+                .to_string(),
+            hotpixel_enabled: false,
+            ..NightStackExport::default()
+        };
         let monitor = ExportMonitor::new(
             super::super::ExportProgress {
                 total: 1,
@@ -555,15 +645,10 @@ mod tests {
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             egui::Context::default(),
         );
-        run_job(&export, &targets, &monitor).unwrap();
-        let progress = monitor.progress.lock().unwrap().clone();
-        assert!(progress.failures.is_empty(), "{:?}", progress.failures);
-        assert_eq!(progress.succeeded_hashes.len(), 1);
-        assert!(dir.path().join("fused/L16_00001_fused.png").is_file());
         assert!(
-            dir.path()
-                .join("fused/L16_00001_fused.fusion.json")
-                .is_file()
+            run_job(&export, &[target(false)], &monitor)
+                .unwrap_err()
+                .contains("standard capture")
         );
     }
 }

@@ -23,7 +23,7 @@ use chiaro_fusion::{
         photometric_match, synthesize,
     },
 };
-use chiaro_hotpixel_core::hotpixel::HotpixelRec;
+use chiaro_hotpixel_core::{demosaic::DemosaicMethod, hotpixel::HotpixelRec};
 use serde::Serialize;
 
 use crate::{StackOptions, StackReport, stack_mosaic_burst};
@@ -64,7 +64,10 @@ impl Default for NightFusionOptions {
             flat_field: true,
             local_photometric: true,
             crop_to_framing: true,
-            synth: SynthOptions::default(),
+            synth: SynthOptions {
+                demosaic: DemosaicMethod::Lmmse,
+                ..SynthOptions::default()
+            },
             threads: 0,
         }
     }
@@ -547,6 +550,14 @@ pub fn set_canvas(options: &mut NightFusionOptions, maximum: bool, max_megapixel
 mod tests {
     use super::*;
     use chiaro::lri::SensorPattern;
+
+    #[test]
+    fn night_fusion_defaults_to_lmmse() {
+        assert_eq!(
+            NightFusionOptions::default().synth.demosaic,
+            DemosaicMethod::Lmmse
+        );
+    }
 
     fn raw(name: &str) -> RawCamera {
         RawCamera {

@@ -29,7 +29,7 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Captures without companion `.lris` files | ✅ Builds a colour-calibrated preview from LRI RAW data | ❌ Not detected or processed |
 | Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
 | Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks; five demosaicing methods | ❌ Not exposed |
-| Night-mode denoising | 🟡 Gyro-seeded, motion-aware temporal and multi-camera fusion CLI | ✅ Integrated night processing |
+| Night-mode denoising | 🟡 Gallery and CLI export with gyro-seeded, motion-aware temporal and multi-camera fusion | ✅ Integrated night processing |
 | Computational fusion | 🟡 Calibrated far-scene alignment and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
 | Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |
 | Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
@@ -37,7 +37,8 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 
 The fusion pipeline currently assumes distant scenes. Near subjects may show
 parallax or ghosting, and depth-aware fusion is not yet implemented. Night
-captures can be processed with temporal and multi-camera fusion in Chiaro Stack.
+captures can be processed from Gallery or the Chiaro Stack CLI with temporal
+and multi-camera fusion.
 
 ## Installation
 

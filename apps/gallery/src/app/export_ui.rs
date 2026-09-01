@@ -8,7 +8,10 @@ use std::{path::PathBuf, thread};
 
 use super::*;
 use crate::{
-    export::{ExportEstimate, ExportSource, ExportTarget, ExportUiServices, disk, format_size},
+    export::{
+        CaptureRequirement, ExportEstimate, ExportSource, ExportTarget, ExportUiServices, disk,
+        format_size,
+    },
     gallery::calibration_cache,
     source::{ObjectLocator, read_preview},
 };
@@ -27,8 +30,9 @@ pub(super) struct ExportDialog {
     /// Exact device-matched persistent calibration for local captures.
     cached_calibration: Option<DeviceCalibration>,
     source: ExportSource,
-    /// Selected night-mode captures left out of the job.
-    skipped_night: Vec<String>,
+    /// Selected captures that do not match the pipeline's required kind.
+    excluded: Vec<String>,
+    requirement: CaptureRequirement,
     error: Option<String>,
 }
 
@@ -110,29 +114,35 @@ impl GalleryApp {
     }
 
     fn open_export_dialog(&mut self, pipeline: usize, ctx: &egui::Context) {
-        if self.exports.get(pipeline).is_none() {
+        let Some(requirement) = self
+            .exports
+            .get(pipeline)
+            .map(|pipeline| pipeline.capture_requirement())
+        else {
             return;
-        }
+        };
         self.exports.set_last_used(pipeline);
-        // Night-mode captures are stacks of 40+ short frames that need their
-        // own processing; the pipelines skip them rather than mangle them.
-        let mut skipped_night = Vec::new();
+        let mut excluded = Vec::new();
         let targets = self
             .current_view
             .items
             .iter()
             .filter(|item| self.current_view.selected.contains(&item.id))
-            .filter(|item| {
-                let night =
+            .filter_map(|item| {
+                let night_mode =
                     matches!(&item.state, ItemState::Ready { metadata, .. } if metadata.night_mode);
-                if night {
-                    skipped_night.push(item.source.name.clone());
+                if requirement.accepts(night_mode) {
+                    Some(
+                        ExportTarget::new(item.source.name.clone(), item.source.capture.clone())
+                            .with_night_mode(night_mode),
+                    )
+                } else {
+                    excluded.push(item.source.name.clone());
+                    None
                 }
-                !night
             })
-            .map(|item| ExportTarget::new(item.source.name.clone(), item.source.capture.clone()))
             .collect::<Vec<_>>();
-        if targets.is_empty() && skipped_night.is_empty() {
+        if targets.is_empty() && excluded.is_empty() {
             return;
         }
         let source = match &self.active_tab {
@@ -172,7 +182,8 @@ impl GalleryApp {
             device_location: device_location.map(|(location, _)| location),
             cached_calibration,
             source,
-            skipped_night,
+            excluded,
+            requirement,
             error: None,
         });
     }
@@ -487,7 +498,7 @@ impl GalleryApp {
                     ))
                     .color(Color32::from_gray(155)),
                 );
-                if !dialog.skipped_night.is_empty() {
+                if !dialog.excluded.is_empty() {
                     egui::Frame::new()
                         .fill(Color32::from_rgb(58, 48, 30))
                         .corner_radius(CornerRadius::same(6))
@@ -495,16 +506,13 @@ impl GalleryApp {
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "{} night-mode capture{} will be skipped: {}. Night mode \
-                                     stacks dozens of short frames and is not supported by the \
-                                     export pipelines yet.",
-                                    dialog.skipped_night.len(),
-                                    if dialog.skipped_night.len() == 1 {
-                                        ""
-                                    } else {
-                                        "s"
-                                    },
-                                    dialog.skipped_night.join(", ")
+                                    "{} {} capture{} will be skipped because this pipeline accepts \
+                                     only {}: {}.",
+                                    dialog.excluded.len(),
+                                    dialog.requirement.excluded_label(),
+                                    if dialog.excluded.len() == 1 { "" } else { "s" },
+                                    dialog.requirement.accepted_label(),
+                                    dialog.excluded.join(", ")
                                 ))
                                 .color(Color32::from_rgb(240, 205, 140)),
                             );
@@ -512,13 +520,18 @@ impl GalleryApp {
                 }
                 ui.separator();
 
-                let mut services = ExportUiServices {
-                    ctx,
-                    picker: &mut self.export_picker,
-                    source: dialog.source,
-                    device_calibration,
-                };
-                pipeline.options_ui(ui, &mut services);
+                egui::ScrollArea::vertical()
+                    .id_salt("export-options")
+                    .max_height((usable.height() - 260.0).max(180.0))
+                    .show(ui, |ui| {
+                        let mut services = ExportUiServices {
+                            ctx,
+                            picker: &mut self.export_picker,
+                            source: dialog.source,
+                            device_calibration,
+                        };
+                        pipeline.options_ui(ui, &mut services);
+                    });
 
                 ui.separator();
                 disk_summary(ui, &estimate, dialog.free_space.as_ref(), insufficient);
@@ -546,8 +559,10 @@ impl GalleryApp {
                         });
                     let mut response = ui.add_enabled(ready, button);
                     if dialog.targets.is_empty() {
-                        response = response
-                            .on_disabled_hover_text("Every selected capture is a night-mode stack");
+                        response = response.on_disabled_hover_text(format!(
+                            "None of the selected files are {}",
+                            dialog.requirement.accepted_label()
+                        ));
                     } else if let Err(reason) = &validation {
                         response = response.on_disabled_hover_text(reason.clone());
                     } else if insufficient {
@@ -555,7 +570,7 @@ impl GalleryApp {
                             .on_disabled_hover_text("Not enough free space at the destination");
                     } else if calibration_pending {
                         response = response
-                            .on_disabled_hover_text("Waiting for the camera's hotpixel.rec");
+                            .on_disabled_hover_text("Waiting for the camera's calibration files");
                     }
                     if response.clicked() {
                         start = true;

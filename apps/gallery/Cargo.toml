@@ -16,6 +16,7 @@ image.workspace = true
 chiaro.workspace = true
 chiaro-fusion.workspace = true
 chiaro-hotpixel-core.workspace = true
+chiaro-stack.workspace = true
 mtp-rs.workspace = true
 nusb.workspace = true
 rfd.workspace = true

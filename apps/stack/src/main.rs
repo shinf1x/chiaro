@@ -86,7 +86,7 @@ struct Cli {
     linear: bool,
 
     /// Bayer reconstruction method.
-    #[arg(long, value_enum, default_value = "amaze")]
+    #[arg(long, value_enum, default_value = "lmmse")]
     demosaic: Demosaic,
 
     /// Worker threads (0 = all cores).

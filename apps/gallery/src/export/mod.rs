@@ -32,9 +32,11 @@ use crate::{gallery::database::CaptureIdentity, source::CaptureLocator};
 pub mod disk;
 mod fusion;
 mod hotpixel;
+mod night;
 
 pub use fusion::FusionExport;
 pub use hotpixel::HotpixelExport;
+pub use night::NightStackExport;
 
 /// One capture chosen for export.
 #[derive(Clone, Debug)]
@@ -50,6 +52,9 @@ pub struct ExportTarget {
     /// RAW frames in the capture when they could be probed cheaply. `None`
     /// for remote captures that would require a full download to inspect.
     pub frames: Option<Vec<FrameInfo>>,
+    /// The capture advertises Light's night scene mode and contains a temporal
+    /// burst rather than one frame per physical module.
+    pub night_mode: bool,
 }
 
 impl ExportTarget {
@@ -67,7 +72,13 @@ impl ExportTarget {
             identity,
             device_id,
             frames,
+            night_mode: false,
         }
+    }
+
+    pub fn with_night_mode(mut self, night_mode: bool) -> Self {
+        self.night_mode = night_mode;
+        self
     }
 
     /// File stem used for per-capture outputs.
@@ -88,6 +99,36 @@ impl ExportTarget {
             "capture".to_owned()
         } else {
             output
+        }
+    }
+}
+
+/// Which captures an export pipeline can process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureRequirement {
+    /// Ordinary captures with one RAW frame per participating module.
+    #[default]
+    Standard,
+    /// Night-mode captures containing temporal bursts.
+    Night,
+}
+
+impl CaptureRequirement {
+    pub fn accepts(self, night_mode: bool) -> bool {
+        night_mode == (self == Self::Night)
+    }
+
+    pub fn accepted_label(self) -> &'static str {
+        match self {
+            Self::Standard => "standard captures",
+            Self::Night => "night-mode captures",
+        }
+    }
+
+    pub fn excluded_label(self) -> &'static str {
+        match self {
+            Self::Standard => "night-mode",
+            Self::Night => "standard",
         }
     }
 }
@@ -458,6 +499,12 @@ pub trait ExportPipeline {
     /// One-line description shown in the pipeline menu.
     fn description(&self) -> &'static str;
 
+    /// Capture kind accepted by this pipeline. Standard exports deliberately
+    /// reject temporal night bursts; the night stacker does the inverse.
+    fn capture_requirement(&self) -> CaptureRequirement {
+        CaptureRequirement::Standard
+    }
+
     /// Draw the pipeline's options. Called every frame while the dialog is open.
     fn options_ui(&mut self, ui: &mut egui::Ui, services: &mut ExportUiServices<'_>);
     /// Receive the path chosen by a file dialog requested from `options_ui`.
@@ -530,6 +577,7 @@ impl ExportRegistry {
             pipelines: vec![
                 Box::new(HotpixelExport::default()),
                 Box::new(FusionExport::default()),
+                Box::new(NightStackExport::default()),
             ],
             last_used: 0,
         }
@@ -565,6 +613,11 @@ impl ExportRegistry {
     /// Snapshot `index` and its current options for immediate or queued use.
     pub fn prepare(&mut self, index: usize, targets: Vec<ExportTarget>) -> Option<PendingExport> {
         let pipeline = self.pipelines.get(index)?;
+        let requirement = pipeline.capture_requirement();
+        let targets = targets
+            .into_iter()
+            .filter(|target| requirement.accepts(target.night_mode))
+            .collect();
         self.last_used = index;
         Some(PendingExport {
             pipeline: pipeline.clone_box(),
@@ -734,6 +787,7 @@ mod tests {
             identity: None,
             device_id: None,
             frames: None,
+            night_mode: false,
         };
         assert_eq!(target.stem(), "L16_04480");
         let odd = ExportTarget {
@@ -742,6 +796,7 @@ mod tests {
             identity: None,
             device_id: None,
             frames: None,
+            night_mode: false,
         };
         assert_eq!(odd.stem(), "night_sky__1_");
     }
@@ -798,6 +853,32 @@ mod tests {
         assert_eq!(pending.pipeline.output_dir(), first);
         assert_eq!(pending.target_count(), 1);
         assert_eq!(pending.label(), "Hot-pixel corrected frames");
+    }
+
+    #[test]
+    fn registry_filters_targets_by_pipeline_capture_kind() {
+        let mut registry = ExportRegistry::new();
+        assert_eq!(
+            registry.get(0).unwrap().capture_requirement(),
+            CaptureRequirement::Standard
+        );
+        assert_eq!(
+            registry.get(2).unwrap().capture_requirement(),
+            CaptureRequirement::Night
+        );
+        let standard = ExportTarget::new(
+            "standard.lri".to_owned(),
+            CaptureLocator::Local(PathBuf::from("/tmp/standard.lri")),
+        );
+        let night = ExportTarget::new(
+            "night.lri".to_owned(),
+            CaptureLocator::Local(PathBuf::from("/tmp/night.lri")),
+        )
+        .with_night_mode(true);
+
+        let pending = registry.prepare(2, vec![standard, night]).unwrap();
+        assert_eq!(pending.target_count(), 1);
+        assert!(pending.targets[0].night_mode);
     }
 
     #[test]

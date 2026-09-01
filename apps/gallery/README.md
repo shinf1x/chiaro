@@ -59,16 +59,24 @@ Available pipelines:
 
 - **Hot-pixel corrected frames** writes linear 16-bit PNGs into one directory
   per physical camera. It uses the same correction pipeline as
-  [`chiaro-hotpixel`](../hotpixel/README.md). RGB export offers Simple, AMaZE, RCD, LMMSE, and IGV demosaicing. AMaZE is the default, RCD is intended for an individual night photo, and LMMSE or IGV can prepare frames for a night stack.
+  [`chiaro-hotpixel`](../hotpixel/README.md). RGB export offers Simple, AMaZE,
+  RCD, LMMSE, and IGV demosaicing; AMaZE is the default.
 - **Fused high-resolution frame** aligns the participating modules and writes
   one 16-bit PNG plus a `.fusion.json` diagnostic report per capture. It uses
   the same pipeline as [`chiaro-fuse`](../fuse/README.md) and exposes the same demosaicing choices. AMaZE is the default.
+- **Night stack** accepts only captures marked as night mode. It motion-aligns
+  and denoises every temporal burst, then performs calibrated multi-camera
+  fusion through [`chiaro-stack`](../stack/README.md). Its settings expose the
+  motion rejection threshold, gyro seed, alignment refinement, calibration,
+  output resolution and colour, demosaicing, flat-field/highlight corrections,
+  compression, and resume behavior. Each PNG is accompanied by a
+  `.night-fusion.json` diagnostic report. LMMSE is the night-stack default;
+  IGV is the other noise-tolerant stack option.
 
 Exports report progress, can be cancelled, check available disk space, and
-record failures in `export-log.txt`. Night-mode captures are not currently
-accepted by either Gallery export pipeline; use
-[`chiaro-stack`](../stack/README.md) for gyro-seeded temporal denoising and
-calibrated multi-camera night fusion.
+record failures in a pipeline-specific export log. Standard pipelines skip
+night-mode captures, while Night stack skips standard captures; a mixed
+selection clearly lists the files that will be excluded before the job starts.
 
 ### Camera calibration
 
