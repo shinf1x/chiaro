@@ -65,7 +65,11 @@ contribute luminance unless explicitly excluded.
 
 - Alignment uses a global homography followed by classical dense multi-view
   reconstruction. Textureless or contradictory areas remain explicit
-  global/far fallback rather than receiving spatially completed depth.
+  global/far fallback rather than receiving spatially completed depth. Small
+  disconnected finite-depth islands are rejected as chance correlations; the
+  filter never grows a measured surface into an unsupported region. A finite
+  label must also improve measurably on the fitted global warp, preventing a
+  shallow distant-scene cost curve from being reported as physical depth.
   The default finite search spans 0.5 m to 10 km so distant landscape detail
   is not collapsed onto a 100 m boundary.
   Per-camera consistency either applies a directly supported finite surface,

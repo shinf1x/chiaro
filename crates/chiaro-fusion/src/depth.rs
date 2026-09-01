@@ -30,6 +30,11 @@ const MAXIMUM_REGULARIZED_BASELINE_LOSS: f32 = 0.04;
 const NEAR_DEPTH_PRIOR: f32 = 0.10;
 const WARP_BOUNDARY_DELTA_PX: f32 = 2.0;
 const WARP_BOUNDARY_CONTRAST: f32 = 0.30;
+// A directly measured surface must occupy more than a chance correlation
+// island. At the default 4 px final grid this is still small enough to retain
+// a roughly 20x20 px feature, while rejecting the salt-and-pepper clusters
+// produced by sensor noise on blank walls and skies.
+const MINIMUM_DIRECT_COMPONENT_NODES: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct DepthOptions {
@@ -363,6 +368,14 @@ pub fn refine_multiview_depth(
         tested,
     } = direct;
     reject_isolated_direct_depths(&mut field, &guidance, columns, rows, inverse_step * 2.5);
+    reject_small_direct_components(
+        &mut field,
+        &guidance,
+        columns,
+        rows,
+        inverse_step * 2.5,
+        MINIMUM_DIRECT_COMPONENT_NODES,
+    );
     fit_local_depth_planes(&mut field, &guidance, columns, rows, inverse_step * 4.0);
 
     let tested_nodes = tested.iter().filter(|&&tested| tested).count();
@@ -897,6 +910,71 @@ fn reject_isolated_direct_depths(
     }
 }
 
+/// Reject small connected islands of otherwise locally plausible depth.
+///
+/// Independent noise can accidentally produce two or three mutually agreeing
+/// ZNCC matches on a textureless surface. Those islands pass a local neighbour
+/// test but do not constitute a reproducible surface. Connectivity requires
+/// both compatible inverse depth and no strong reference-image discontinuity.
+/// This operation only removes measurements; it never completes a hole.
+fn reject_small_direct_components(
+    field: &mut [Option<NodeDepth>],
+    guidance: &[f32],
+    columns: usize,
+    rows: usize,
+    inverse_tolerance: f64,
+    minimum_nodes: usize,
+) {
+    if minimum_nodes <= 1 {
+        return;
+    }
+    let source = field.to_vec();
+    let mut visited = vec![false; source.len()];
+    for seed in 0..source.len() {
+        if visited[seed] || source[seed].is_none() {
+            continue;
+        }
+        visited[seed] = true;
+        let mut pending = vec![seed];
+        let mut component = Vec::new();
+        while let Some(index) = pending.pop() {
+            component.push(index);
+            let column = index % columns;
+            let row = index / columns;
+            let inverse = 1.0 / source[index].expect("visited depth node").depth;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (x, y) = (column as i32 + dx, row as i32 + dy);
+                    if x < 0 || y < 0 || x >= columns as i32 || y >= rows as i32 {
+                        continue;
+                    }
+                    let neighbour = y as usize * columns + x as usize;
+                    if visited[neighbour] {
+                        continue;
+                    }
+                    let Some(neighbour_node) = source[neighbour] else {
+                        continue;
+                    };
+                    let image_edge = (guidance[index] - guidance[neighbour]).abs();
+                    let inverse_difference = (1.0 / neighbour_node.depth - inverse).abs();
+                    if image_edge <= 0.6 && inverse_difference <= inverse_tolerance {
+                        visited[neighbour] = true;
+                        pending.push(neighbour);
+                    }
+                }
+            }
+        }
+        if component.len() < minimum_nodes {
+            for index in component {
+                field[index] = None;
+            }
+        }
+    }
+}
+
 /// Fit a local inverse-depth plane to coherent, directly measured neighbours.
 /// The fit updates only an existing measurement and is clamped near that
 /// measurement, so it removes quantisation/speckle without growing surfaces
@@ -1050,8 +1128,14 @@ fn select_direct_depth(
     } else {
         options.minimum_margin
     };
+    // A finite label being unique among other finite labels is insufficient:
+    // distant textured surfaces can have an extremely shallow cost curve and
+    // acquire a coherent but fictitious finite depth. Require the candidate
+    // to improve measurably on the already fitted global warp. When the global
+    // patch is unavailable, uniqueness remains the only usable evidence.
+    let improves_global = baseline.is_none_or(|_| improvement >= options.minimum_improvement * 0.5);
     let supported = score >= score_floor
-        && baseline.is_none_or(|baseline| score + 0.015 >= baseline)
+        && improves_global
         && (margin >= required_margin || improvement >= options.minimum_improvement);
     if !supported {
         return None;
@@ -2013,6 +2097,47 @@ mod tests {
         let mut field = vec![node(2_000.0), None, node(500.0)];
         reject_isolated_direct_depths(&mut field, &[0.5; 3], 3, 1, 1.0e-4);
         assert!(field.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn direct_component_filter_removes_speckles_without_growing_surfaces() {
+        let node = || {
+            Some(NodeDepth {
+                depth: 2_000.0,
+                confidence: 0.9,
+                improvement: 0.1,
+                regularized: false,
+            })
+        };
+        let mut field = vec![None; 36];
+        // A coherent 3x3 surface survives a six-node minimum.
+        for row in 2..=4 {
+            for column in 1..=3 {
+                field[row * 6 + column] = node();
+            }
+        }
+        // A separate two-node chance island is removed.
+        field[3 * 6 + 5] = node();
+        field[4 * 6 + 5] = node();
+        reject_small_direct_components(&mut field, &[0.5; 36], 6, 6, 1.0e-4, 6);
+        assert_eq!(field.iter().flatten().count(), 9);
+        assert!(field[3 * 6 + 2].is_some());
+        assert!(field[3 * 6 + 5].is_none());
+        assert!(field[4 * 6 + 5].is_none());
+    }
+
+    #[test]
+    fn direct_depth_must_improve_on_the_global_warp() {
+        let depths = [10_000.0, 9_000.0, 8_000.0, 7_000.0, 6_000.0];
+        let scores = [Some(0.60), Some(0.65), Some(0.90), Some(0.65), Some(0.60)];
+        let options = DepthOptions::default();
+
+        // The finite winner is extremely clear relative to the other finite
+        // labels, but it is indistinguishable from the global mapping.
+        assert!(select_direct_depth(&depths, &scores, Some(0.899), false, &options).is_none());
+
+        // The same unique label is accepted once it also improves on global.
+        assert!(select_direct_depth(&depths, &scores, Some(0.89), false, &options).is_some());
     }
 
     #[test]
