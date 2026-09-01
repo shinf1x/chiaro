@@ -4,7 +4,7 @@
 //! based on the published algorithm descriptions. They do not incorporate the
 //! GPL implementations shipped by RawTherapee, darktable, or LibRaw.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::OnceLock};
 
 use anyhow::{Result, bail};
 use chiaro::lri::SensorPattern;
@@ -126,12 +126,19 @@ fn estimate_green_rows(
     green: &mut [f32],
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if method == DemosaicMethod::Amaze && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 support was checked above; the vector loop observes the
-        // same four-pixel border as the scalar estimator.
-        return unsafe {
-            estimate_green_rows_amaze_avx2(raw, rgb, width, height, pattern, rows, green)
-        };
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support was checked above; both vector loops observe
+        // the same four-pixel border as the scalar estimator.
+        if method == DemosaicMethod::Amaze {
+            return unsafe {
+                estimate_green_rows_amaze_avx2(raw, rgb, width, height, pattern, rows, green)
+            };
+        }
+        if method == DemosaicMethod::Lmmse {
+            return unsafe {
+                estimate_green_rows_lmmse_avx2(raw, rgb, width, height, pattern, rows, green)
+            };
+        }
     }
     estimate_green_rows_scalar(raw, rgb, width, height, pattern, method, rows, green);
 }
@@ -200,6 +207,45 @@ unsafe fn estimate_green_rows_amaze_avx2(
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn estimate_green_rows_lmmse_avx2(
+    raw: &[u16],
+    rgb: &[u16],
+    width: usize,
+    height: usize,
+    pattern: SensorPattern,
+    rows: std::ops::Range<usize>,
+    green: &mut [f32],
+) {
+    for (local_y, y) in rows.enumerate() {
+        for x in 0..width {
+            let index = y * width + x;
+            green[local_y * width + x] = if pattern.color_at(y, x) == 1 {
+                f32::from(raw[index])
+            } else {
+                f32::from(rgb[index * 3 + 1])
+            };
+        }
+        if y < 4 || y + 4 >= height {
+            continue;
+        }
+        let parity = usize::from(pattern.color_at(y, 0) == 1);
+        let mut x = 4 + parity;
+        while x + 18 < width {
+            let values = unsafe { lmmse_green_batch_avx2(raw, width, x, y) };
+            for (lane, value) in values.into_iter().enumerate() {
+                green[local_y * width + x + lane * 2] = value;
+            }
+            x += 16;
+        }
+        while x + 4 < width {
+            green[local_y * width + x] = estimate_green(raw, width, x, y, DemosaicMethod::Lmmse);
+            x += 2;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_rows(
     raw: &[u16],
@@ -212,12 +258,19 @@ fn reconstruct_rows(
     rgb: &mut [u16],
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if method == DemosaicMethod::Amaze && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 support was checked above, and the row kernel only
-        // accesses the same four-pixel interior used by the scalar path.
-        return unsafe {
-            reconstruct_rows_amaze_avx2(raw, green, width, height, pattern, rows, rgb)
-        };
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support was checked above, and both row kernels observe
+        // the same four-pixel interior used by the scalar path.
+        if method == DemosaicMethod::Amaze {
+            return unsafe {
+                reconstruct_rows_amaze_avx2(raw, green, width, height, pattern, rows, rgb)
+            };
+        }
+        if method == DemosaicMethod::Lmmse {
+            return unsafe {
+                reconstruct_rows_lmmse_avx2(raw, green, width, height, pattern, rows, rgb)
+            };
+        }
     }
     reconstruct_rows_scalar(raw, green, width, height, pattern, method, rows, rgb);
 }
@@ -320,6 +373,123 @@ unsafe fn reconstruct_rows_amaze_avx2(
                 } else {
                     let channel = if colour == 0 { 2 } else { 0 };
                     rgb[(local_y * width + x) * 3 + channel] = quantize(estimate_chroma_amaze(
+                        raw, green, width, pattern, x, y, channel,
+                    ));
+                }
+                x += 2;
+            }
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn reconstruct_rows_lmmse_avx2(
+    raw: &[u16],
+    green: &[f32],
+    width: usize,
+    height: usize,
+    pattern: SensorPattern,
+    rows: std::ops::Range<usize>,
+    rgb: &mut [u16],
+) {
+    let diagonal_weights =
+        LMMSE_DIAGONAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_DIAGONAL));
+    let horizontal_weights =
+        LMMSE_HORIZONTAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_HORIZONTAL));
+    let vertical_weights =
+        LMMSE_VERTICAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_VERTICAL));
+
+    for (local_y, y) in rows.enumerate() {
+        for x in 0..width {
+            rgb[(local_y * width + x) * 3 + 1] = quantize(green[y * width + x]);
+        }
+        if y < 4 || y + 4 >= height {
+            continue;
+        }
+        for parity in 0..2 {
+            let mut x = 4 + parity;
+            let colour = pattern.color_at(y, x);
+            while x + 18 < width {
+                if colour == 1 {
+                    let red = if pattern.color_at(y, x + 1) == 0 {
+                        unsafe {
+                            lmmse_chroma_batch_avx2(
+                                raw,
+                                green,
+                                width,
+                                x,
+                                y,
+                                &LMMSE_HORIZONTAL,
+                                horizontal_weights,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            lmmse_chroma_batch_avx2(
+                                raw,
+                                green,
+                                width,
+                                x,
+                                y,
+                                &LMMSE_VERTICAL,
+                                vertical_weights,
+                            )
+                        }
+                    };
+                    let blue = if pattern.color_at(y, x + 1) == 2 {
+                        unsafe {
+                            lmmse_chroma_batch_avx2(
+                                raw,
+                                green,
+                                width,
+                                x,
+                                y,
+                                &LMMSE_HORIZONTAL,
+                                horizontal_weights,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            lmmse_chroma_batch_avx2(
+                                raw,
+                                green,
+                                width,
+                                x,
+                                y,
+                                &LMMSE_VERTICAL,
+                                vertical_weights,
+                            )
+                        }
+                    };
+                    write_chroma_batch(rgb, width, local_y, x, 0, red);
+                    write_chroma_batch(rgb, width, local_y, x, 2, blue);
+                } else {
+                    let channel = if colour == 0 { 2 } else { 0 };
+                    let values = unsafe {
+                        lmmse_chroma_batch_avx2(
+                            raw,
+                            green,
+                            width,
+                            x,
+                            y,
+                            &LMMSE_DIAGONAL,
+                            diagonal_weights,
+                        )
+                    };
+                    write_chroma_batch(rgb, width, local_y, x, channel, values);
+                }
+                x += 16;
+            }
+            while x + 4 < width {
+                if colour == 1 {
+                    rgb[(local_y * width + x) * 3] =
+                        quantize(estimate_chroma_lmmse(raw, green, width, pattern, x, y, 0));
+                    rgb[(local_y * width + x) * 3 + 2] =
+                        quantize(estimate_chroma_lmmse(raw, green, width, pattern, x, y, 2));
+                } else {
+                    let channel = if colour == 0 { 2 } else { 0 };
+                    rgb[(local_y * width + x) * 3 + channel] = quantize(estimate_chroma_lmmse(
                         raw, green, width, pattern, x, y, channel,
                     ));
                 }
@@ -450,6 +620,41 @@ unsafe fn vertical_gradient_avx2(raw: &[u16], width: usize, indices: __m256i) ->
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+unsafe fn horizontal_estimate_avx2(raw: &[u16], indices: __m256i) -> __m256 {
+    unsafe {
+        let center = gather_raw_avx2(raw, indices, 0);
+        let left = gather_raw_avx2(raw, indices, -1);
+        let right = gather_raw_avx2(raw, indices, 1);
+        let left2 = gather_raw_avx2(raw, indices, -2);
+        let right2 = gather_raw_avx2(raw, indices, 2);
+        let correction = _mm256_sub_ps(_mm256_sub_ps(_mm256_add_ps(center, center), left2), right2);
+        _mm256_add_ps(
+            _mm256_mul_ps(_mm256_set1_ps(0.5), _mm256_add_ps(left, right)),
+            _mm256_mul_ps(_mm256_set1_ps(0.25), correction),
+        )
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn vertical_estimate_avx2(raw: &[u16], width: usize, indices: __m256i) -> __m256 {
+    unsafe {
+        let row = width as i32;
+        let center = gather_raw_avx2(raw, indices, 0);
+        let up = gather_raw_avx2(raw, indices, -row);
+        let down = gather_raw_avx2(raw, indices, row);
+        let up2 = gather_raw_avx2(raw, indices, -2 * row);
+        let down2 = gather_raw_avx2(raw, indices, 2 * row);
+        let correction = _mm256_sub_ps(_mm256_sub_ps(_mm256_add_ps(center, center), up2), down2);
+        _mm256_add_ps(
+            _mm256_mul_ps(_mm256_set1_ps(0.5), _mm256_add_ps(up, down)),
+            _mm256_mul_ps(_mm256_set1_ps(0.25), correction),
+        )
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
 unsafe fn amaze_green_batch_avx2(raw: &[u16], width: usize, x: usize, y: usize) -> [f32; 8] {
     unsafe {
         let base = (y * width + x) as i32;
@@ -512,6 +717,54 @@ unsafe fn amaze_green_batch_avx2(raw: &[u16], width: usize, x: usize, y: usize) 
             _mm256_max_ps(value, _mm256_setzero_ps()),
             _mm256_set1_ps(65535.0),
         );
+        let mut values = [0.0f32; 8];
+        _mm256_storeu_ps(values.as_mut_ptr(), value);
+        values
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn lmmse_green_batch_avx2(raw: &[u16], width: usize, x: usize, y: usize) -> [f32; 8] {
+    unsafe {
+        let base = (y * width + x) as i32;
+        let indices = _mm256_setr_epi32(
+            base,
+            base + 2,
+            base + 4,
+            base + 6,
+            base + 8,
+            base + 10,
+            base + 12,
+            base + 14,
+        );
+        let (gh, gv, dh, dv) = directional_candidates_avx2(raw, width, indices);
+        let zero = _mm256_setzero_ps();
+        let mut error_h = zero;
+        let mut error_v = zero;
+        for offset in [-2i32, -1, 1, 2] {
+            let horizontal =
+                horizontal_estimate_avx2(raw, _mm256_add_epi32(indices, _mm256_set1_epi32(offset)));
+            let vertical = vertical_estimate_avx2(
+                raw,
+                width,
+                _mm256_add_epi32(indices, _mm256_set1_epi32(offset * width as i32)),
+            );
+            let difference_h = _mm256_sub_ps(horizontal, gh);
+            let difference_v = _mm256_sub_ps(vertical, gv);
+            error_h = _mm256_add_ps(error_h, _mm256_mul_ps(difference_h, difference_h));
+            error_v = _mm256_add_ps(error_v, _mm256_mul_ps(difference_v, difference_v));
+        }
+        error_h = _mm256_add_ps(error_h, _mm256_mul_ps(dh, dh));
+        error_v = _mm256_add_ps(error_v, _mm256_mul_ps(dv, dv));
+        let one = _mm256_set1_ps(1.0);
+        let weight_h = _mm256_div_ps(one, _mm256_add_ps(error_h, one));
+        let weight_v = _mm256_div_ps(one, _mm256_add_ps(error_v, one));
+        let value = _mm256_div_ps(
+            _mm256_add_ps(_mm256_mul_ps(gh, weight_h), _mm256_mul_ps(gv, weight_v)),
+            _mm256_add_ps(weight_h, weight_v),
+        );
+        let value = _mm256_min_ps(_mm256_max_ps(value, zero), _mm256_set1_ps(65535.0));
         let mut values = [0.0f32; 8];
         _mm256_storeu_ps(values.as_mut_ptr(), value);
         values
@@ -590,6 +843,133 @@ unsafe fn amaze_chroma_batch_avx2<const N: usize>(
         let mut values = [0.0f32; 8];
         _mm256_storeu_ps(values.as_mut_ptr(), result);
         values
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn lmmse_chroma_batch_avx2<const N: usize>(
+    raw: &[u16],
+    green: &[f32],
+    width: usize,
+    x: usize,
+    y: usize,
+    offsets: &[(isize, isize); N],
+    spatial: &[f32; N],
+) -> [f32; 8] {
+    unsafe {
+        let base = (y * width + x) as i32;
+        let lane_indices = _mm256_setr_epi32(
+            base,
+            base + 2,
+            base + 4,
+            base + 6,
+            base + 8,
+            base + 10,
+            base + 12,
+            base + 14,
+        );
+        let center_green = _mm256_i32gather_ps(green.as_ptr(), lane_indices, 4);
+        let zero = _mm256_setzero_ps();
+        let mut differences = [zero; N];
+        let mut weights = [zero; N];
+        let one = _mm256_set1_ps(1.0);
+        let inv_edge_scale = _mm256_set1_ps(1.0 / 256.0);
+        let sign = _mm256_set1_ps(-0.0);
+        let raw_base = raw.as_ptr().cast::<i32>();
+
+        for slot in 0..N {
+            let (dx, dy) = offsets[slot];
+            let offset = (dy * width as isize + dx) as i32;
+            let indices = _mm256_add_epi32(lane_indices, _mm256_set1_epi32(offset));
+            let packed = _mm256_i32gather_epi32(raw_base, indices, 2);
+            let samples = _mm256_cvtepi32_ps(_mm256_and_si256(packed, _mm256_set1_epi32(0xffff)));
+            let neighbour_green = _mm256_i32gather_ps(green.as_ptr(), indices, 4);
+            differences[slot] = _mm256_sub_ps(samples, neighbour_green);
+            let green_delta = _mm256_andnot_ps(sign, _mm256_sub_ps(neighbour_green, center_green));
+            let edge = _mm256_div_ps(
+                one,
+                _mm256_add_ps(one, _mm256_mul_ps(green_delta, inv_edge_scale)),
+            );
+            weights[slot] = _mm256_mul_ps(_mm256_set1_ps(spatial[slot]), edge);
+        }
+
+        let median = upper_median_lmmse_avx2(differences);
+        let mut deviations = [zero; N];
+        for slot in 0..N {
+            deviations[slot] = _mm256_andnot_ps(sign, _mm256_sub_ps(differences[slot], median));
+        }
+        let scale = _mm256_max_ps(upper_median_lmmse_avx2(deviations), one);
+        let spread = _mm256_mul_ps(_mm256_set1_ps(2.5), scale);
+        let low = _mm256_sub_ps(median, spread);
+        let high = _mm256_add_ps(median, spread);
+        let mut sum = zero;
+        let mut weight = zero;
+        for slot in 0..N {
+            let bounded = _mm256_min_ps(_mm256_max_ps(differences[slot], low), high);
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(bounded, weights[slot]));
+            weight = _mm256_add_ps(weight, weights[slot]);
+        }
+        let result = _mm256_add_ps(
+            center_green,
+            _mm256_div_ps(sum, _mm256_max_ps(weight, _mm256_set1_ps(f32::EPSILON))),
+        );
+        let mut values = [0.0f32; 8];
+        _mm256_storeu_ps(values.as_mut_ptr(), result);
+        values
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn upper_median_lmmse_avx2<const N: usize>(mut values: [__m256; N]) -> __m256 {
+    macro_rules! ascending {
+        ($left:expr, $right:expr) => {{
+            let a = values[$left];
+            let b = values[$right];
+            values[$left] = _mm256_min_ps(a, b);
+            values[$right] = _mm256_max_ps(a, b);
+        }};
+    }
+    macro_rules! descending {
+        ($left:expr, $right:expr) => {{
+            let a = values[$left];
+            let b = values[$right];
+            values[$left] = _mm256_max_ps(a, b);
+            values[$right] = _mm256_min_ps(a, b);
+        }};
+    }
+
+    if N == 16 {
+        let mut size = 2;
+        while size <= 16 {
+            let mut stride = size / 2;
+            while stride > 0 {
+                for left in 0..16 {
+                    let right = left ^ stride;
+                    if right > left {
+                        if left & size == 0 {
+                            ascending!(left, right);
+                        } else {
+                            descending!(left, right);
+                        }
+                    }
+                }
+                stride /= 2;
+            }
+            size *= 2;
+        }
+        values[8]
+    } else {
+        debug_assert_eq!(N, 20);
+        for phase in 0..20 {
+            let mut left = phase & 1;
+            while left + 1 < 20 {
+                ascending!(left, left + 1);
+                left += 2;
+            }
+        }
+        values[10]
     }
 }
 
@@ -747,7 +1127,162 @@ fn estimate_chroma(
         return estimate_chroma_amaze(raw, green, width, pattern, x, y, channel)
             .clamp(0.0, 65535.0);
     }
+    if method == DemosaicMethod::Lmmse {
+        return estimate_chroma_lmmse(raw, green, width, pattern, x, y, channel)
+            .clamp(0.0, 65535.0);
+    }
     estimate_chroma_generic(raw, green, width, height, pattern, x, y, channel, method)
+}
+
+const LMMSE_DIAGONAL: [(isize, isize); 16] = [
+    (-3, -3),
+    (-1, -3),
+    (1, -3),
+    (3, -3),
+    (-3, -1),
+    (-1, -1),
+    (1, -1),
+    (3, -1),
+    (-3, 1),
+    (-1, 1),
+    (1, 1),
+    (3, 1),
+    (-3, 3),
+    (-1, 3),
+    (1, 3),
+    (3, 3),
+];
+const LMMSE_HORIZONTAL: [(isize, isize); 20] = [
+    (-3, -4),
+    (-1, -4),
+    (1, -4),
+    (3, -4),
+    (-3, -2),
+    (-1, -2),
+    (1, -2),
+    (3, -2),
+    (-3, 0),
+    (-1, 0),
+    (1, 0),
+    (3, 0),
+    (-3, 2),
+    (-1, 2),
+    (1, 2),
+    (3, 2),
+    (-3, 4),
+    (-1, 4),
+    (1, 4),
+    (3, 4),
+];
+const LMMSE_VERTICAL: [(isize, isize); 20] = [
+    (-4, -3),
+    (-2, -3),
+    (0, -3),
+    (2, -3),
+    (4, -3),
+    (-4, -1),
+    (-2, -1),
+    (0, -1),
+    (2, -1),
+    (4, -1),
+    (-4, 1),
+    (-2, 1),
+    (0, 1),
+    (2, 1),
+    (4, 1),
+    (-4, 3),
+    (-2, 3),
+    (0, 3),
+    (2, 3),
+    (4, 3),
+];
+static LMMSE_DIAGONAL_WEIGHTS: OnceLock<[f32; 16]> = OnceLock::new();
+static LMMSE_HORIZONTAL_WEIGHTS: OnceLock<[f32; 20]> = OnceLock::new();
+static LMMSE_VERTICAL_WEIGHTS: OnceLock<[f32; 20]> = OnceLock::new();
+
+fn lmmse_gaussian_weights<const N: usize>(offsets: &[(isize, isize); N]) -> [f32; N] {
+    std::array::from_fn(|index| {
+        let (dx, dy) = offsets[index];
+        let distance2 = (dx * dx + dy * dy) as f32;
+        (-distance2 / 8.0).exp()
+    })
+}
+
+/// LMMSE uses the target-colour positions in a 9x9 neighbourhood: sixteen
+/// diagonal sites at the opposite chroma phase or twenty sites at a green
+/// phase. Direct enumeration removes the generic 81-position search, while
+/// the Gaussian factors are calculated only once per process.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn estimate_chroma_lmmse(
+    raw: &[u16],
+    green: &[f32],
+    width: usize,
+    pattern: SensorPattern,
+    x: usize,
+    y: usize,
+    channel: usize,
+) -> f32 {
+    let center = y * width + x;
+    let center_green = green[center];
+    let center_colour = pattern.color_at(y, x);
+    let (offsets, spatial): (&[(isize, isize)], &[f32]) = if center_colour != 1 {
+        (
+            &LMMSE_DIAGONAL,
+            LMMSE_DIAGONAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_DIAGONAL)),
+        )
+    } else if pattern.color_at(y, x + 1) == channel {
+        (
+            &LMMSE_HORIZONTAL,
+            LMMSE_HORIZONTAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_HORIZONTAL)),
+        )
+    } else {
+        (
+            &LMMSE_VERTICAL,
+            LMMSE_VERTICAL_WEIGHTS.get_or_init(|| lmmse_gaussian_weights(&LMMSE_VERTICAL)),
+        )
+    };
+    let mut differences = [0.0f32; 20];
+    let mut weights = [0.0f32; 20];
+    for (slot, (&(dx, dy), &spatial)) in offsets.iter().zip(spatial).enumerate() {
+        let nx = (x as isize + dx) as usize;
+        let ny = (y as isize + dy) as usize;
+        let index = ny * width + nx;
+        let neighbour_green = green[index];
+        let edge = 1.0 / (1.0 + (neighbour_green - center_green).abs() / 256.0);
+        differences[slot] = f32::from(raw[index]) - neighbour_green;
+        weights[slot] = spatial * edge;
+    }
+    robust_difference_fixed(center_green, &differences, &weights, offsets.len(), 2.5)
+}
+
+#[inline(always)]
+fn robust_difference_fixed(
+    center_green: f32,
+    differences: &[f32; 20],
+    weights: &[f32; 20],
+    len: usize,
+    limit: f32,
+) -> f32 {
+    let mut ordered = *differences;
+    let median_index = len / 2;
+    let (_, median, _) = ordered[..len].select_nth_unstable_by(median_index, f32::total_cmp);
+    let median = *median;
+    let mut deviations = [0.0f32; 20];
+    for (deviation, &difference) in deviations[..len].iter_mut().zip(&differences[..len]) {
+        *deviation = (difference - median).abs();
+    }
+    let (_, scale, _) = deviations[..len].select_nth_unstable_by(median_index, f32::total_cmp);
+    let scale = (*scale).max(1.0);
+    let low = median - limit * scale;
+    let high = median + limit * scale;
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    for (&difference, &sample_weight) in differences[..len].iter().zip(&weights[..len]) {
+        sum += difference.clamp(low, high) * sample_weight;
+        weight += sample_weight;
+    }
+    center_green + sum / weight.max(f32::EPSILON)
 }
 
 /// AMaZE only considers target-colour sites in a 5x5 Bayer neighbourhood.
@@ -1014,7 +1549,63 @@ mod tests {
         rgb
     }
 
-    fn scalar_amaze(raw: &[u16], width: usize, height: usize, pattern: SensorPattern) -> Vec<u16> {
+    fn generic_lmmse_reference(
+        raw: &[u16],
+        width: usize,
+        height: usize,
+        pattern: SensorPattern,
+    ) -> Vec<u16> {
+        let mut rgb = demosaic_bilinear_threaded(raw, width, height, pattern, 1).unwrap();
+        let green = (0..raw.len())
+            .map(|index| {
+                let (x, y) = (index % width, index / width);
+                if pattern.color_at(y, x) == 1 {
+                    f32::from(raw[index])
+                } else if x < 4 || y < 4 || x + 4 >= width || y + 4 >= height {
+                    f32::from(rgb[index * 3 + 1])
+                } else {
+                    estimate_green(raw, width, x, y, DemosaicMethod::Lmmse)
+                }
+            })
+            .collect::<Vec<_>>();
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                let colour = pattern.color_at(y, x);
+                let border = x < 4 || y < 4 || x + 4 >= width || y + 4 >= height;
+                for channel in [0, 2] {
+                    let value = if colour == channel {
+                        f32::from(raw[index])
+                    } else if border {
+                        f32::from(rgb[index * 3 + channel])
+                    } else {
+                        estimate_chroma_generic(
+                            raw,
+                            &green,
+                            width,
+                            height,
+                            pattern,
+                            x,
+                            y,
+                            channel,
+                            DemosaicMethod::Lmmse,
+                        )
+                    };
+                    rgb[index * 3 + channel] = quantize(value);
+                }
+                rgb[index * 3 + 1] = quantize(green[index]);
+            }
+        }
+        rgb
+    }
+
+    fn scalar_demosaic(
+        raw: &[u16],
+        width: usize,
+        height: usize,
+        pattern: SensorPattern,
+        method: DemosaicMethod,
+    ) -> Vec<u16> {
         let mut rgb = demosaic_bilinear_threaded(raw, width, height, pattern, 1).unwrap();
         let mut green = vec![0.0; raw.len()];
         estimate_green_rows_scalar(
@@ -1023,7 +1614,7 @@ mod tests {
             width,
             height,
             pattern,
-            DemosaicMethod::Amaze,
+            method,
             0..height,
             &mut green,
         );
@@ -1033,7 +1624,7 @@ mod tests {
             width,
             height,
             pattern,
-            DemosaicMethod::Amaze,
+            method,
             0..height,
             &mut rgb,
         );
@@ -1144,6 +1735,62 @@ mod tests {
     }
 
     #[test]
+    fn lmmse_chroma_kernel_matches_generic_neighbour_search() {
+        let (width, height) = (24, 20);
+        let raw = (0..width * height)
+            .map(|index| ((index * 977 + index / width * 311) & 0xffff) as u16)
+            .collect::<Vec<_>>();
+        for pattern in [
+            SensorPattern::Rggb,
+            SensorPattern::Grbg,
+            SensorPattern::Gbrg,
+            SensorPattern::Bggr,
+        ] {
+            let bilinear = demosaic_bilinear_threaded(&raw, width, height, pattern, 1).unwrap();
+            let green = (0..raw.len())
+                .map(|index| {
+                    let (x, y) = (index % width, index / width);
+                    if pattern.color_at(y, x) == 1 {
+                        f32::from(raw[index])
+                    } else if x < 4 || y < 4 || x + 4 >= width || y + 4 >= height {
+                        f32::from(bilinear[index * 3 + 1])
+                    } else {
+                        estimate_green(&raw, width, x, y, DemosaicMethod::Lmmse)
+                    }
+                })
+                .collect::<Vec<_>>();
+            for y in 4..height - 4 {
+                for x in 4..width - 4 {
+                    for channel in [0, 2] {
+                        if pattern.color_at(y, x) == channel {
+                            continue;
+                        }
+                        let optimized =
+                            estimate_chroma_lmmse(&raw, &green, width, pattern, x, y, channel)
+                                .clamp(0.0, 65535.0);
+                        let generic = estimate_chroma_generic(
+                            &raw,
+                            &green,
+                            width,
+                            height,
+                            pattern,
+                            x,
+                            y,
+                            channel,
+                            DemosaicMethod::Lmmse,
+                        );
+                        assert_eq!(
+                            optimized.to_bits(),
+                            generic.to_bits(),
+                            "{pattern:?} channel={channel} at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn optimized_amaze_matches_generic_full_frame_reference() {
         let (width, height) = (24, 20);
         let raw = (0..width * height)
@@ -1157,7 +1804,7 @@ mod tests {
         ] {
             let dispatched =
                 demosaic(&raw, width, height, pattern, DemosaicMethod::Amaze, 3).unwrap();
-            let scalar = scalar_amaze(&raw, width, height, pattern);
+            let scalar = scalar_demosaic(&raw, width, height, pattern, DemosaicMethod::Amaze);
             assert_eq!(
                 dispatched, scalar,
                 "runtime dispatch versus scalar fallback for {pattern:?}"
@@ -1166,6 +1813,33 @@ mod tests {
                 scalar,
                 generic_amaze_reference(&raw, width, height, pattern),
                 "optimized versus generic reference for {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_lmmse_matches_generic_full_frame_reference() {
+        let (width, height) = (24, 20);
+        let raw = (0..width * height)
+            .map(|index| ((index * 977 + index / width * 311) & 0xffff) as u16)
+            .collect::<Vec<_>>();
+        for pattern in [
+            SensorPattern::Rggb,
+            SensorPattern::Grbg,
+            SensorPattern::Gbrg,
+            SensorPattern::Bggr,
+        ] {
+            let dispatched =
+                demosaic(&raw, width, height, pattern, DemosaicMethod::Lmmse, 3).unwrap();
+            let scalar = scalar_demosaic(&raw, width, height, pattern, DemosaicMethod::Lmmse);
+            assert_eq!(
+                dispatched, scalar,
+                "runtime LMMSE dispatch versus scalar fallback for {pattern:?}"
+            );
+            assert_eq!(
+                scalar,
+                generic_lmmse_reference(&raw, width, height, pattern),
+                "optimized LMMSE versus generic reference for {pattern:?}"
             );
         }
     }
