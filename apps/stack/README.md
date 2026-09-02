@@ -64,6 +64,9 @@ default elsewhere, while RCD is intended for individual night-sky exposures.
 `--highlight-recovery` accepts `none`, `local-bayer`, `multiscale-bayer`, or
 `multi-camera`; all-module mode defaults to confidence-gated multi-camera RAW
 recovery before demosaic.
+`--crosstalk` accepts `none`, `factory`, or `adaptive`. Adaptive is the
+all-module default; it applies a held-out-validated residual over the factory
+17x13 four-phase mesh and otherwise retains that factory mesh unchanged.
 
 Temporal rejection is per pixel. Dense depth reconstruction is classical and
 confidence-gated; it does not yet estimate non-rigid subject motion between

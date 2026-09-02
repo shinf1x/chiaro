@@ -14,6 +14,9 @@ use chiaro_fusion::{
         CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, awb_gains,
         camera_name, image_focal_length_mm, module_states,
     },
+    crosstalk::{
+        AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
+    },
     depth::{DenseDepthMap, refine_multiview_depth},
     geometry::{CameraRefinement, ResolvedCamera},
     image::{Mosaic, Plane},
@@ -51,6 +54,7 @@ pub struct NightFusionOptions {
     pub local_photometric: bool,
     pub crop_to_framing: bool,
     pub synth: SynthOptions,
+    pub crosstalk: CrosstalkMode,
     pub threads: usize,
 }
 
@@ -76,6 +80,7 @@ impl Default for NightFusionOptions {
                 demosaic: DemosaicMethod::Lmmse,
                 ..SynthOptions::default()
             },
+            crosstalk: CrosstalkMode::default(),
             threads: 0,
         }
     }
@@ -88,6 +93,7 @@ pub struct NightFusionReport {
     pub temporal: Vec<StackReport>,
     pub modules: Vec<AlignmentReport>,
     pub highlights: Vec<(String, HighlightRecoveryReport)>,
+    pub crosstalk: Vec<(String, AdaptiveCrosstalkReport)>,
     /// Per-module synthesis confidence contributed by the calibrated dark
     /// noise estimate, relative to the reference module.
     pub dark_noise_weights: Vec<(String, f32)>,
@@ -104,6 +110,8 @@ struct LoadedModule {
     camera: Option<ResolvedCamera>,
     dark_noise_variance: Option<f32>,
     highlight: HighlightRecoveryState,
+    capture_gain: f32,
+    exposure_ns: u64,
 }
 
 pub fn fuse_night(
@@ -273,6 +281,8 @@ pub fn fuse_night(
             camera: resolved,
             dark_noise_variance,
             highlight: stack.highlight,
+            capture_gain: state.map_or(1.0, |state| state.gain as f32),
+            exposure_ns: state.map_or(0, |state| state.exposure_ns),
         });
     }
 
@@ -372,6 +382,37 @@ pub fn fuse_night(
                 reference_calibration,
                 recorded_wb,
             )
+        })
+        .collect::<Vec<_>>();
+    progress("fit adaptive RAW crosstalk");
+    let crosstalk_fits = {
+        let sources = modules
+            .iter()
+            .zip(&alignments)
+            .zip(&colors)
+            .map(|((module, alignment), &color)| CrosstalkFitSource {
+                mosaic: &module.mosaic,
+                highlight: &module.highlight,
+                alignment,
+                color,
+                capture_gain: module.capture_gain,
+                exposure_ns: module.exposure_ns,
+            })
+            .collect::<Vec<_>>();
+        fit_adaptive_crosstalk(
+            &sources,
+            reference_index,
+            options.crosstalk,
+            modules[reference_index].mosaic.width,
+            modules[reference_index].mosaic.height,
+        )
+    };
+    let crosstalk_reports = modules
+        .iter_mut()
+        .zip(crosstalk_fits)
+        .map(|(module, fit)| {
+            module.mosaic.crosstalk = fit.mesh;
+            (module.raw.name.clone(), fit.report)
         })
         .collect::<Vec<_>>();
     for (module, alignment) in modules.iter_mut().zip(&alignments) {
@@ -502,6 +543,7 @@ pub fn fuse_night(
             .iter()
             .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
             .collect(),
+        crosstalk: crosstalk_reports,
         dark_noise_weights,
         synthesis,
         depth_map,

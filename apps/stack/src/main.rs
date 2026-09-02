@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chiaro_fusion::calibration::{CalibrationDatabase, LriMessages};
+use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_hotpixel_core::{
     demosaic::DemosaicMethod,
     highlight::HighlightRecovery,
@@ -107,6 +108,10 @@ struct Cli {
     #[arg(long, default_value = "multi-camera")]
     highlight_recovery: HighlightRecovery,
 
+    /// Apply no crosstalk, the factory mesh, or a capture-adaptive residual.
+    #[arg(long, default_value = "adaptive")]
+    crosstalk: CrosstalkMode,
+
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -140,6 +145,7 @@ fn main() -> Result<()> {
         options.synth.threads = cli.threads;
         options.synth.demosaic = cli.demosaic.into();
         options.synth.highlight_recovery = cli.highlight_recovery;
+        options.crosstalk = cli.crosstalk;
         set_output_color(&mut options, cli.linear);
         let report = fuse_night(&lri, &options, &cli.output, &mut |detail| {
             eprintln!("{detail}…");

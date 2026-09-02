@@ -9,7 +9,10 @@
 //!    coarse-to-fine correlation search refines a global homography and a
 //!    dense calibrated inverse-depth reconstruction corrects parallax
 //!    ([`align`], [`depth`]);
-//! 3. synthesis: every module is resampled onto a common high-resolution
+//! 3. capture-adaptive crosstalk: a constrained residual over the factory
+//!    four-phase mesh is fitted from smooth aligned overlap and accepted only
+//!    after held-out validation ([`crosstalk`]);
+//! 4. synthesis: every module is resampled onto a common high-resolution
 //!    canvas with resolution-aware, feathered weights and written as a linear
 //!    or display-referred 16-bit PNG ([`synth`]).
 //!
@@ -19,6 +22,7 @@
 
 pub mod align;
 pub mod calibration;
+pub mod crosstalk;
 pub mod depth;
 pub mod geometry;
 pub mod image;

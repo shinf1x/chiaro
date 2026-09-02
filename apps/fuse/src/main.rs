@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use chiaro_fusion::calibration::IntrinsicsMode;
+use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::synth::{CanvasMode, OutputColor};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
@@ -117,6 +118,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "multi-camera")]
     highlight_recovery: RawHighlightRecovery,
 
+    /// Apply no crosstalk, the factory mesh, or a capture-adaptive residual.
+    #[arg(long, default_value = "adaptive")]
+    crosstalk: CrosstalkMode,
+
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
     exclude_mono: bool,
@@ -210,6 +215,7 @@ fn main() -> Result<()> {
     options.synth.include_mono = !cli.exclude_mono;
     options.synth.demosaic = cli.demosaic.into();
     options.synth.highlight_recovery = cli.highlight_recovery.into();
+    options.crosstalk = cli.crosstalk;
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;

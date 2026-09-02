@@ -16,3 +16,8 @@ exposures.
 Merged Bayer mosaics pass through confidence-tracked local and multiscale RAW
 highlight reconstruction before demosaicing. All-module fusion can additionally
 use consistent unclipped donor measurements from aligned cameras.
+Before demosaicing, it also defaults to capture-adaptive crosstalk: a small
+white-balance-aware residual is fitted over the factory 17x13 four-phase mesh
+using smooth aligned overlap and accepted only when held-out measurements
+improve. Individual cameras fall back to their factory mesh when evidence is
+insufficient.

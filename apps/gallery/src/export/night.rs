@@ -6,7 +6,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use chiaro_fusion::synth::{CanvasMode, OutputColor};
+use chiaro_fusion::{
+    crosstalk::CrosstalkMode,
+    synth::{CanvasMode, OutputColor},
+};
 use chiaro_hotpixel_core::{
     demosaic::DemosaicMethod, highlight::HighlightRecovery, scan::mmap_file,
 };
@@ -50,6 +53,7 @@ pub struct NightStackExport {
     color: OutputColor,
     demosaic: DemosaicMethod,
     highlight_recovery: HighlightRecovery,
+    crosstalk: CrosstalkMode,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -77,6 +81,7 @@ impl Default for NightStackExport {
             color: OutputColor::Display,
             demosaic: DemosaicMethod::Lmmse,
             highlight_recovery: HighlightRecovery::MultiCamera,
+            crosstalk: CrosstalkMode::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -114,6 +119,7 @@ impl NightStackExport {
         options.synth.color = self.color;
         options.synth.demosaic = self.demosaic;
         options.synth.highlight_recovery = self.highlight_recovery;
+        options.crosstalk = self.crosstalk;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -282,6 +288,21 @@ impl ExportPipeline for NightStackExport {
                     }
                 });
         });
+        ui.horizontal(|ui| {
+            ui.label("RAW crosstalk");
+            egui::ComboBox::from_id_salt("night-crosstalk")
+                .selected_text(self.crosstalk.label())
+                .show_ui(ui, |ui| {
+                    for mode in CrosstalkMode::ALL {
+                        ui.selectable_value(&mut self.crosstalk, mode, mode.label());
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Adaptive preserves the factory mesh and fits a constrained capture-specific \
+             residual from smooth aligned overlap between camera modules.",
+        );
         ui.horizontal(|ui| {
             ui.radio_value(
                 &mut self.color,
@@ -466,7 +487,7 @@ fn run_job(
         format!(
             "Chiaro Gallery night-stack export\nhotpixel.rec: {}\ncalibration: {} / {}\n\
              motion rejection: {:.1} sigma, gyro seed: {}, refinement: {}\n\
-             canvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, output color: {:?}\n\n{}\n",
+             canvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, RAW crosstalk: {}, output color: {:?}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
@@ -477,6 +498,7 @@ fn run_job(
             export.crop_to_framing,
             export.demosaic,
             export.highlight_recovery,
+            export.crosstalk,
             export.color,
             log.join("\n")
         ),
@@ -616,6 +638,7 @@ mod tests {
             color: OutputColor::Linear,
             demosaic: DemosaicMethod::Igv,
             highlight_recovery: HighlightRecovery::LocalBayer,
+            crosstalk: CrosstalkMode::Factory,
             include_mono: false,
             highlight_correction: false,
             fast_compression: true,
@@ -641,6 +664,7 @@ mod tests {
             options.synth.highlight_recovery,
             HighlightRecovery::LocalBayer
         );
+        assert_eq!(options.crosstalk, CrosstalkMode::Factory);
         assert!(!options.synth.include_mono);
         assert!(!options.synth.highlight_correction);
         assert_eq!(options.synth.png_level, 1);

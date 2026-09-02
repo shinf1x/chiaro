@@ -39,6 +39,9 @@ Common options include:
   can be used when preparing night-stack output;
 - `--highlight-recovery none|local-bayer|multiscale-bayer|multi-camera`
   selects pre-demosaic RAW recovery; multi-camera is the default;
+- `--crosstalk none|factory|adaptive` controls the four-phase spatial
+  correction; adaptive is the default and safely falls back per camera when a
+  capture-specific residual does not improve held-out overlap measurements;
 - `--exclude-mono` omits monochrome luminance;
 - `--no-depth` keeps the global homography for depth-refinement comparisons;
 - `--depth-near` and `--depth-far` set the calibrated local search interval
@@ -71,7 +74,9 @@ detail that moved differently in every exposure cannot be reconstructed.
 Before crosstalk and demosaic, RAW highlight recovery combines edge-aware local
 colour-difference reconstruction with a clipping-aware multiscale pyramid.
 Multi-camera mode additionally borrows radiance only when at least two aligned,
-unclipped modules agree. Display-ready output retains the smooth sensor-white
-shoulder as a final neutral safeguard.
+unclipped modules agree. The default adaptive crosstalk stage retains the
+factory 17x13 matrix mesh as a prior and fits only a small, white-balance-aware
+residual from smooth aligned regions. Display-ready output retains the smooth
+sensor-white shoulder as a final neutral safeguard.
 Night-sky captures may retain visible module boundaries. Use Chiaro Hotpixel
 and a stacker for astrophotography.

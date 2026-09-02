@@ -270,6 +270,58 @@ impl Mosaic {
         Some((((value - self.black_q6) / range).max(0.0), confidence))
     }
 
+    /// Sample the four CFA phases after the factory crosstalk matrix but
+    /// before white balance and demosaicing. Values are black-subtracted and
+    /// normalized to sensor white. The confidence is the minimum confidence
+    /// of every lattice point contributing to the four bilinear samples.
+    pub fn sample_factory_phases(
+        &self,
+        x: f32,
+        y: f32,
+        highlight: &HighlightRecoveryState,
+    ) -> Option<([f32; 4], u8)> {
+        if self.is_mono()
+            || !(x >= 0.0
+                && y >= 0.0
+                && x <= (self.width - 1) as f32
+                && y <= (self.height - 1) as f32)
+        {
+            return None;
+        }
+        let (red_row, red_col) = self.red_position();
+        let offsets = [
+            (red_col, red_row),
+            (1 - red_col, red_row),
+            (red_col, 1 - red_row),
+            (1 - red_col, 1 - red_row),
+        ];
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        let mut confidence = 255;
+        let mut phases = std::array::from_fn(|phase| {
+            let (column, row) = offsets[phase];
+            confidence = confidence.min(self.bilinear_plane_confidence(
+                x,
+                y,
+                column,
+                row,
+                2,
+                &highlight.confidence,
+            ));
+            ((self.bilinear_plane(x, y, column, row, 2) - self.black_q6) / range).max(0.0)
+        });
+        if let Some(crosstalk) = &self.crosstalk {
+            let matrix = crosstalk.matrix(x, y, self.width, self.height);
+            let input = phases;
+            for row in 0..4 {
+                phases[row] = (0..4)
+                    .map(|column| matrix[row * 4 + column] * input[column])
+                    .sum();
+            }
+        }
+        let flat = self.flat_field(x, y);
+        Some((phases.map(|value| value * flat), confidence))
+    }
+
     /// Convert a normalized, black-subtracted measurement back to this
     /// module's Q6 sensor encoding.
     pub fn normalized_raw_to_q6(&self, value: f32) -> u16 {

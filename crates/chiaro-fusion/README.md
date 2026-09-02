@@ -23,9 +23,13 @@ command-line application.
    donor field only when at least two accepted, aligned modules provide
    consistent unclipped RAW radiance. Donors are regularised within each CFA
    phase and feathered at coverage boundaries; per-channel overlap ratios
-   account for exposure/transmission differences. Then apply four-phase
-   crosstalk correction and reconstruct
-   Bayer colour with the selected demosaicing method, apply
+   account for exposure/transmission differences. Treat the factory 17x13
+   four-phase crosstalk mesh as a prior and, in the default adaptive mode, fit
+   five small residual modes from smooth aligned overlap. The fit is performed
+   in the capture's white-balance domain, tested on held-out observations, and
+   falls back independently to the factory mesh for any module without enough
+   evidence or a measurable validation improvement. Then reconstruct Bayer
+   colour with the selected demosaicing method and apply
    module-specific colour and flat-field calibration, match overlapping
    modules photometrically, and blend them into a 16-bit PNG. AMaZE is the
    default; Simple, RCD, LMMSE, and IGV are also available. Warp
@@ -44,7 +48,8 @@ command-line application.
    introducing a hard highlight boundary.
 
 Every run also writes a `.fusion.json` report with alignment, RAW highlight
-confidence/counts, coverage, photometric, and timing diagnostics.
+confidence/counts, per-module crosstalk fit/validation measurements, coverage,
+photometric, and timing diagnostics.
 
 ## Calibration
 
@@ -101,6 +106,13 @@ contribute luminance unless explicitly excluded.
   every local raw channel is saturated. Multi-camera mode can recover such
   samples only inside reliable overlap where at least two unclipped modules
   agree. The final smooth shoulder remains as a neutral fallback.
+- Capture-adaptive crosstalk estimates only a strongly regularised residual on
+  the supplied factory mesh. The reference module remains the colour anchor,
+  because one scene cannot identify its absolute error. Capture gain, exposure,
+  and AWB are recorded for analysis, but Chiaro does not yet select among
+  multiple factory families because no reliable family mapping is available.
+  Spatial leakage kernels are intentionally deferred until residual diagnostics
+  demonstrate leakage beyond the existing phase matrix.
 
 ## API and diagnostics
 

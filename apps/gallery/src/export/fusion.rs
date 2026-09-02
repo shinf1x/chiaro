@@ -8,6 +8,7 @@ use std::{
 };
 
 use chiaro_fusion::{
+    crosstalk::CrosstalkMode,
     pipeline::{FusionOptions, HotpixelStage, fuse},
     synth::{CanvasMode, OutputColor},
 };
@@ -51,6 +52,7 @@ pub struct FusionExport {
     color: OutputColor,
     demosaic: DemosaicMethod,
     highlight_recovery: HighlightRecovery,
+    crosstalk: CrosstalkMode,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -73,6 +75,7 @@ impl Default for FusionExport {
             color: OutputColor::Display,
             demosaic: DemosaicMethod::default(),
             highlight_recovery: HighlightRecovery::default(),
+            crosstalk: CrosstalkMode::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -108,6 +111,7 @@ impl FusionExport {
         options.synth.color = self.color;
         options.synth.demosaic = self.demosaic;
         options.synth.highlight_recovery = self.highlight_recovery;
+        options.crosstalk = self.crosstalk;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -230,6 +234,21 @@ impl ExportPipeline for FusionExport {
         .on_hover_text(
             "The crop is relative to the capture's reference group: 28 mm for A, 70 mm for B, \
              or 150 mm for C. Unchecked renders the whole reference frame.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("RAW crosstalk");
+            egui::ComboBox::from_id_salt("fusion-crosstalk")
+                .selected_text(self.crosstalk.label())
+                .show_ui(ui, |ui| {
+                    for mode in CrosstalkMode::ALL {
+                        ui.selectable_value(&mut self.crosstalk, mode, mode.label());
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Adaptive keeps the factory 17×13 four-phase mesh as a prior and fits a small, \
+             smooth capture-specific residual from aligned low-texture regions.",
         );
         ui.horizontal(|ui| {
             ui.label("Resolution");
@@ -449,7 +468,7 @@ fn run_job(
     let _ = fs::write(
         output_root.join("export-log.txt"),
         format!(
-            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, final highlight shoulder: {}\n\n{}\n",
+            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, RAW crosstalk: {}, final highlight shoulder: {}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
@@ -457,6 +476,7 @@ fn run_job(
             export.crop_to_framing,
             export.demosaic,
             export.highlight_recovery.label(),
+            export.crosstalk.label(),
             export.highlight_correction,
             log.join("\n")
         ),

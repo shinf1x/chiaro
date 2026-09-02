@@ -68,10 +68,14 @@ Available pipelines:
   and denoises every temporal burst, then performs calibrated multi-camera
   fusion through [`chiaro-stack`](../stack/README.md). Its settings expose the
   motion rejection threshold, gyro seed, alignment refinement, calibration,
-  output resolution and colour, demosaicing, flat-field/highlight corrections,
-  compression, and resume behavior. Each PNG is accompanied by a
+  output resolution and colour, demosaicing, adaptive RAW crosstalk,
+  flat-field/highlight corrections, compression, and resume behavior. Each PNG is accompanied by a
   `.night-fusion.json` diagnostic report. LMMSE is the night-stack default;
   IGV is the other noise-tolerant stack option.
+
+Fused and night exports default to adaptive RAW crosstalk. The factory spatial
+four-phase calibration remains the prior; the capture-specific residual is
+accepted per camera only when it improves held-out smooth overlap samples.
 
 Exports report progress, can be cancelled, check available disk space, and
 record failures in a pipeline-specific export log. Standard pipelines skip

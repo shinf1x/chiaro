@@ -28,6 +28,9 @@ use crate::calibration::{
     CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, ModuleFocusState,
     awb_gains, image_focal_length_mm, module_states,
 };
+use crate::crosstalk::{
+    AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
+};
 use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
@@ -56,6 +59,8 @@ pub struct FusionOptions {
     pub cameras: Vec<String>,
     pub align: AlignOptions,
     pub synth: SynthOptions,
+    /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
+    pub crosstalk: CrosstalkMode,
     /// Apply the factory vignetting meshes as flat-field gains.
     pub flat_field: bool,
     /// Fit a coarse per-module gain field (in addition to the global match)
@@ -81,6 +86,7 @@ impl Default for FusionOptions {
             cameras: Vec::new(),
             align: AlignOptions::default(),
             synth: SynthOptions::default(),
+            crosstalk: CrosstalkMode::default(),
             flat_field: true,
             local_photometric: true,
             crop_to_framing: true,
@@ -109,6 +115,8 @@ pub struct FusionReport {
     pub modules: Vec<AlignmentReport>,
     /// RAW-domain clipped-sample reconstruction performed per module.
     pub highlights: Vec<(String, HighlightRecoveryReport)>,
+    /// Per-module factory-prior and capture-adaptive crosstalk fit.
+    pub crosstalk: Vec<(String, AdaptiveCrosstalkReport)>,
     /// Per module: `(name, luminance gain, luminance offset)`.
     pub gains: Vec<(String, f32, f32)>,
     pub synthesis: SynthReport,
@@ -240,6 +248,8 @@ struct LoadedModule {
     camera: Option<ResolvedCamera>,
     focus: ModuleFocusState,
     highlight: HighlightRecoveryState,
+    capture_gain: f32,
+    exposure_ns: u64,
 }
 
 /// Replace only low-confidence spatial reconstructions for which at least two
@@ -747,13 +757,19 @@ pub fn fuse(
             .ok(),
             _ => None,
         };
-        let focus = state.map_or_else(ModuleFocusState::default, |state| state.focus);
+        let focus = state
+            .as_ref()
+            .map_or_else(ModuleFocusState::default, |state| state.focus.clone());
+        let capture_gain = state.as_ref().map_or(1.0, |state| state.gain as f32);
+        let exposure_ns = state.as_ref().map_or(0, |state| state.exposure_ns);
         modules.push(LoadedModule {
             raw: raw.clone(),
             mosaic,
             camera,
             focus,
             highlight,
+            capture_gain,
+            exposure_ns,
         });
     }
     timings.hotpixel = stage_started.elapsed().as_secs_f32();
@@ -914,6 +930,46 @@ pub fn fuse(
                 reference_calibration,
                 recorded_wb,
             )
+        })
+        .collect::<Vec<_>>();
+
+    progress(Progress {
+        stage: "crosstalk",
+        detail: "fitting capture-adaptive factory residuals".to_owned(),
+        fraction: 0.54,
+    });
+    let crosstalk_fits = {
+        let sources = modules
+            .iter()
+            .zip(&alignments)
+            .zip(&module_colors)
+            .map(|((module, alignment), &color)| CrosstalkFitSource {
+                mosaic: &module.mosaic,
+                highlight: &module.highlight,
+                alignment,
+                color,
+                capture_gain: module.capture_gain,
+                exposure_ns: module.exposure_ns,
+            })
+            .collect::<Vec<_>>();
+        let dimensions = (
+            modules[reference_index].mosaic.width,
+            modules[reference_index].mosaic.height,
+        );
+        fit_adaptive_crosstalk(
+            &sources,
+            reference_index,
+            options.crosstalk,
+            dimensions.0,
+            dimensions.1,
+        )
+    };
+    let crosstalk_reports = modules
+        .iter_mut()
+        .zip(crosstalk_fits)
+        .map(|(module, fit)| {
+            module.mosaic.crosstalk = fit.mesh;
+            (module.raw.name.clone(), fit.report)
         })
         .collect::<Vec<_>>();
 
@@ -1089,6 +1145,7 @@ pub fn fuse(
             .iter()
             .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
             .collect(),
+        crosstalk: crosstalk_reports,
         gains: alignments
             .iter()
             .map(|a| (a.name.clone(), a.gain, a.offset))
