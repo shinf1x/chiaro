@@ -40,6 +40,7 @@
 //! Module overview:
 //!
 //! - [`hotpixel`]: the factory `hotpixel.rec` container and per-camera maps;
+//! - [`highlight`]: confidence-tracked RAW Bayer highlight reconstruction;
 //! - [`raw10`]: Light's reversed packed-RAW10 decoding;
 //! - [`correct`]: factory-guided same-colour interpolation and demosaicing;
 //! - [`universal_hotpixel`]: the bundled coordinate-free activity prior;
@@ -54,6 +55,7 @@
 pub mod cleanup;
 pub mod correct;
 pub mod demosaic;
+pub mod highlight;
 pub mod hotpixel;
 pub mod parallel;
 pub mod pipeline;

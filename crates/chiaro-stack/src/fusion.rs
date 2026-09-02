@@ -17,14 +17,21 @@ use chiaro_fusion::{
     depth::{DenseDepthMap, refine_multiview_depth},
     geometry::{CameraRefinement, ResolvedCamera},
     image::{Mosaic, Plane},
-    pipeline::{group_equivalent_focal_mm, nominal_focal_px},
+    pipeline::{
+        RawHighlightSource, cross_camera_highlight_updates, group_equivalent_focal_mm,
+        nominal_focal_px,
+    },
     synth::{
         CanvasMode, ColorPipeline, CropWindow, GainField, ModuleColor, OutputColor, SynthOptions,
         SynthReport, SynthSource, auto_exposure, canvas_scale, photometric_field,
         photometric_match, synthesize,
     },
 };
-use chiaro_hotpixel_core::{demosaic::DemosaicMethod, hotpixel::HotpixelRec};
+use chiaro_hotpixel_core::{
+    demosaic::DemosaicMethod,
+    highlight::{HighlightRecoveryReport, HighlightRecoveryState},
+    hotpixel::HotpixelRec,
+};
 use serde::Serialize;
 
 use crate::{StackOptions, StackReport, stack_mosaic_burst};
@@ -80,6 +87,7 @@ pub struct NightFusionReport {
     pub reference_frame: u64,
     pub temporal: Vec<StackReport>,
     pub modules: Vec<AlignmentReport>,
+    pub highlights: Vec<(String, HighlightRecoveryReport)>,
     /// Per-module synthesis confidence contributed by the calibrated dark
     /// noise estimate, relative to the reference module.
     pub dark_noise_weights: Vec<(String, f32)>,
@@ -95,6 +103,7 @@ struct LoadedModule {
     mosaic: Mosaic,
     camera: Option<ResolvedCamera>,
     dark_noise_variance: Option<f32>,
+    highlight: HighlightRecoveryState,
 }
 
 pub fn fuse_night(
@@ -217,6 +226,7 @@ pub fn fuse_night(
             motion_seeds,
             noise_profiles: calibration.sensor_noise_profiles.clone(),
             demosaic: options.synth.demosaic,
+            highlight_recovery: options.synth.highlight_recovery,
             threads: options.threads,
         };
         let stack = stack_mosaic_burst(lri, &stack_options)?;
@@ -237,6 +247,12 @@ pub fn fuse_night(
             crosstalk: None,
             demosaiced_rgb: None,
         };
+        if options.synth.highlight_recovery
+            != chiaro_hotpixel_core::highlight::HighlightRecovery::None
+            && !mosaic.is_mono()
+        {
+            mosaic.reserve_highlight_headroom();
+        }
         if options.flat_field
             && let Some(vignetting) = calibration
                 .cameras
@@ -256,6 +272,7 @@ pub fn fuse_night(
             mosaic,
             camera: resolved,
             dark_noise_variance,
+            highlight: stack.highlight,
         });
     }
 
@@ -307,6 +324,43 @@ pub fn fuse_night(
     } else {
         None
     };
+    if options.synth.highlight_recovery.uses_multi_camera() {
+        progress("recover cross-camera RAW highlights");
+        let reference_dimensions = (
+            modules[reference_index].raw.width,
+            modules[reference_index].raw.height,
+        );
+        let updates = {
+            let sources = modules
+                .iter()
+                .zip(&alignments)
+                .map(|(module, alignment)| RawHighlightSource {
+                    mosaic: &module.mosaic,
+                    highlight: &module.highlight,
+                    alignment,
+                })
+                .collect::<Vec<_>>();
+            (0..sources.len())
+                .map(|target| {
+                    cross_camera_highlight_updates(
+                        &sources,
+                        target,
+                        reference_dimensions.0,
+                        reference_dimensions.1,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (module, updates) in modules.iter_mut().zip(updates) {
+            for update in updates {
+                module.mosaic.samples[update.index] = update.value;
+                module
+                    .highlight
+                    .mark_multi_camera(update.index, update.confidence);
+            }
+            module.highlight.finish_multi_camera();
+        }
+    }
 
     let reference_calibration = calibration.cameras.get(&reference_name);
     let recorded_wb = awb_gains(&messages).map(|gains| gains.map(|gain| gain as f32));
@@ -443,6 +497,10 @@ pub fn fuse_night(
         modules: alignments
             .iter()
             .map(|alignment| alignment.report.clone())
+            .collect(),
+        highlights: modules
+            .iter()
+            .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
             .collect(),
         dark_noise_weights,
         synthesis,

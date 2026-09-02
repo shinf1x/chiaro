@@ -11,7 +11,9 @@ use chiaro_fusion::{
     pipeline::{FusionOptions, HotpixelStage, fuse},
     synth::{CanvasMode, OutputColor},
 };
-use chiaro_hotpixel_core::{demosaic::DemosaicMethod, scan::mmap_file};
+use chiaro_hotpixel_core::{
+    demosaic::DemosaicMethod, highlight::HighlightRecovery, scan::mmap_file,
+};
 use eframe::egui::{self, Color32, RichText};
 
 use super::{
@@ -48,6 +50,7 @@ pub struct FusionExport {
     crop_to_framing: bool,
     color: OutputColor,
     demosaic: DemosaicMethod,
+    highlight_recovery: HighlightRecovery,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -69,6 +72,7 @@ impl Default for FusionExport {
             crop_to_framing: true,
             color: OutputColor::Display,
             demosaic: DemosaicMethod::default(),
+            highlight_recovery: HighlightRecovery::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -103,6 +107,7 @@ impl FusionExport {
         };
         options.synth.color = self.color;
         options.synth.demosaic = self.demosaic;
+        options.synth.highlight_recovery = self.highlight_recovery;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -253,6 +258,21 @@ impl ExportPipeline for FusionExport {
                     }
                 });
         });
+        ui.horizontal(|ui| {
+            ui.label("RAW highlight recovery");
+            egui::ComboBox::from_id_salt("fusion-highlight-recovery")
+                .selected_text(self.highlight_recovery.label())
+                .show_ui(ui, |ui| {
+                    for mode in HighlightRecovery::ALL {
+                        ui.selectable_value(&mut self.highlight_recovery, mode, mode.label());
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Repairs clipped Bayer samples before crosstalk and demosaicing. Multi-camera also \
+             requires agreement from at least two aligned modules before borrowing radiance.",
+        );
         ui.horizontal(|ui| {
             ui.radio_value(
                 &mut self.color,
@@ -429,13 +449,14 @@ fn run_job(
     let _ = fs::write(
         output_root.join("export-log.txt"),
         format!(
-            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, highlight correction: {}\n\n{}\n",
+            "Chiaro Gallery fusion export\nhotpixel.rec: {}\ncalibration: {} / {}\ncanvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, final highlight shoulder: {}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
             export.canvas,
             export.crop_to_framing,
             export.demosaic,
+            export.highlight_recovery.label(),
             export.highlight_correction,
             log.join("\n")
         ),

@@ -22,6 +22,10 @@ use chiaro_fusion::{
 };
 use chiaro_hotpixel_core::{
     demosaic::{DemosaicMethod, demosaic},
+    highlight::{
+        HighlightRecovery, HighlightRecoveryReport, HighlightRecoveryState,
+        recover_bayer_highlights,
+    },
     parallel::map_row_bands,
     pipeline::FramePipeline,
     thermal::ThermalProfile,
@@ -51,6 +55,10 @@ pub struct StackOptions {
     /// or gain entries.
     pub noise_profiles: HashMap<u64, SensorNoiseProfile>,
     pub demosaic: DemosaicMethod,
+    /// RAW-domain reconstruction applied to the merged Bayer mosaic before
+    /// demosaicing. Multi-camera mode performs its spatial portion here; the
+    /// all-module fusion stage may subsequently add aligned donor samples.
+    pub highlight_recovery: HighlightRecovery,
     pub threads: usize,
 }
 
@@ -70,6 +78,7 @@ impl Default for StackOptions {
             motion_seeds: HashMap::new(),
             noise_profiles: HashMap::new(),
             demosaic: DemosaicMethod::Lmmse,
+            highlight_recovery: HighlightRecovery::MultiscaleBayer,
             threads: 0,
         }
     }
@@ -100,6 +109,8 @@ pub struct StackReport {
     pub fallback_fraction: f32,
     pub imu_sequences: usize,
     pub gyro_seeded_frames: usize,
+    pub highlight: HighlightRecoveryReport,
+    pub reference_highlight: HighlightRecoveryReport,
     pub frames: Vec<FrameReport>,
 }
 
@@ -120,6 +131,8 @@ pub struct MosaicStackResult {
     /// Normalised CFA/mono mosaic in calibration-raster orientation.
     pub mosaic16: Vec<u16>,
     pub reference_mosaic16: Vec<u16>,
+    pub highlight: HighlightRecoveryState,
+    pub reference_highlight: HighlightRecoveryState,
     pub effective_count: Vec<u16>,
     pub temporal_warps: HashMap<u64, Warp>,
     pub report: StackReport,
@@ -446,7 +459,27 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         merged.extend(samples);
         effective_count.extend(counts);
     }
-    let reference_mosaic = reference_mosaic_u16(reference);
+    let mut reference_mosaic = reference_mosaic_u16(reference);
+    let highlight = recover_bayer_highlights(
+        &mut merged,
+        width,
+        height,
+        pattern,
+        0.0,
+        65535.0,
+        options.highlight_recovery,
+    )?;
+    let reference_highlight = recover_bayer_highlights(
+        &mut reference_mosaic,
+        width,
+        height,
+        pattern,
+        0.0,
+        65535.0,
+        options.highlight_recovery,
+    )?;
+    let highlight_report = highlight.report.clone();
+    let reference_highlight_report = reference_highlight.report.clone();
     let mean_effective_frames = effective_count
         .iter()
         .map(|count| *count as f64 / 16384.0)
@@ -487,6 +520,8 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         camera: reference.frame.camera.clone(),
         mosaic16: merged,
         reference_mosaic16: reference_mosaic,
+        highlight,
+        reference_highlight,
         effective_count,
         temporal_warps,
         report: StackReport {
@@ -502,6 +537,8 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             fallback_fraction,
             imu_sequences: motion_sequences.len(),
             gyro_seeded_frames,
+            highlight: highlight_report,
+            reference_highlight: reference_highlight_report,
             frames,
         },
     })
@@ -740,6 +777,10 @@ mod tests {
     #[test]
     fn temporal_stack_defaults_to_lmmse() {
         assert_eq!(StackOptions::default().demosaic, DemosaicMethod::Lmmse);
+        assert_eq!(
+            StackOptions::default().highlight_recovery,
+            HighlightRecovery::MultiscaleBayer
+        );
     }
 
     #[test]

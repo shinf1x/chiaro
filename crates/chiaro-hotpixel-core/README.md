@@ -11,6 +11,8 @@ and Chiaro Gallery.
 - repair factory-listed hot and dead pixels with CFA-aware interpolation;
 - apply bundled condition-dependent hot-pixel and corner-glow models;
 - apply optional camera-specific cleanup profiles;
+- reconstruct clipped Bayer samples locally or with a clipping-aware
+  multiscale pyramid before demosaicing;
 - preserve Bayer mosaics or produce linear 16-bit RGB with selectable demosaicing; and
 - process and encode one frame across multiple CPU cores.
 
@@ -89,6 +91,22 @@ For one portable x86-64 binary, use the ordinary release build (optionally with
 `--target x86_64-unknown-linux-gnu`) and do not set `target-cpu=native`. The
 baseline and AVX2 implementations are linked into the same executable and the
 CPU feature check selects between them at runtime.
+
+## RAW highlight recovery
+
+`HighlightRecovery` provides `None`, `LocalBayer`, `MultiscaleBayer`, and
+`MultiCamera` policies. The local pass reconstructs green first and then
+colour differences along the least-contradictory edge. The multiscale pass
+reduces complete, unclipped 2x2 Bayer cells into a half-resolution RGB pyramid,
+ignores clipped cells while filtering, and propagates surviving colour ratios
+back into low-confidence regions. Pyramid support continuously feathers colour
+toward a neutral lower bound where evidence disappears; the top 2.5% below
+hard clipping also blends gradually instead of forming a threshold contour.
+`MultiCamera` enables the same spatial work and signals the fusion layer to seek
+independently measured aligned donors.
+
+Every reconstructed sample retains a confidence value. A known clipped sample
+is never made darker than its sensor-white lower bound.
 
 ## Tests
 

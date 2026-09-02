@@ -7,7 +7,10 @@ command-line application.
 ## Pipeline
 
 1. Decode each participating RAW module and optionally run the shared
-   hot-pixel and corner-glow correction pipeline.
+   hot-pixel and corner-glow correction pipeline. Detect near-clipped CFA
+   measurements, reconstruct small edges locally, and use a clipping-aware RGB
+   pyramid for larger low-confidence regions. One bit of fractional RAW
+   precision is reserved as radiometric headroom above sensor white.
 2. Resolve the factory camera model, project each module into a reference view,
    refine the global alignment with image correlation, build a dense calibrated
    inverse-depth cost field, and regularise coarse search hypotheses with
@@ -16,7 +19,13 @@ command-line application.
    bilateral support; coarse values and holes are never copied into the final
    map. Each camera subsequently refines the shared depth continuously and
    applies a bounded residual correction.
-3. Reconstruct Bayer colour with the selected demosaicing method, apply
+3. When requested, blend a low-confidence spatial highlight estimate toward a
+   donor field only when at least two accepted, aligned modules provide
+   consistent unclipped RAW radiance. Donors are regularised within each CFA
+   phase and feathered at coverage boundaries; per-channel overlap ratios
+   account for exposure/transmission differences. Then apply four-phase
+   crosstalk correction and reconstruct
+   Bayer colour with the selected demosaicing method, apply
    module-specific colour and flat-field calibration, match overlapping
    modules photometrically, and blend them into a 16-bit PNG. AMaZE is the
    default; Simple, RCD, LMMSE, and IGV are also available. Warp
@@ -34,8 +43,8 @@ command-line application.
    shoulder neutralises false colour from unequally clipped raw channels without
    introducing a hard highlight boundary.
 
-Every run also writes a `.fusion.json` report with alignment, coverage,
-photometric, and timing diagnostics.
+Every run also writes a `.fusion.json` report with alignment, RAW highlight
+confidence/counts, coverage, photometric, and timing diagnostics.
 
 ## Calibration
 
@@ -88,15 +97,20 @@ contribute luminance unless explicitly excluded.
   per-camera Hotpixel output and a stacker for astrophotography.
 - Factory geometry alone is not sufficiently accurate for normal output;
   disabling correlation refinement is intended mainly for diagnostics.
-- Highlight reconstruction can remove false clipping colour, but it cannot
-  recover true colour or texture where every raw channel is saturated. Disable
-  it when preserving the channel response for a dedicated raw processor.
+- Spatial highlight reconstruction cannot recover true colour or texture where
+  every local raw channel is saturated. Multi-camera mode can recover such
+  samples only inside reliable overlap where at least two unclipped modules
+  agree. The final smooth shoulder remains as a neutral fallback.
 
 ## API and diagnostics
 
 `pipeline::fuse` accepts an in-memory LRI, `FusionOptions`, an output path, and
 a progress callback. The processing stages use plain data structures so
 alignment and synthesis can also be inspected independently.
+
+With a debug directory, `<camera>_highlight-uncertainty.png` marks recovered
+RAW samples by inverse confidence in addition to the depth, alignment, and
+source-ownership diagnostics.
 
 Set `FusionOptions::debug_dir` to write per-module alignment checkerboards.
 Continuous scene edges across checkerboard boundaries are a quick visual check

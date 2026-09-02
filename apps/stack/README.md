@@ -61,6 +61,9 @@ linear camera RGB for downstream processing. `--demosaic` accepts `simple`,
 `amaze`, `rcd`, `lmmse`, or `igv`. LMMSE is the night-stack default; IGV is the
 alternative for noise- and moire-prone detail. AMaZE remains the general-photo
 default elsewhere, while RCD is intended for individual night-sky exposures.
+`--highlight-recovery` accepts `none`, `local-bayer`, `multiscale-bayer`, or
+`multi-camera`; all-module mode defaults to confidence-gated multi-camera RAW
+recovery before demosaic.
 
 Temporal rejection is per pixel. Dense depth reconstruction is classical and
 confidence-gated; it does not yet estimate non-rigid subject motion between

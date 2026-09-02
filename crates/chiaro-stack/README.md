@@ -12,3 +12,7 @@ The final mosaics use the shared selectable Simple, AMaZE, RCD, LMMSE, or IGV
 reconstruction. LMMSE is the night-stack default; IGV is the other
 noise-tolerant stack option, while RCD is intended for individual night-sky
 exposures.
+
+Merged Bayer mosaics pass through confidence-tracked local and multiscale RAW
+highlight reconstruction before demosaicing. All-module fusion can additionally
+use consistent unclipped donor measurements from aligned cameras.

@@ -11,6 +11,7 @@
 
 use chiaro::lri::SensorPattern;
 use chiaro_hotpixel_core::demosaic::{DemosaicMethod, demosaic};
+use chiaro_hotpixel_core::highlight::HighlightRecoveryState;
 
 use crate::calibration::{CrosstalkMesh, VignettingMesh};
 
@@ -59,6 +60,18 @@ impl Mosaic {
             crosstalk: None,
             demosaiced_rgb: None,
         }
+    }
+
+    /// Trade one fractional RAW bit for one stop of reconstruction headroom.
+    /// A 10-bit sensor still retains Q5 precision, while demosaic and
+    /// crosstalk can carry estimates above the physical clipping point rather
+    /// than saturating immediately at `u16::MAX`.
+    pub fn reserve_highlight_headroom(&mut self) {
+        for sample in &mut self.samples {
+            *sample = (*sample + 1) / 2;
+        }
+        self.black_q6 *= 0.5;
+        self.white_q6 *= 0.5;
     }
 
     /// Prepare the selected Bayer reconstruction for repeated warped samples.
@@ -231,6 +244,41 @@ impl Mosaic {
         Some(((value - self.black_q6) / range).max(0.0) * self.flat_field(x, y))
     }
 
+    /// Sample a black-subtracted CFA plane before flat-field/crosstalk, along
+    /// with the minimum recovery confidence of the contributing lattice
+    /// points. Cross-camera highlight recovery uses only confidence 255,
+    /// ensuring donor radiance came from sensor measurements rather than from
+    /// another spatial reconstruction.
+    pub fn sample_raw_channel(
+        &self,
+        x: f32,
+        y: f32,
+        channel: usize,
+        highlight: &HighlightRecoveryState,
+    ) -> Option<(f32, u8)> {
+        if !(x >= 0.0 && y >= 0.0 && x <= (self.width - 1) as f32 && y <= (self.height - 1) as f32)
+        {
+            return None;
+        }
+        let (row, column) = (0..2usize)
+            .flat_map(|row| (0..2usize).map(move |column| (row, column)))
+            .find(|&(row, column)| self.pattern.color_at(row, column) == channel)?;
+        let value = self.bilinear_plane(x, y, column, row, 2);
+        let confidence =
+            self.bilinear_plane_confidence(x, y, column, row, 2, &highlight.confidence);
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        Some((((value - self.black_q6) / range).max(0.0), confidence))
+    }
+
+    /// Convert a normalized, black-subtracted measurement back to this
+    /// module's Q6 sensor encoding.
+    pub fn normalized_raw_to_q6(&self, value: f32) -> u16 {
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        (self.black_q6 + value.max(0.0) * range)
+            .round()
+            .clamp(0.0, 65535.0) as u16
+    }
+
     /// Bilinear interpolation on the lattice `(ox + i*step, oy + j*step)`.
     fn bilinear_plane(&self, x: f32, y: f32, ox: usize, oy: usize, step: usize) -> f32 {
         let step_f = step as f32;
@@ -248,6 +296,34 @@ impl Mosaic {
         let top = px(i0, j0) * (1.0 - tx) + px(i1, j0) * tx;
         let bottom = px(i0, j1) * (1.0 - tx) + px(i1, j1) * tx;
         top * (1.0 - ty) + bottom * ty
+    }
+
+    fn bilinear_plane_confidence(
+        &self,
+        x: f32,
+        y: f32,
+        ox: usize,
+        oy: usize,
+        step: usize,
+        confidence: &[u8],
+    ) -> u8 {
+        if confidence.len() != self.samples.len() {
+            return 255;
+        }
+        let step_f = step as f32;
+        let lx = (x - ox as f32) / step_f;
+        let ly = (y - oy as f32) / step_f;
+        let max_i = (self.width - 1 - ox) / step;
+        let max_j = (self.height - 1 - oy) / step;
+        let i0 = lx.floor().clamp(0.0, max_i as f32) as usize;
+        let j0 = ly.floor().clamp(0.0, max_j as f32) as usize;
+        let i1 = (i0 + 1).min(max_i);
+        let j1 = (j0 + 1).min(max_j);
+        [(i0, j0), (i1, j0), (i0, j1), (i1, j1)]
+            .into_iter()
+            .map(|(i, j)| confidence[(oy + j * step) * self.width + ox + i * step])
+            .min()
+            .unwrap_or(0)
     }
 
     fn bilinear_rgb(&self, rgb: &[u16], x: f32, y: f32) -> [f32; 3] {

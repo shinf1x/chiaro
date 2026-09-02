@@ -7,7 +7,9 @@ use std::{
 };
 
 use chiaro_fusion::synth::{CanvasMode, OutputColor};
-use chiaro_hotpixel_core::{demosaic::DemosaicMethod, scan::mmap_file};
+use chiaro_hotpixel_core::{
+    demosaic::DemosaicMethod, highlight::HighlightRecovery, scan::mmap_file,
+};
 use chiaro_stack::fusion::{NightFusionOptions, fuse_night};
 use eframe::egui::{self, Color32, RichText};
 
@@ -47,6 +49,7 @@ pub struct NightStackExport {
     crop_to_framing: bool,
     color: OutputColor,
     demosaic: DemosaicMethod,
+    highlight_recovery: HighlightRecovery,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -73,6 +76,7 @@ impl Default for NightStackExport {
             crop_to_framing: true,
             color: OutputColor::Display,
             demosaic: DemosaicMethod::Lmmse,
+            highlight_recovery: HighlightRecovery::MultiCamera,
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -109,6 +113,7 @@ impl NightStackExport {
         };
         options.synth.color = self.color;
         options.synth.demosaic = self.demosaic;
+        options.synth.highlight_recovery = self.highlight_recovery;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -264,6 +269,16 @@ impl ExportPipeline for NightStackExport {
                             method,
                             format!("{} — {}", method.label(), method.recommendation()),
                         );
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("RAW highlight recovery");
+            egui::ComboBox::from_id_salt("night-highlight-recovery")
+                .selected_text(self.highlight_recovery.label())
+                .show_ui(ui, |ui| {
+                    for mode in HighlightRecovery::ALL {
+                        ui.selectable_value(&mut self.highlight_recovery, mode, mode.label());
                     }
                 });
         });
@@ -451,7 +466,7 @@ fn run_job(
         format!(
             "Chiaro Gallery night-stack export\nhotpixel.rec: {}\ncalibration: {} / {}\n\
              motion rejection: {:.1} sigma, gyro seed: {}, refinement: {}\n\
-             canvas: {:?}, crop to framing: {}, demosaicing: {}, output color: {:?}\n\n{}\n",
+             canvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, output color: {:?}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
@@ -461,6 +476,7 @@ fn run_job(
             export.canvas,
             export.crop_to_framing,
             export.demosaic,
+            export.highlight_recovery,
             export.color,
             log.join("\n")
         ),
@@ -599,6 +615,7 @@ mod tests {
             crop_to_framing: false,
             color: OutputColor::Linear,
             demosaic: DemosaicMethod::Igv,
+            highlight_recovery: HighlightRecovery::LocalBayer,
             include_mono: false,
             highlight_correction: false,
             fast_compression: true,
@@ -620,6 +637,10 @@ mod tests {
         );
         assert_eq!(options.synth.color, OutputColor::Linear);
         assert_eq!(options.synth.demosaic, DemosaicMethod::Igv);
+        assert_eq!(
+            options.synth.highlight_recovery,
+            HighlightRecovery::LocalBayer
+        );
         assert!(!options.synth.include_mono);
         assert!(!options.synth.highlight_correction);
         assert_eq!(options.synth.png_level, 1);

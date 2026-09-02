@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chiaro_fusion::calibration::{CalibrationDatabase, LriMessages};
 use chiaro_hotpixel_core::{
     demosaic::DemosaicMethod,
+    highlight::HighlightRecovery,
     hotpixel::HotpixelRec,
     png16::{write_gray16_native_atomic, write_rgb16_native_atomic},
     scan::mmap_file,
@@ -102,6 +103,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "lmmse")]
     demosaic: Demosaic,
 
+    /// Reconstruct clipped Bayer samples before demosaicing.
+    #[arg(long, default_value = "multi-camera")]
+    highlight_recovery: HighlightRecovery,
+
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -134,6 +139,7 @@ fn main() -> Result<()> {
         options.module_align.depth.far_depth = cli.depth_far;
         options.synth.threads = cli.threads;
         options.synth.demosaic = cli.demosaic.into();
+        options.synth.highlight_recovery = cli.highlight_recovery;
         set_output_color(&mut options, cli.linear);
         let report = fuse_night(&lri, &options, &cli.output, &mut |detail| {
             eprintln!("{detail}…");
@@ -172,6 +178,10 @@ fn main() -> Result<()> {
         motion_sigma: cli.motion_sigma,
         gyro_seed: !cli.no_gyro_seed,
         demosaic: cli.demosaic.into(),
+        highlight_recovery: match cli.highlight_recovery {
+            HighlightRecovery::MultiCamera => HighlightRecovery::MultiscaleBayer,
+            mode => mode,
+        },
         threads: cli.threads,
         ..StackOptions::default()
     };

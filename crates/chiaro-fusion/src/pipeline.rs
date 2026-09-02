@@ -15,6 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chiaro::lri::{RawCamera, parse_raw_layout};
 use chiaro_hotpixel_core::{
+    highlight::{HighlightRecoveryReport, HighlightRecoveryState, recover_bayer_highlights},
     hotpixel::HotpixelRec,
     pipeline::{CleanupStage, FramePipeline, extract_raw_plane_threaded},
     thermal::ThermalProfile,
@@ -106,6 +107,8 @@ pub struct FusionReport {
     /// 35 mm-equivalent focal length recorded for the framing, if any.
     pub framed_focal_length_mm: Option<i32>,
     pub modules: Vec<AlignmentReport>,
+    /// RAW-domain clipped-sample reconstruction performed per module.
+    pub highlights: Vec<(String, HighlightRecoveryReport)>,
     /// Per module: `(name, luminance gain, luminance offset)`.
     pub gains: Vec<(String, f32, f32)>,
     pub synthesis: SynthReport,
@@ -236,6 +239,355 @@ struct LoadedModule {
     mosaic: Mosaic,
     camera: Option<ResolvedCamera>,
     focus: ModuleFocusState,
+    highlight: HighlightRecoveryState,
+}
+
+/// Replace only low-confidence spatial reconstructions for which at least two
+/// other modules provide geometrically consistent, genuinely measured RAW
+/// samples. Per-channel overlap ratios account for exposure/transmission
+/// differences without applying white balance or a colour matrix prematurely.
+#[derive(Clone, Copy)]
+pub struct RawHighlightSource<'a> {
+    pub mosaic: &'a Mosaic,
+    pub highlight: &'a HighlightRecoveryState,
+    pub alignment: &'a ModuleAlignment,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RawHighlightUpdate {
+    pub index: usize,
+    pub value: u16,
+    pub confidence: u8,
+}
+
+/// Calculate conservative donor replacements for one module without mutating
+/// any source. Keeping calculation and application separate lets callers own
+/// mosaics in different pipeline-specific containers.
+pub fn cross_camera_highlight_updates(
+    sources: &[RawHighlightSource<'_>],
+    target_index: usize,
+    reference_width: usize,
+    reference_height: usize,
+) -> Vec<RawHighlightUpdate> {
+    if sources.len() < 3 || target_index >= sources.len() {
+        return Vec::new();
+    }
+    let target = &sources[target_index];
+    if !target.alignment.report.accepted
+        || target.mosaic.is_mono()
+        || target.highlight.confidence.is_empty()
+    {
+        return Vec::new();
+    }
+    let ratios = sources
+        .iter()
+        .enumerate()
+        .map(|(donor_index, donor)| {
+            if target_index == donor_index || !donor.alignment.report.accepted {
+                [None; 3]
+            } else {
+                raw_channel_ratios(target, donor, reference_width, reference_height)
+            }
+        })
+        .collect::<Vec<_>>();
+    // Build a donor radiance field first. Applying accepted estimates during
+    // this pass would turn the binary geometry/consensus decision into a
+    // salt-and-pepper CFA mask after demosaic.
+    let mut candidates = vec![None; target.mosaic.samples.len()];
+    for y in 0..target.mosaic.height {
+        for x in 0..target.mosaic.width {
+            let index = y * target.mosaic.width + x;
+            if !target.highlight.needs_donor(index) {
+                continue;
+            }
+            let Some(reference) = invert_warp(
+                &target.alignment.warp,
+                [x as f32, y as f32],
+                reference_width,
+                reference_height,
+            ) else {
+                continue;
+            };
+            if target.alignment.warp.confidence(reference[0], reference[1]) < 0.7 {
+                continue;
+            }
+            let channel = target.mosaic.pattern.color_at(y, x);
+            let mut estimates = Vec::with_capacity(sources.len() - 1);
+            for (donor_index, donor) in sources.iter().enumerate() {
+                let Some(ratio) = ratios[donor_index][channel] else {
+                    continue;
+                };
+                if donor.alignment.warp.confidence(reference[0], reference[1]) < 0.7 {
+                    continue;
+                }
+                let Some(q) = donor.alignment.warp.map(reference[0], reference[1]) else {
+                    continue;
+                };
+                let Some((sample, confidence)) =
+                    donor
+                        .mosaic
+                        .sample_raw_channel(q[0], q[1], channel, donor.highlight)
+                else {
+                    continue;
+                };
+                if confidence == 255 && sample < 0.985 {
+                    estimates.push(sample * ratio);
+                }
+            }
+            if let Some((estimate, confidence)) = consistent_donor_estimate(&mut estimates) {
+                candidates[index] = Some((estimate.max(0.995), confidence));
+            }
+        }
+    }
+
+    // Regularise each CFA phase independently, preserving radiance edges with
+    // a range weight. Neighbourhood support becomes a continuous feather, so
+    // donor coverage and occlusion boundaries fade into the spatial estimate
+    // rather than making hard per-pixel replacements.
+    let mut updates = Vec::new();
+    const OFFSETS: [(isize, isize, f32); 9] = [
+        (-2, -2, 1.0),
+        (0, -2, 2.0),
+        (2, -2, 1.0),
+        (-2, 0, 2.0),
+        (0, 0, 4.0),
+        (2, 0, 2.0),
+        (-2, 2, 1.0),
+        (0, 2, 2.0),
+        (2, 2, 1.0),
+    ];
+    for y in 0..target.mosaic.height {
+        for x in 0..target.mosaic.width {
+            let index = y * target.mosaic.width + x;
+            let Some((centre, donor_confidence)) = candidates[index] else {
+                continue;
+            };
+            let mut weighted = 0.0;
+            let mut total_weight = 0.0;
+            let mut support_weight = 0.0;
+            let mut possible_weight = 0.0;
+            for (dx, dy, spatial_weight) in OFFSETS {
+                let Some(nx) = x.checked_add_signed(dx) else {
+                    continue;
+                };
+                let Some(ny) = y.checked_add_signed(dy) else {
+                    continue;
+                };
+                if nx >= target.mosaic.width || ny >= target.mosaic.height {
+                    continue;
+                }
+                possible_weight += spatial_weight;
+                let Some((neighbour, _)) = candidates[ny * target.mosaic.width + nx] else {
+                    continue;
+                };
+                support_weight += spatial_weight;
+                let relative_difference = (neighbour - centre).abs() / centre.max(0.05);
+                let range_weight = 1.0 / (1.0 + relative_difference / 0.08).powi(2);
+                let weight = spatial_weight * range_weight;
+                weighted += neighbour * weight;
+                total_weight += weight;
+            }
+            if total_weight <= 0.0 || possible_weight <= 0.0 {
+                continue;
+            }
+            let support = (support_weight / possible_weight).clamp(0.0, 1.0);
+            let feather = smoothstep((support - 0.2) / 0.65);
+            let donor_strength = feather * (f32::from(donor_confidence) / 255.0);
+            if donor_strength < 0.02 {
+                continue;
+            }
+            let estimate = weighted / total_weight;
+            let range = (target.mosaic.white_q6 - target.mosaic.black_q6).max(1.0);
+            let spatial = ((f32::from(target.mosaic.samples[index]) - target.mosaic.black_q6)
+                / range)
+                .max(0.0);
+            let blended = spatial + (estimate - spatial) * donor_strength;
+            let old_confidence = target.highlight.confidence[index];
+            let confidence = f32::from(old_confidence)
+                + (f32::from(donor_confidence) - f32::from(old_confidence)) * donor_strength;
+            updates.push(RawHighlightUpdate {
+                index,
+                value: target.mosaic.normalized_raw_to_q6(blended.max(spatial)),
+                confidence: confidence.round().clamp(1.0, 254.0) as u8,
+            });
+        }
+    }
+    updates
+}
+
+fn smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn recover_cross_camera_highlights(
+    modules: &mut [LoadedModule],
+    alignments: &[ModuleAlignment],
+    reference_width: usize,
+    reference_height: usize,
+) {
+    if modules.len() < 3 || modules.len() != alignments.len() {
+        return;
+    }
+    let updates = {
+        let sources = modules
+            .iter()
+            .zip(alignments)
+            .map(|(module, alignment)| RawHighlightSource {
+                mosaic: &module.mosaic,
+                highlight: &module.highlight,
+                alignment,
+            })
+            .collect::<Vec<_>>();
+        (0..modules.len())
+            .map(|target| {
+                cross_camera_highlight_updates(&sources, target, reference_width, reference_height)
+            })
+            .collect::<Vec<_>>()
+    };
+    for target_index in 0..modules.len() {
+        let target = &mut modules[target_index];
+        for update in &updates[target_index] {
+            target.mosaic.samples[update.index] = update.value;
+            target
+                .highlight
+                .mark_multi_camera(update.index, update.confidence);
+        }
+        target.highlight.finish_multi_camera();
+    }
+}
+
+/// Robust target/donor response ratios from unclipped overlap samples.
+fn raw_channel_ratios(
+    target: &RawHighlightSource<'_>,
+    donor: &RawHighlightSource<'_>,
+    reference_width: usize,
+    reference_height: usize,
+) -> [Option<f32>; 3] {
+    let mut samples: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::new());
+    for y in (24..reference_height.saturating_sub(24)).step_by(48) {
+        for x in (24..reference_width.saturating_sub(24)).step_by(48) {
+            let (x, y) = (x as f32, y as f32);
+            if target.alignment.warp.confidence(x, y) < 0.75
+                || donor.alignment.warp.confidence(x, y) < 0.75
+            {
+                continue;
+            }
+            let (Some(tq), Some(dq)) = (
+                target.alignment.warp.map(x, y),
+                donor.alignment.warp.map(x, y),
+            ) else {
+                continue;
+            };
+            for (channel, ratios) in samples.iter_mut().enumerate() {
+                let Some((target_value, target_confidence)) =
+                    target
+                        .mosaic
+                        .sample_raw_channel(tq[0], tq[1], channel, target.highlight)
+                else {
+                    continue;
+                };
+                let Some((donor_value, donor_confidence)) =
+                    donor
+                        .mosaic
+                        .sample_raw_channel(dq[0], dq[1], channel, donor.highlight)
+                else {
+                    continue;
+                };
+                if target_confidence == 255
+                    && donor_confidence == 255
+                    && (0.03..0.94).contains(&target_value)
+                    && (0.03..0.94).contains(&donor_value)
+                {
+                    let ratio = target_value / donor_value;
+                    if (0.2..5.0).contains(&ratio) {
+                        ratios.push(ratio);
+                    }
+                }
+            }
+        }
+    }
+    std::array::from_fn(|channel| robust_median(&mut samples[channel], 32))
+}
+
+fn robust_median(values: &mut [f32], minimum: usize) -> Option<f32> {
+    if values.len() < minimum {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let trim = values.len() / 10;
+    let retained = &values[trim..values.len() - trim];
+    Some(retained[retained.len() / 2])
+}
+
+fn consistent_donor_estimate(values: &mut [f32]) -> Option<(f32, u8)> {
+    if values.len() < 2 {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let median = values[values.len() / 2];
+    if !median.is_finite() || median <= 0.0 {
+        return None;
+    }
+    let mut deviations = values
+        .iter()
+        .map(|value| (value - median).abs())
+        .collect::<Vec<_>>();
+    deviations.sort_by(f32::total_cmp);
+    let relative_mad = deviations[deviations.len() / 2] / median;
+    if relative_mad > 0.12 {
+        return None;
+    }
+    let confidence = (220 + values.len().saturating_sub(2).min(4) * 6) as u8;
+    Some((median, confidence))
+}
+
+/// Numerically invert the reference-to-module warp near the corresponding
+/// sensor coordinate. The L16 rasters share dimensions, so `[qx,qy]` is a
+/// useful initial guess even for tele modules; Newton updates handle the
+/// calibrated/refined displacement.
+fn invert_warp(
+    warp: &crate::align::Warp,
+    target: [f32; 2],
+    reference_width: usize,
+    reference_height: usize,
+) -> Option<[f32; 2]> {
+    let mut point = [
+        target[0].clamp(0.0, (reference_width - 1) as f32),
+        target[1].clamp(0.0, (reference_height - 1) as f32),
+    ];
+    for _ in 0..8 {
+        let mapped = warp.map(point[0], point[1])?;
+        let error = [mapped[0] - target[0], mapped[1] - target[1]];
+        if error[0].abs().max(error[1].abs()) < 0.35 {
+            return Some(point);
+        }
+        let dx = warp.map((point[0] + 1.0).min((reference_width - 1) as f32), point[1])?;
+        let dy = warp.map(
+            point[0],
+            (point[1] + 1.0).min((reference_height - 1) as f32),
+        )?;
+        let j00 = dx[0] - mapped[0];
+        let j10 = dx[1] - mapped[1];
+        let j01 = dy[0] - mapped[0];
+        let j11 = dy[1] - mapped[1];
+        let determinant = j00 * j11 - j01 * j10;
+        if determinant.abs() < 1e-5 {
+            return None;
+        }
+        let update_x = (error[0] * j11 - error[1] * j01) / determinant;
+        let update_y = (j00 * error[1] - j10 * error[0]) / determinant;
+        point[0] =
+            (point[0] - update_x.clamp(-64.0, 64.0)).clamp(0.0, (reference_width - 1) as f32);
+        point[1] =
+            (point[1] - update_y.clamp(-64.0, 64.0)).clamp(0.0, (reference_height - 1) as f32);
+    }
+    let mapped = warp.map(point[0], point[1])?;
+    ((mapped[0] - target[0])
+        .abs()
+        .max((mapped[1] - target[1]).abs())
+        < 0.75)
+        .then_some(point)
 }
 
 /// Run the whole pipeline on an in-memory LRI and write `output` (16-bit PNG)
@@ -356,6 +708,22 @@ pub fn fuse(
             raw.black_level,
             raw.white_level,
         );
+        if options.synth.highlight_recovery
+            != chiaro_hotpixel_core::highlight::HighlightRecovery::None
+            && !mosaic.is_mono()
+        {
+            mosaic.reserve_highlight_headroom();
+        }
+        let highlight = recover_bayer_highlights(
+            &mut mosaic.samples,
+            mosaic.width,
+            mosaic.height,
+            mosaic.pattern,
+            mosaic.black_q6,
+            mosaic.white_q6,
+            options.synth.highlight_recovery,
+        )
+        .with_context(|| format!("RAW highlight recovery {}", raw.name))?;
         let state = states.get(&raw.name).cloned();
         if options.flat_field
             && let Some(vignetting) = calibration
@@ -385,6 +753,7 @@ pub fn fuse(
             mosaic,
             camera,
             focus,
+            highlight,
         });
     }
     timings.hotpixel = stage_started.elapsed().as_secs_f32();
@@ -461,6 +830,23 @@ pub fn fuse(
     } else {
         None
     };
+    if options.synth.highlight_recovery.uses_multi_camera() {
+        progress(Progress {
+            stage: "highlight",
+            detail: "geometry-gated cross-camera recovery".to_owned(),
+            fraction: 0.52,
+        });
+        let reference_dimensions = (
+            modules[reference_index].raw.width,
+            modules[reference_index].raw.height,
+        );
+        recover_cross_camera_highlights(
+            &mut modules,
+            &alignments,
+            reference_dimensions.0,
+            reference_dimensions.1,
+        );
+    }
     if let Some(debug_dir) = &options.debug_dir {
         fs::create_dir_all(debug_dir).with_context(|| format!("create {}", debug_dir.display()))?;
         if let Some(depth_map) = &depth_map {
@@ -469,6 +855,29 @@ pub fn fuse(
                 &debug_dir.join("depth-provenance.png"),
             )?;
             depth_map.write_visualization(&debug_dir.join("depth-visualization.png"))?;
+        }
+        for module in &modules {
+            if module.highlight.confidence.is_empty() {
+                continue;
+            }
+            let uncertainty = module
+                .highlight
+                .confidence
+                .iter()
+                .map(|&confidence| {
+                    if confidence == 255 {
+                        0
+                    } else {
+                        u16::from(255 - confidence) * 257
+                    }
+                })
+                .collect::<Vec<_>>();
+            chiaro_hotpixel_core::png16::write_gray16_native_atomic(
+                &debug_dir.join(format!("{}_highlight-uncertainty.png", module.raw.name)),
+                module.raw.width,
+                module.raw.height,
+                &uncertainty,
+            )?;
         }
         for (module, alignment) in modules.iter().zip(&alignments) {
             if module.raw.name == reference_name {
@@ -676,6 +1085,10 @@ pub fn fuse(
         calibration_modules: calibration.cameras.len(),
         framed_focal_length_mm,
         modules: alignments.iter().map(|a| a.report.clone()).collect(),
+        highlights: modules
+            .iter()
+            .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
+            .collect(),
         gains: alignments
             .iter()
             .map(|a| (a.name.clone(), a.gain, a.offset))
@@ -697,6 +1110,8 @@ pub fn fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chiaro::lri::SensorPattern;
+    use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryReport};
 
     #[test]
     fn framing_crop_is_relative_to_the_reference_camera_group() {
@@ -717,5 +1132,112 @@ mod tests {
         assert!((correspondence_confidence(0.575, minimum) - 0.5).abs() < 1e-6);
         assert_eq!(correspondence_confidence(0.70, minimum), 1.0);
         assert_eq!(correspondence_confidence(0.90, minimum), 1.0);
+    }
+
+    #[test]
+    fn cross_camera_recovery_requires_agreeing_measured_donors() {
+        let (width, height) = (512, 512);
+        let centre = 256 * width + 256;
+        let make_mosaic = |clipped: bool| {
+            let mut samples = (0..height)
+                .flat_map(|y| {
+                    (0..width).map(move |x| match (y & 1, x & 1) {
+                        (0, 0) => 30_000,
+                        (1, 1) => 18_000,
+                        _ => 24_000,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if clipped {
+                for y in 250..=262 {
+                    for x in 250..=262 {
+                        samples[y * width + x] = 65_535;
+                    }
+                }
+            }
+            Mosaic {
+                width,
+                height,
+                pattern: SensorPattern::Rggb,
+                samples,
+                black_q6: 0.0,
+                white_q6: 65_535.0,
+                vignetting: None,
+                crosstalk: None,
+                demosaiced_rgb: None,
+            }
+        };
+        let mosaics = [make_mosaic(true), make_mosaic(false), make_mosaic(false)];
+        let states = [
+            HighlightRecoveryState {
+                confidence: {
+                    let mut confidence = vec![255; width * height];
+                    for y in 250..=262 {
+                        for x in 250..=262 {
+                            confidence[y * width + x] = 0;
+                        }
+                    }
+                    confidence
+                },
+                report: HighlightRecoveryReport {
+                    mode: HighlightRecovery::MultiCamera,
+                    clipped_samples: 13 * 13,
+                    ..Default::default()
+                },
+            },
+            HighlightRecoveryState {
+                confidence: vec![255; width * height],
+                report: HighlightRecoveryReport::default(),
+            },
+            HighlightRecoveryState {
+                confidence: vec![255; width * height],
+                report: HighlightRecoveryReport::default(),
+            },
+        ];
+        let alignments = (0..3)
+            .map(|index| ModuleAlignment {
+                name: format!("B{index}"),
+                warp: crate::align::Warp::from_fn(width, height, 32, Some),
+                gain: 1.0,
+                offset: 0.0,
+                report: AlignmentReport {
+                    accepted: true,
+                    ..Default::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        let sources = (0..3)
+            .map(|index| RawHighlightSource {
+                mosaic: &mosaics[index],
+                highlight: &states[index],
+                alignment: &alignments[index],
+            })
+            .collect::<Vec<_>>();
+
+        let mut isolated_confidence = vec![255; width * height];
+        isolated_confidence[centre] = 0;
+        let isolated_state = HighlightRecoveryState {
+            confidence: isolated_confidence,
+            report: HighlightRecoveryReport::default(),
+        };
+        let isolated_target = RawHighlightSource {
+            mosaic: &mosaics[0],
+            highlight: &isolated_state,
+            alignment: &alignments[0],
+        };
+        let isolated_sources = [isolated_target, sources[1], sources[2]];
+        assert!(
+            cross_camera_highlight_updates(&isolated_sources, 0, width, height)
+                .iter()
+                .all(|update| update.index != centre)
+        );
+
+        let updates = cross_camera_highlight_updates(&sources, 0, width, height);
+        let recovered = updates
+            .iter()
+            .find(|update| update.index == centre)
+            .unwrap();
+        assert!(recovered.value >= 65_000);
+        assert!(recovered.confidence >= 180);
     }
 }

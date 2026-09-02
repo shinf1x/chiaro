@@ -7,6 +7,7 @@ use chiaro_fusion::calibration::IntrinsicsMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::synth::{CanvasMode, OutputColor};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
+use chiaro_hotpixel_core::highlight::HighlightRecovery;
 use chiaro_hotpixel_core::scan::mmap_file;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -38,6 +39,25 @@ impl From<Demosaic> for DemosaicMethod {
             Demosaic::Rcd => Self::Rcd,
             Demosaic::Lmmse => Self::Lmmse,
             Demosaic::Igv => Self::Igv,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RawHighlightRecovery {
+    None,
+    LocalBayer,
+    MultiscaleBayer,
+    MultiCamera,
+}
+
+impl From<RawHighlightRecovery> for HighlightRecovery {
+    fn from(value: RawHighlightRecovery) -> Self {
+        match value {
+            RawHighlightRecovery::None => Self::None,
+            RawHighlightRecovery::LocalBayer => Self::LocalBayer,
+            RawHighlightRecovery::MultiscaleBayer => Self::MultiscaleBayer,
+            RawHighlightRecovery::MultiCamera => Self::MultiCamera,
         }
     }
 }
@@ -92,6 +112,10 @@ struct Cli {
     /// Bayer reconstruction method.
     #[arg(long, value_enum, default_value = "amaze")]
     demosaic: Demosaic,
+
+    /// Reconstruct clipped Bayer samples before crosstalk and demosaicing.
+    #[arg(long, value_enum, default_value = "multi-camera")]
+    highlight_recovery: RawHighlightRecovery,
 
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
@@ -185,6 +209,7 @@ fn main() -> Result<()> {
         };
     options.synth.include_mono = !cli.exclude_mono;
     options.synth.demosaic = cli.demosaic.into();
+    options.synth.highlight_recovery = cli.highlight_recovery.into();
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;

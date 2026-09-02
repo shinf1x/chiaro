@@ -37,13 +37,14 @@ Common options include:
 - `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction; AMaZE
   is the default, RCD is intended for individual night photos, and LMMSE or IGV
   can be used when preparing night-stack output;
+- `--highlight-recovery none|local-bayer|multiscale-bayer|multi-camera`
+  selects pre-demosaic RAW recovery; multi-camera is the default;
 - `--exclude-mono` omits monochrome luminance;
 - `--no-depth` keeps the global homography for depth-refinement comparisons;
 - `--depth-near` and `--depth-far` set the calibrated local search interval
   (0.5 m to 10 km by default);
-- `--no-highlight-correction` disables display-oriented clipped-highlight
-  reconstruction and preserves the unequal raw-channel response for downstream
-  processing;
+- `--no-highlight-correction` disables only the final display-oriented smooth
+  shoulder; use `--highlight-recovery none` to preserve the RAW mosaic too;
 - `--color display|linear` controls output encoding; and
 - `--debug-dir` writes per-module alignment checkerboards, luminance/colour
   source-ownership maps, quantitative inverse-depth, log-colour depth, and
@@ -67,10 +68,10 @@ reproduces the same direction, in which case the zoom module can own the detail.
 Thin branches and wires retain centre-surround protection. Distant or ambiguous
 areas retain the global warp;
 detail that moved differently in every exposure cannot be reconstructed.
-Display-ready output uses a smooth shoulder near sensor white to neutralise the
-false magenta produced when raw colour channels clip at different effective
-levels after white balance. This avoids a hard boundary in the highlight, but
-cannot recover colour or texture once every channel is saturated. Disable it
-when exporting material intended for a dedicated raw processor.
+Before crosstalk and demosaic, RAW highlight recovery combines edge-aware local
+colour-difference reconstruction with a clipping-aware multiscale pyramid.
+Multi-camera mode additionally borrows radiance only when at least two aligned,
+unclipped modules agree. Display-ready output retains the smooth sensor-white
+shoulder as a final neutral safeguard.
 Night-sky captures may retain visible module boundaries. Use Chiaro Hotpixel
 and a stacker for astrophotography.
