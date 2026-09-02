@@ -161,6 +161,21 @@ pub struct ModuleAlignment {
 pub struct AlignmentReport {
     pub camera: String,
     pub initialised_from: &'static str,
+    /// Capture autofocus result for the exposure group containing this module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_achieved: Option<bool>,
+    /// Object-space focus distance interpolated from factory calibration and
+    /// the captured lens Hall position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_focus_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disparity_focus_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast_focus_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_roi: Option<[f64; 2]>,
+    pub lens_timeout: bool,
+    pub mirror_timeout: bool,
     /// Fraction of the reference frame this module covers.
     pub coverage: f32,
     /// Median correction applied to the factory model, reference pixels.

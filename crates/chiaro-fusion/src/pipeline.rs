@@ -24,8 +24,8 @@ use serde::Serialize;
 
 use crate::align::{AlignInput, AlignOptions, AlignmentReport, ModuleAlignment, align_module};
 use crate::calibration::{
-    CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, awb_gains,
-    image_focal_length_mm, module_states,
+    CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, ModuleFocusState,
+    awb_gains, image_focal_length_mm, module_states,
 };
 use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
@@ -235,6 +235,7 @@ struct LoadedModule {
     raw: RawCamera,
     mosaic: Mosaic,
     camera: Option<ResolvedCamera>,
+    focus: ModuleFocusState,
 }
 
 /// Run the whole pipeline on an in-memory LRI and write `output` (16-bit PNG)
@@ -378,10 +379,12 @@ pub fn fuse(
             .ok(),
             _ => None,
         };
+        let focus = state.map_or_else(ModuleFocusState::default, |state| state.focus);
         modules.push(LoadedModule {
             raw: raw.clone(),
             mosaic,
             camera,
+            focus,
         });
     }
     timings.hotpixel = stage_started.elapsed().as_secs_f32();
@@ -431,6 +434,18 @@ pub fn fuse(
             .map(|handle| handle.join().expect("alignment worker panicked"))
             .collect::<Result<Vec<ModuleAlignment>>>()
     })?;
+    for (module, alignment) in modules.iter().zip(&mut alignments) {
+        alignment.report.focus_achieved = module.focus.achieved;
+        alignment.report.calibrated_focus_distance = module
+            .camera
+            .as_ref()
+            .and_then(|camera| camera.focus_distance);
+        alignment.report.disparity_focus_distance = module.focus.disparity_distance;
+        alignment.report.contrast_focus_distance = module.focus.contrast_distance;
+        alignment.report.focus_roi = module.focus.roi;
+        alignment.report.lens_timeout = module.focus.lens_timeout;
+        alignment.report.mirror_timeout = module.focus.mirror_timeout;
+    }
     let depth_map = if options.align.refine && options.align.depth.enabled {
         progress(Progress {
             stage: "align",
@@ -628,12 +643,32 @@ pub fn fuse(
             alignment,
             reference: alignment.name == reference_name,
             magnification: magnification(module),
-            confidence: synthesis_confidence(alignment),
+            confidence: synthesis_confidence(alignment)
+                * if module.focus.mirror_timeout {
+                    0.1
+                } else if module.focus.lens_timeout {
+                    0.25
+                } else {
+                    1.0
+                },
+            focus_distance: module
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.focus_distance),
             color: *color,
             gain_field: gain_field.clone(),
         })
         .collect::<Vec<_>>();
-    let synthesis = synthesize(output, crop, scale, &sources, &color, &options.synth)?;
+    let synthesis = synthesize(
+        output,
+        crop,
+        scale,
+        &sources,
+        depth_map.as_ref(),
+        options.debug_dir.as_deref(),
+        &color,
+        &options.synth,
+    )?;
     timings.synthesize = stage_started.elapsed().as_secs_f32();
 
     let report = FusionReport {

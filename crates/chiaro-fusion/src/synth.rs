@@ -22,10 +22,12 @@ use anyhow::{Result, bail};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::png16::{
     PngColor, samples_to_be_bytes, write_png16_streaming_atomic_with_level,
+    write_rgb16_native_atomic,
 };
 use std::path::Path;
 
 use crate::align::ModuleAlignment;
+use crate::depth::DenseDepthMap;
 use crate::image::Mosaic;
 
 /// Output colour handling.
@@ -339,8 +341,39 @@ pub struct SynthSource<'a> {
     /// Alignment confidence, used to stop an uncertain high-resolution
     /// module from dominating a well-supported lower-resolution one.
     pub confidence: f32,
+    /// Object-space focus distance inferred from the captured lens position.
+    /// Used only as a local prior when the depth map independently places an
+    /// object substantially closer than a magnified source's focus plane.
+    pub focus_distance: Option<f64>,
     pub color: ModuleColor,
     pub gain_field: GainField,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SourceContributionReport {
+    pub camera: String,
+    /// RGB legend colour used by the optional ownership diagnostics.
+    pub diagnostic_rgb: [u8; 3],
+    /// Fraction of covered output pixels where this source supplied the
+    /// largest pre-normalisation luminance weight.
+    pub luminance_owner_fraction: f32,
+    /// Equivalent ownership fraction for colour.
+    pub color_owner_fraction: f32,
+    /// Fraction of sampled pixels where known scene depth strongly disagreed
+    /// with this magnified source's focus plane.
+    pub focus_suppressed_fraction: f32,
+    /// Fraction of colour samples suppressed by reference chromaticity.
+    pub chroma_suppressed_fraction: f32,
+}
+
+#[derive(Default)]
+struct SourceCounters {
+    sampled: std::sync::atomic::AtomicUsize,
+    luminance_owner: std::sync::atomic::AtomicUsize,
+    color_owner: std::sync::atomic::AtomicUsize,
+    focus_suppressed: std::sync::atomic::AtomicUsize,
+    color_sampled: std::sync::atomic::AtomicUsize,
+    chroma_suppressed: std::sync::atomic::AtomicUsize,
 }
 
 /// Per-module statistics of a synthesis run.
@@ -362,6 +395,9 @@ pub struct SynthReport {
     /// Fraction of non-reference samples rejected as strong photometric or
     /// local-detail contradictions. Agreeing modules remain fully blended.
     pub edge_rejected_fraction: f32,
+    pub source_contributions: Vec<SourceContributionReport>,
+    /// Reference/output pixel stride of the ownership diagnostics.
+    pub ownership_diagnostic_step: usize,
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -395,12 +431,15 @@ pub fn synthesize(
     crop: CropWindow,
     scale: f32,
     sources: &[SynthSource<'_>],
+    depth_map: Option<&DenseDepthMap>,
+    diagnostic_dir: Option<&Path>,
     color: &ColorPipeline,
     options: &SynthOptions,
 ) -> Result<SynthReport> {
     let usable = sources
         .iter()
         .filter(|source| options.include_mono || !source.mosaic.is_mono())
+        .enumerate()
         .collect::<Vec<_>>();
     if usable.is_empty() {
         bail!("no modules to synthesise from");
@@ -410,9 +449,26 @@ pub fn synthesize(
     }
     let width = (crop.width * scale).round().max(1.0) as usize;
     let height = (crop.height * scale).round().max(1.0) as usize;
+    const OWNERSHIP_STEP: usize = 8;
+    let ownership_columns = width.div_ceil(OWNERSHIP_STEP);
+    let ownership_rows = height.div_ceil(OWNERSHIP_STEP);
+    let ownership_len = if diagnostic_dir.is_some() {
+        ownership_columns * ownership_rows
+    } else {
+        0
+    };
+    let luminance_ownership = (0..ownership_len)
+        .map(|_| std::sync::atomic::AtomicUsize::new(usize::MAX))
+        .collect::<Vec<_>>();
+    let color_ownership = (0..ownership_len)
+        .map(|_| std::sync::atomic::AtomicUsize::new(usize::MAX))
+        .collect::<Vec<_>>();
     let covered = std::sync::atomic::AtomicUsize::new(0);
     let edge_checked = std::sync::atomic::AtomicUsize::new(0);
     let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
+    let source_counters = (0..usable.len())
+        .map(|_| SourceCounters::default())
+        .collect::<Vec<_>>();
 
     write_png16_streaming_atomic_with_level(
         output,
@@ -430,7 +486,7 @@ pub fn synthesize(
             // cover a small part of the canvas, so most bands skip them.
             let band_sources = usable
                 .iter()
-                .filter(|source| band_touches_module(source, rows.clone(), &crop, scale))
+                .filter(|(_, source)| band_touches_module(source, rows.clone(), &crop, scale))
                 .collect::<Vec<_>>();
             for (row_offset, v) in rows.clone().enumerate() {
                 let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
@@ -438,12 +494,21 @@ pub fn synthesize(
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
                     let reference_luminance = band_sources
                         .iter()
-                        .find(|source| source.reference)
-                        .and_then(|source| source_luminance(source, rx, ry, options));
+                        .find(|(_, source)| source.reference)
+                        .and_then(|(_, source)| source_luminance(source, rx, ry, options));
                     let reference_structure = band_sources
                         .iter()
-                        .find(|source| source.reference)
-                        .and_then(|source| source_log_luminance_structure(source, rx, ry, options));
+                        .find(|(_, source)| source.reference)
+                        .and_then(|(_, source)| {
+                            source_log_luminance_structure(source, rx, ry, options)
+                        });
+                    let reference_color = band_sources
+                        .iter()
+                        .find(|(_, source)| source.reference)
+                        .and_then(|(_, source)| source_xyz(source, rx, ry, options));
+                    let scene_depth = depth_map
+                        .and_then(|map| map.sample_nearest(rx, ry))
+                        .and_then(|node| node.depth.map(|depth| (depth, node.confidence)));
                     // Chroma comes from colour modules (XYZ), luminance from
                     // every module including panchromatic ones.
                     let mut xyz = [0.0f32; 3];
@@ -454,7 +519,11 @@ pub fn synthesize(
                     let mut reference_color_weight = 0.0f32;
                     let mut reference_luminance_sum = 0.0f32;
                     let mut reference_luminance_weight = 0.0f32;
-                    for source in &band_sources {
+                    let mut sharpest_agreeing_detail = 1.0f32;
+                    let mut luminance_owner = None::<(usize, f32)>;
+                    let mut color_owner = None::<(usize, f32)>;
+                    let mut reference_source_index = None;
+                    for (source_index, source) in &band_sources {
                         let Some(q) = source.alignment.warp.map(rx, ry) else {
                             continue;
                         };
@@ -472,11 +541,29 @@ pub fn synthesize(
                         if feather <= 0.0 || local_confidence <= 0.0 {
                             continue;
                         }
-                        let weight = feather
+                        let source_index = *source_index;
+                        if source.reference {
+                            reference_source_index = Some(source_index);
+                        }
+                        source_counters[source_index]
+                            .sampled
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let base_weight = feather
                             * local_confidence
                             * source.magnification
                             * source.magnification
                             * source.confidence;
+                        let focus_weight = focus_consistency_weight(
+                            scene_depth,
+                            source.focus_distance,
+                            source.magnification,
+                            source.reference,
+                        );
+                        if focus_weight < 0.5 {
+                            source_counters[source_index]
+                                .focus_suppressed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let gain = source.alignment.gain;
                         let offset = source.alignment.offset;
                         let field = source
@@ -484,19 +571,20 @@ pub fn synthesize(
                             .at(q[0], q[1], mosaic.width, mosaic.height);
                         if mosaic.is_mono() || !source.color.calibrated {
                             let y = (gain * (rgb[1] - offset)).max(0.0) * field[1];
+                            let sample_structure = (!source.reference)
+                                .then(|| source_log_luminance_structure(source, rx, ry, options))
+                                .flatten();
                             let mut edge_weight =
                                 edge_consistency_weight(reference_luminance, y, source.reference)
                                     * detail_consistency_weight(
                                         reference_structure,
-                                        (!source.reference)
-                                            .then(|| {
-                                                source_log_luminance_structure(
-                                                    source, rx, ry, options,
-                                                )
-                                            })
-                                            .flatten(),
+                                        sample_structure,
                                         source.reference,
                                     );
+                            sharpest_agreeing_detail = sharpest_agreeing_detail.max(
+                                agreeing_detail_gain(reference_structure, sample_structure)
+                                    * focus_weight,
+                            );
                             let rejected = edge_weight < 0.1;
                             if rejected {
                                 edge_weight = 0.0;
@@ -505,9 +593,13 @@ pub fn synthesize(
                                 band_edge_checked += 1;
                                 band_edge_rejected += usize::from(rejected);
                             }
-                            let weight = weight * edge_weight;
+                            edge_weight *= focus_weight;
+                            let weight = base_weight * edge_weight;
                             luminance += weight * y;
                             luminance_weight += weight;
+                            if luminance_owner.is_none_or(|(_, best)| weight > best) {
+                                luminance_owner = Some((source_index, weight));
+                            }
                             if source.reference {
                                 reference_luminance_sum += weight * y;
                                 reference_luminance_weight += weight;
@@ -524,18 +616,21 @@ pub fn synthesize(
                             for c in 0..3 {
                                 matched[c] *= field[c];
                             }
+                            let sample_structure = (!source.reference)
+                                .then(|| source_log_luminance_structure(source, rx, ry, options))
+                                .flatten();
                             let mut edge_weight = edge_consistency_weight(
                                 reference_luminance,
                                 matched[1],
                                 source.reference,
                             ) * detail_consistency_weight(
                                 reference_structure,
-                                (!source.reference)
-                                    .then(|| {
-                                        source_log_luminance_structure(source, rx, ry, options)
-                                    })
-                                    .flatten(),
+                                sample_structure,
                                 source.reference,
+                            );
+                            sharpest_agreeing_detail = sharpest_agreeing_detail.max(
+                                agreeing_detail_gain(reference_structure, sample_structure)
+                                    * focus_weight,
                             );
                             let rejected = edge_weight < 0.1;
                             if rejected {
@@ -545,20 +640,43 @@ pub fn synthesize(
                                 band_edge_checked += 1;
                                 band_edge_rejected += usize::from(rejected);
                             }
-                            let weight = weight * edge_weight;
-                            for c in 0..3 {
-                                xyz[c] += weight * matched[c];
+                            edge_weight *= focus_weight;
+                            let luminance_source_weight = base_weight * edge_weight;
+                            let chroma_weight = chroma_consistency_weight(
+                                reference_color,
+                                Some(matched),
+                                source.reference,
+                            );
+                            source_counters[source_index]
+                                .color_sampled
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if chroma_weight < 0.5 {
+                                source_counters[source_index]
+                                    .chroma_suppressed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            color_weight += weight;
-                            luminance += weight * matched[1];
-                            luminance_weight += weight;
+                            let color_source_weight = base_weight * edge_weight * chroma_weight;
+                            for c in 0..3 {
+                                xyz[c] += color_source_weight * matched[c];
+                            }
+                            color_weight += color_source_weight;
+                            luminance += luminance_source_weight * matched[1];
+                            luminance_weight += luminance_source_weight;
+                            if luminance_owner
+                                .is_none_or(|(_, best)| luminance_source_weight > best)
+                            {
+                                luminance_owner = Some((source_index, luminance_source_weight));
+                            }
+                            if color_owner.is_none_or(|(_, best)| color_source_weight > best) {
+                                color_owner = Some((source_index, color_source_weight));
+                            }
                             if source.reference {
                                 for c in 0..3 {
-                                    reference_xyz[c] += weight * matched[c];
+                                    reference_xyz[c] += color_source_weight * matched[c];
                                 }
-                                reference_color_weight += weight;
-                                reference_luminance_sum += weight * matched[1];
-                                reference_luminance_weight += weight;
+                                reference_color_weight += color_source_weight;
+                                reference_luminance_sum += luminance_source_weight * matched[1];
+                                reference_luminance_weight += luminance_source_weight;
                             }
                         }
                     }
@@ -566,6 +684,7 @@ pub fn synthesize(
                         reference_structure,
                         reference_luminance_weight,
                         luminance_weight,
+                        sharpest_agreeing_detail,
                     );
                     if other_scale < 1.0 {
                         luminance = reference_luminance_sum
@@ -581,10 +700,51 @@ pub fn synthesize(
                                 + (color_weight - reference_color_weight) * other_scale;
                         }
                     }
+                    if let Some(reference_index) = reference_source_index {
+                        if let Some((owner, weight)) = luminance_owner
+                            && owner != reference_index
+                            && reference_luminance_weight > weight * other_scale
+                        {
+                            luminance_owner = Some((reference_index, reference_luminance_weight));
+                        }
+                        if let Some((owner, weight)) = color_owner
+                            && owner != reference_index
+                            && reference_color_weight > weight * other_scale
+                        {
+                            color_owner = Some((reference_index, reference_color_weight));
+                        }
+                    }
                     let pixel =
                         &mut band[(row_offset * width + u) * 3..(row_offset * width + u) * 3 + 3];
                     if luminance_weight > 0.0 {
                         band_covered += 1;
+                        if let Some((owner, _)) = luminance_owner {
+                            source_counters[owner]
+                                .luminance_owner
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Some((owner, _)) = color_owner {
+                            source_counters[owner]
+                                .color_owner
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !luminance_ownership.is_empty()
+                            && u % OWNERSHIP_STEP == OWNERSHIP_STEP / 2
+                            && v % OWNERSHIP_STEP == OWNERSHIP_STEP / 2
+                        {
+                            let diagnostic_index =
+                                (v / OWNERSHIP_STEP) * ownership_columns + u / OWNERSHIP_STEP;
+                            if diagnostic_index < luminance_ownership.len() {
+                                luminance_ownership[diagnostic_index].store(
+                                    luminance_owner.map_or(usize::MAX, |(owner, _)| owner),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                color_ownership[diagnostic_index].store(
+                                    color_owner.map_or(usize::MAX, |(owner, _)| owner),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
                         let target_luminance = luminance / luminance_weight;
                         let blended = if color_weight > 0.0 {
                             let mean = xyz.map(|v| v / color_weight);
@@ -610,26 +770,154 @@ pub fn synthesize(
         },
     )?;
 
+    if let Some(directory) = diagnostic_dir {
+        write_ownership_diagnostic(
+            &directory.join("source-luminance-ownership.png"),
+            ownership_columns,
+            ownership_rows,
+            &luminance_ownership,
+        )?;
+        write_ownership_diagnostic(
+            &directory.join("source-color-ownership.png"),
+            ownership_columns,
+            ownership_rows,
+            &color_ownership,
+        )?;
+    }
+
     let mut modules = usable
         .iter()
-        .map(|s| (s.alignment.name.clone(), s.magnification))
+        .map(|(_, source)| (source.alignment.name.clone(), source.magnification))
         .collect::<Vec<_>>();
     modules.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let covered_pixels = covered.load(std::sync::atomic::Ordering::Relaxed);
+    let source_contributions = usable
+        .iter()
+        .zip(&source_counters)
+        .enumerate()
+        .map(|(source_index, ((_, source), counters))| {
+            let sampled = counters.sampled.load(std::sync::atomic::Ordering::Relaxed);
+            let color_sampled = counters
+                .color_sampled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            SourceContributionReport {
+                camera: source.alignment.name.clone(),
+                diagnostic_rgb: ownership_color(source_index),
+                luminance_owner_fraction: fraction(
+                    counters
+                        .luminance_owner
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    covered_pixels,
+                ),
+                color_owner_fraction: fraction(
+                    counters
+                        .color_owner
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    covered_pixels,
+                ),
+                focus_suppressed_fraction: fraction(
+                    counters
+                        .focus_suppressed
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    sampled,
+                ),
+                chroma_suppressed_fraction: fraction(
+                    counters
+                        .chroma_suppressed
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    color_sampled,
+                ),
+            }
+        })
+        .collect();
     Ok(SynthReport {
         canvas_width: width,
         canvas_height: height,
         scale,
         crop: [crop.x, crop.y, crop.width, crop.height],
         modules: modules.into_iter().map(|(name, _)| name).collect(),
-        covered: covered.load(std::sync::atomic::Ordering::Relaxed) as f32
-            / (width * height) as f32,
+        covered: covered_pixels as f32 / (width * height) as f32,
         highlight_correction: options.highlight_correction,
         demosaic: options.demosaic,
         edge_rejected_fraction: fraction(
             edge_rejected.load(std::sync::atomic::Ordering::Relaxed),
             edge_checked.load(std::sync::atomic::Ordering::Relaxed),
         ),
+        source_contributions,
+        ownership_diagnostic_step: OWNERSHIP_STEP,
     })
+}
+
+fn ownership_color(index: usize) -> [u8; 3] {
+    const PALETTE: [[u8; 3]; 16] = [
+        [230, 25, 75],
+        [60, 180, 75],
+        [0, 130, 200],
+        [245, 130, 48],
+        [145, 30, 180],
+        [70, 240, 240],
+        [240, 50, 230],
+        [210, 245, 60],
+        [250, 190, 190],
+        [0, 128, 128],
+        [230, 190, 255],
+        [170, 110, 40],
+        [255, 250, 200],
+        [128, 0, 0],
+        [170, 255, 195],
+        [128, 128, 0],
+    ];
+    PALETTE[index % PALETTE.len()]
+}
+
+fn write_ownership_diagnostic(
+    path: &Path,
+    width: usize,
+    height: usize,
+    ownership: &[std::sync::atomic::AtomicUsize],
+) -> Result<()> {
+    let mut labels = ownership
+        .iter()
+        .map(|owner| owner.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    // Ownership is decided per sampled pixel and is intentionally sensitive
+    // to fine texture. Two small majority passes make the diagnostic readable
+    // as regions without changing any synthesis weights.
+    for _ in 0..2 {
+        let source = labels.clone();
+        for row in 0..height {
+            for column in 0..width {
+                let mut counts = [0u8; 16];
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (x, y) = (column as i32 + dx, row as i32 + dy);
+                        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                            continue;
+                        }
+                        let label = source[y as usize * width + x as usize];
+                        if label < counts.len() {
+                            counts[label] += 1;
+                        }
+                    }
+                }
+                if let Some((label, &count)) = counts.iter().enumerate().max_by_key(|(_, n)| *n)
+                    && count >= 3
+                {
+                    labels[row * width + column] = label;
+                }
+            }
+        }
+    }
+    let mut pixels = Vec::with_capacity(width * height * 3);
+    for index in labels {
+        let color = if index == usize::MAX {
+            [0; 3]
+        } else {
+            ownership_color(index).map(|channel| u16::from(channel) * 257)
+        };
+        pixels.extend(color);
+    }
+    write_rgb16_native_atomic(path, width, height, &pixels)
 }
 
 fn fraction(count: usize, total: usize) -> f32 {
@@ -665,6 +953,92 @@ fn source_luminance(
                 * field[1],
         )
     }
+}
+
+fn source_xyz(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<[f32; 3]> {
+    if source.mosaic.is_mono() || !source.color.calibrated {
+        return None;
+    }
+    let q = source.alignment.warp.map(rx, ry)?;
+    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
+    let gain = source.alignment.gain;
+    let offset = source.alignment.offset;
+    let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
+    let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
+    let mut xyz =
+        source
+            .color
+            .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
+    let field = source
+        .gain_field
+        .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
+    for channel in 0..3 {
+        xyz[channel] *= field[channel];
+    }
+    Some(xyz)
+}
+
+/// Conservative close-side defocus prior. Dense-depth labels describe
+/// residual inverse-depth parallax on top of the global warp, which already
+/// absorbs an unknown dominant scene plane. Treating a label as an absolute
+/// subject distance would therefore be wrong. If autofocus selected that
+/// dominant plane, `focus / residual_depth` is the additional relative
+/// dioptric displacement towards the camera; magnified sources are more
+/// sensitive to it. Image-measured sharpness remains authoritative.
+fn focus_consistency_weight(
+    residual: Option<(f64, f32)>,
+    focus_distance: Option<f64>,
+    magnification: f32,
+    reference: bool,
+) -> f32 {
+    if reference || magnification <= 1.05 {
+        return 1.0;
+    }
+    let (Some((residual_depth, confidence)), Some(focus)) = (residual, focus_distance) else {
+        return 1.0;
+    };
+    if !residual_depth.is_finite() || !focus.is_finite() || residual_depth <= 0.0 || focus <= 0.0 {
+        return 1.0;
+    }
+    let mismatch = (focus / residual_depth) as f32 * (magnification - 1.0);
+    let relative = mismatch / 0.75;
+    let supported = 1.0 / (1.0 + relative.powi(4));
+    1.0 - confidence.clamp(0.0, 1.0) * (1.0 - supported)
+}
+
+/// Compare colour independently of luminance. A defocused chromatic halo may
+/// preserve total luminance and therefore pass the structural checks; D50 XYZ
+/// chromaticity exposes that disagreement without rejecting exposure changes.
+fn chroma_consistency_weight(
+    reference: Option<[f32; 3]>,
+    sample: Option<[f32; 3]>,
+    is_reference: bool,
+) -> f32 {
+    if is_reference {
+        return 1.0;
+    }
+    let (Some(reference), Some(sample)) = (reference, sample) else {
+        return 1.0;
+    };
+    let chromaticity = |xyz: [f32; 3]| {
+        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
+        [xyz[0] / sum, xyz[2] / sum]
+    };
+    let reference_chroma = chromaticity(reference);
+    let sample_chroma = chromaticity(sample);
+    let difference =
+        (reference_chroma[0] - sample_chroma[0]).hypot(reference_chroma[1] - sample_chroma[1]);
+    let relative = difference / 0.055;
+    let robust = 1.0 / (1.0 + relative.powi(4));
+    // Chroma is unstable in deep shadows. Fade the decision in using the
+    // darker of the two samples instead of manufacturing coloured speckle.
+    let reliability = smoothstep(reference[1].min(sample[1]) / 0.02);
+    1.0 - reliability * (1.0 - robust)
 }
 
 /// Reference-space log-luminance structure sampled through one module's warp.
@@ -746,15 +1120,50 @@ fn detail_consistency_weight(
     1.0 / (1.0 + relative.powi(4))
 }
 
+/// Relative strength of a sharper source that reproduces the reference edge
+/// direction or ridge sign. Such a source may own high-frequency detail rather
+/// than being capped merely because it is not the reference camera.
+fn agreeing_detail_gain(reference: Option<[f32; 3]>, sample: Option<[f32; 3]>) -> f32 {
+    let (Some(reference), Some(sample)) = (reference, sample) else {
+        return 1.0;
+    };
+    let reference_gradient = reference[0].hypot(reference[1]);
+    let reference_ridge = reference[2].abs();
+    let reference_strength = reference_gradient.max(reference_ridge);
+    if reference_strength < 0.01 {
+        return 1.0;
+    }
+    if reference_gradient >= reference_ridge {
+        let sample_gradient = sample[0].hypot(sample[1]);
+        if sample_gradient <= reference_gradient {
+            return 1.0;
+        }
+        let cosine = (sample[0] * reference[0] + sample[1] * reference[1])
+            / (sample_gradient * reference_gradient).max(1.0e-6);
+        if cosine < 0.94 {
+            return 1.0;
+        }
+        (sample_gradient / reference_gradient).clamp(1.0, 4.0)
+    } else {
+        let agreeing = sample[2] * reference[2].signum();
+        if agreeing <= reference_ridge {
+            1.0
+        } else {
+            (agreeing / reference_ridge).clamp(1.0, 4.0)
+        }
+    }
+}
+
 /// Cap the *combined* weight of other lenses around strong reference detail.
 /// Per-source robust weights are insufficient when many small residual weights
 /// collectively outvote a one-pixel twig. Flat regions retain their full
-/// denoising average; a strong edge or ridge keeps at least two thirds of its
-/// weight from the reference module.
+/// denoising average. A strong edge stays reference-owned unless a finer source
+/// reproduces its direction with measurably greater contrast.
 fn reference_detail_protection_scale(
     reference: Option<[f32; 3]>,
     reference_weight: f32,
     total_weight: f32,
+    sharpest_agreeing_gain: f32,
 ) -> f32 {
     let Some(reference) = reference else {
         return 1.0;
@@ -767,7 +1176,9 @@ fn reference_detail_protection_scale(
         return 1.0;
     }
     let protection = smoothstep((strength - 0.01) / 0.08);
-    let maximum_other_ratio = 4.0 * (1.0 - protection) + 0.5 * protection;
+    let ownership = smoothstep((sharpest_agreeing_gain - 1.0) / 0.75);
+    let protected_ratio = 0.5 + 2.5 * ownership;
+    let maximum_other_ratio = 4.0 * (1.0 - protection) + protected_ratio * protection;
     let other_weight = total_weight - reference_weight;
     (maximum_other_ratio * reference_weight / other_weight).min(1.0)
 }
@@ -1100,11 +1511,52 @@ mod tests {
     #[test]
     fn combined_non_reference_weight_cannot_erase_strong_thin_detail() {
         assert_eq!(
-            reference_detail_protection_scale(Some([0.0, 0.0, 0.0]), 1.0, 10.0),
+            reference_detail_protection_scale(Some([0.0, 0.0, 0.0]), 1.0, 10.0, 1.0),
             1.0
         );
-        let scale = reference_detail_protection_scale(Some([0.0, 0.0, 0.2]), 1.0, 10.0);
+        let scale = reference_detail_protection_scale(Some([0.0, 0.0, 0.2]), 1.0, 10.0, 1.0);
         assert!((scale - 0.5 / 9.0).abs() < 1.0e-6);
+
+        let sharper = reference_detail_protection_scale(Some([0.0, 0.0, 0.2]), 1.0, 10.0, 2.0);
+        assert!(sharper > scale * 5.0);
+    }
+
+    #[test]
+    fn focus_prior_rejects_close_content_only_for_magnified_sources() {
+        let close = Some((500.0, 1.0));
+        assert!(focus_consistency_weight(close, Some(2_500.0), 2.25, false) < 0.01);
+        assert_eq!(
+            focus_consistency_weight(close, Some(2_500.0), 1.0, false),
+            1.0
+        );
+        assert!(focus_consistency_weight(Some((10_000.0, 1.0)), Some(2_500.0), 2.25, false) > 0.97);
+        assert_eq!(
+            focus_consistency_weight(None, Some(2_500.0), 2.25, false),
+            1.0
+        );
+    }
+
+    #[test]
+    fn chroma_is_checked_independently_of_luminance() {
+        let neutral = Some([0.2, 0.2, 0.2]);
+        assert!(chroma_consistency_weight(neutral, Some([0.4, 0.4, 0.4]), false) > 0.99);
+        assert!(chroma_consistency_weight(neutral, Some([0.38, 0.2, 0.02]), false) < 0.1);
+        assert_eq!(
+            chroma_consistency_weight(neutral, Some([0.38, 0.2, 0.02]), true),
+            1.0
+        );
+    }
+
+    #[test]
+    fn sharper_agreeing_detail_can_own_an_edge() {
+        assert_eq!(
+            agreeing_detail_gain(Some([0.1, 0.0, 0.0]), Some([0.25, 0.0, 0.0])),
+            2.5
+        );
+        assert_eq!(
+            agreeing_detail_gain(Some([0.1, 0.0, 0.0]), Some([0.0, 0.25, 0.0])),
+            1.0
+        );
     }
 
     #[test]

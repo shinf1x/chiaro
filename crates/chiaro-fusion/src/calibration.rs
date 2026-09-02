@@ -32,6 +32,7 @@ use chiaro_proto::{
     point3f::Point3F,
     view_preferences::ViewPreferences,
 };
+use serde::Serialize;
 
 use crate::math::{Mat3, Vec2, Vec3};
 
@@ -474,6 +475,49 @@ impl CameraCalibration {
         }
         Ok(k)
     }
+
+    /// Calibrated object-space focus distance for a capture-time lens Hall
+    /// code. This follows the same interpolation/extrapolation policy as the
+    /// focus-dependent intrinsic matrix.
+    pub fn focus_distance_for_hall(&self, lens_hall: f64, mode: IntrinsicsMode) -> Option<f64> {
+        let mut points = self
+            .intrinsics
+            .iter()
+            .filter_map(|bundle| {
+                (bundle.focus_distance.is_finite() && bundle.focus_distance > 0.0)
+                    .then_some((bundle.hall_code?, bundle.focus_distance))
+            })
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            return None;
+        }
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if points.len() == 1 {
+            return Some(points[0].1);
+        }
+        let (left, right) = if lens_hall <= points[0].0 {
+            if mode == IntrinsicsMode::Clamp {
+                return Some(points[0].1);
+            }
+            (points[0], points[1])
+        } else if lens_hall >= points[points.len() - 1].0 {
+            if mode == IntrinsicsMode::Clamp {
+                return Some(points[points.len() - 1].1);
+            }
+            (points[points.len() - 2], points[points.len() - 1])
+        } else {
+            points
+                .windows(2)
+                .find(|window| window[0].0 <= lens_hall && lens_hall <= window[1].0)
+                .map(|window| (window[0], window[1]))?
+        };
+        let span = right.0 - left.0;
+        if span == 0.0 {
+            return None;
+        }
+        let t = (lens_hall - left.0) / span;
+        Some(((1.0 - t) * left.1 + t * right.1).max(1.0))
+    }
 }
 
 /// All calibrated modules of one device.
@@ -747,6 +791,21 @@ pub fn camera_name(id: i32) -> String {
         .unwrap_or_else(|| format!("camera{id}"))
 }
 
+/// Autofocus observations recorded for one captured module.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ModuleFocusState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub achieved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disparity_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roi: Option<Vec2>,
+    pub lens_timeout: bool,
+    pub mirror_timeout: bool,
+}
+
 /// Capture-time state of one module that the geometry depends on.
 #[derive(Clone, Debug)]
 pub struct ModuleState {
@@ -758,6 +817,7 @@ pub struct ModuleState {
     /// Analogue x digital gain, for photometric normalisation.
     pub gain: f64,
     pub exposure_ns: u64,
+    pub focus: ModuleFocusState,
 }
 
 /// Read per-module capture state from the capture's headers (first frame of
@@ -777,6 +837,7 @@ pub fn module_states(messages: &LriMessages) -> Vec<ModuleState> {
                 continue;
             };
             let name = camera_name(id.value());
+            let autofocus = module.af_info.as_ref();
             states.entry(name.clone()).or_insert(ModuleState {
                 name,
                 lens_hall: f64::from(module.lens_position.unwrap_or(0)),
@@ -786,6 +847,24 @@ pub fn module_states(messages: &LriMessages) -> Vec<ModuleState> {
                 gain: f64::from(module.sensor_analog_gain.unwrap_or(1.0))
                     * f64::from(module.sensor_digital_gain.unwrap_or(1.0)),
                 exposure_ns: module.sensor_exposure.unwrap_or(0),
+                focus: ModuleFocusState {
+                    achieved: header.af_info.as_ref().and_then(|info| info.focus_achieved),
+                    disparity_distance: autofocus
+                        .and_then(|info| info.disparity_focus_distance)
+                        .map(f64::from),
+                    contrast_distance: autofocus
+                        .and_then(|info| info.contrast_focus_distance)
+                        .map(f64::from),
+                    roi: autofocus
+                        .and_then(|info| info.roi_center.as_ref())
+                        .map(point2),
+                    lens_timeout: autofocus
+                        .and_then(|info| info.lens_timeout)
+                        .unwrap_or(false),
+                    mirror_timeout: autofocus
+                        .and_then(|info| info.mirror_timeout)
+                        .unwrap_or(false),
+                },
             });
         }
     }
@@ -856,6 +935,18 @@ mod tests {
         assert_eq!(
             camera.k_for_hall(50.0, IntrinsicsMode::LinearHall).unwrap()[0][0],
             1_050.0
+        );
+        assert_eq!(
+            camera.focus_distance_for_hall(150.0, IntrinsicsMode::Clamp),
+            Some(1_500.0)
+        );
+        assert_eq!(
+            camera.focus_distance_for_hall(50.0, IntrinsicsMode::Clamp),
+            Some(1_000.0)
+        );
+        assert_eq!(
+            camera.focus_distance_for_hall(50.0, IntrinsicsMode::LinearHall),
+            Some(500.0)
         );
     }
 

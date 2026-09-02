@@ -41,6 +41,9 @@ pub struct ResolvedCamera {
     orientation_correction: Mat3,
     /// Calibrated focal length in pixels, for resolution weighting.
     pub focal_px: f64,
+    /// Object-space focus distance interpolated from the capture-time lens
+    /// Hall code, in the calibration's distance units (millimetres on L16).
+    pub focus_distance: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +123,7 @@ impl ResolvedCamera {
             pose,
             orientation_correction,
             focal_px: k[0][0],
+            focus_distance: calibration.focus_distance_for_hall(state.lens_hall, mode),
         })
     }
 

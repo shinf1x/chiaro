@@ -408,6 +408,10 @@ pub fn fuse_night(
                 magnification: *magnification,
                 confidence: alignment_confidence(alignment, &reference_name, &options.module_align)
                     * noise_confidence(reference_noise, module.dark_noise_variance),
+                focus_distance: module
+                    .camera
+                    .as_ref()
+                    .and_then(|camera| camera.focus_distance),
                 color: *color,
                 gain_field: gain_field.clone(),
             },
@@ -427,6 +431,8 @@ pub fn fuse_night(
         crop,
         scale,
         &sources,
+        depth_map.as_ref(),
+        None,
         &color_pipeline,
         &options.synth,
     )?;

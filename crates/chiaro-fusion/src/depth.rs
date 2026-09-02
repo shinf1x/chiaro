@@ -145,6 +145,19 @@ impl DenseDepthMap {
         (column < self.columns && row < self.rows).then(|| self.nodes[row * self.columns + column])
     }
 
+    /// Nearest directly represented node for a reference-raster position.
+    /// This deliberately does not interpolate across missing nodes: callers
+    /// may use finite depth as a prior, but must not manufacture support in a
+    /// textureless or contradictory region.
+    pub fn sample_nearest(&self, x: f32, y: f32) -> Option<DenseDepthNode> {
+        if x < 0.0 || y < 0.0 || self.step == 0 {
+            return None;
+        }
+        let column = (x / self.step as f32).round() as usize;
+        let row = (y / self.step as f32).round() as usize;
+        self.node(column, row)
+    }
+
     /// Write a quantitative inverse-depth image and a categorical provenance
     /// image. Inverse depth uses 0 for global/unsupported, 1 for the far bound,
     /// and 65535 for the near bound. Provenance is black=unsupported,

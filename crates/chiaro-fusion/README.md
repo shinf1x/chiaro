@@ -22,14 +22,17 @@ command-line application.
    default; Simple, RCD, LMMSE, and IGV are also available. Warp
    discontinuities are not interpolated across visible scene edges, and a
    reference-guided robust weight rejects contradictory edge samples without
-   discarding agreeing high-resolution samples. Fine structure remains
-   reference-anchored unless another module reproduces its direction at least
-   as sharply, so mildly defocused or sub-pixel-misaligned lenses cannot soften
-   a well-resolved reference edge. Centre-surround contrast and an aggregate
-   reference-weight floor preserve thin branches and wires even when their
-   centres have little directional gradient. For display-ready output, a smooth
-   sensor-white shoulder neutralises false colour from unequally clipped raw
-   channels without introducing a hard highlight boundary.
+   discarding agreeing high-resolution samples. Luminance and chroma are
+   weighted independently, preventing a defocused colour fringe with plausible
+   total brightness from entering the result. Fine structure remains
+   reference-anchored unless another module reproduces its direction more
+   sharply; that agreeing zoom module may then own the high-frequency detail.
+   Strong near-side residual parallax relative to a magnified module's
+   calibrated focus plane suppresses that module locally. Centre-surround
+   contrast preserves thin branches and wires even when their centres have
+   little directional gradient. For display-ready output, a smooth sensor-white
+   shoulder neutralises false colour from unequally clipped raw channels without
+   introducing a hard highlight boundary.
 
 Every run also writes a `.fusion.json` report with alignment, coverage,
 photometric, and timing diagnostics.
@@ -42,10 +45,14 @@ gaps, including mirror-aiming data. Supply both whenever possible; alignment is
 likely to be poor without them. An overlay is merged only when its physical
 device id matches the capture.
 
-Focus-dependent intrinsics are interpolated in lens Hall space and continued
-linearly just beyond the factory samples, matching the validated reconstruction
-model. The CLI's diagnostic `--intrinsics clamp` mode freezes out-of-range
-captures at the nearest sample instead.
+Focus-dependent intrinsics and object-space focus distance are interpolated in
+lens Hall space and continued linearly just beyond the factory samples,
+matching the validated reconstruction model. Capture autofocus success,
+disparity/contrast estimates, ROI, and actuator timeouts are retained in the
+report. Image evidence remains authoritative: autofocus success describes the
+selected focus plane, not whether every scene depth is sharp. The CLI's
+diagnostic `--intrinsics clamp` mode freezes out-of-range captures at the
+nearest sample instead.
 
 `hotpixel.rec` is optional at the fusion API level, but when enabled it must
 belong to the same physical camera.
@@ -93,9 +100,12 @@ alignment and synthesis can also be inspected independently.
 
 Set `FusionOptions::debug_dir` to write per-module alignment checkerboards.
 Continuous scene edges across checkerboard boundaries are a quick visual check
-of the resulting warp. The same directory receives `depth-inverse.png`,
-`depth-visualization.png`, and `depth-provenance.png`. The first is quantitative
-16-bit inverse depth; the second is a log-scaled far-blue to near-red rendering.
+of the resulting warp. The same directory receives `source-luminance-ownership.png`
+and `source-color-ownership.png`; their camera-to-colour legend and exact owner
+fractions are recorded under `synthesis.source_contributions` in the JSON
+report. It also receives `depth-inverse.png`, `depth-visualization.png`, and
+`depth-provenance.png`. The first is quantitative 16-bit inverse depth; the
+second is a log-scaled far-blue to near-red rendering.
 The provenance image marks directly remeasured nodes green, a regularized
 finite node amber if one is explicitly supplied, global/infinite fallback blue,
 and unsupported nodes black. With default settings, finite final nodes are

@@ -6,7 +6,9 @@
 
 use std::{collections::HashMap, fs};
 
-use chiaro_fusion::calibration::{CalibrationDatabase, IntrinsicsMode, LriMessages, ModuleState};
+use chiaro_fusion::calibration::{
+    CalibrationDatabase, IntrinsicsMode, LriMessages, ModuleFocusState, ModuleState,
+};
 use chiaro_fusion::geometry::{CameraRefinement, ResolvedCamera};
 use serde_json::Value;
 
@@ -50,6 +52,7 @@ fn load() -> (CalibrationDatabase, Vec<ModuleState>, Value) {
             height: m["height"].as_u64().unwrap() as usize,
             gain: 1.0,
             exposure_ns: 0,
+            focus: ModuleFocusState::default(),
         })
         .collect();
     (db, states, fixture)

@@ -45,8 +45,9 @@ Common options include:
   reconstruction and preserves the unequal raw-channel response for downstream
   processing;
 - `--color display|linear` controls output encoding; and
-- `--debug-dir` writes per-module alignment checkerboards plus quantitative
-  inverse-depth, log-colour depth, and colour-coded provenance control grids.
+- `--debug-dir` writes per-module alignment checkerboards, luminance/colour
+  source-ownership maps, quantitative inverse-depth, log-colour depth, and
+  colour-coded provenance control grids.
 
 Run `chiaro-fuse --help` for all options.
 
@@ -57,12 +58,14 @@ small or adaptive edge-aware support. Missing regions are not completed.
 Continuous per-camera depth and bounded residual refinement follow. Warp
 discontinuities are suppressed at visible scene edges, and robust
 reference-guided synthesis rejects contradictory edge samples while retaining
-agreeing module detail. It also keeps fine structure reference-anchored unless
-another module reproduces the same edge direction at least as sharply, avoiding
-soft averages of mildly defocused or sub-pixel-misaligned lenses. Thin branches
-and wires also receive aggregate reference protection so many small residual
-weights cannot collectively erase them. Distant or ambiguous areas retain the
-global warp;
+agreeing module detail. Luminance and colour consistency are evaluated
+separately so defocused chromatic fringes cannot survive merely by matching
+brightness. Focus distance interpolated from the captured lens position and
+supported near-side residual parallax suppress a magnified source focused
+behind nearby content. Fine structure stays reference-anchored unless a sharper source
+reproduces the same direction, in which case the zoom module can own the detail.
+Thin branches and wires retain centre-surround protection. Distant or ambiguous
+areas retain the global warp;
 detail that moved differently in every exposure cannot be reconstructed.
 Display-ready output uses a smooth shoulder near sensor white to neutralise the
 false magenta produced when raw colour channels clip at different effective
