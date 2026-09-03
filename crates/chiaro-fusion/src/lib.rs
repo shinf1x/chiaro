@@ -28,4 +28,5 @@ pub mod geometry;
 pub mod image;
 pub mod math;
 pub mod pipeline;
+pub mod resolution;
 pub mod synth;

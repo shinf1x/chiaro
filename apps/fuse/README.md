@@ -30,8 +30,14 @@ capture.
 
 Common options include:
 
-- `--canvas native|max|<scale>` controls output resolution;
-- `--max-megapixels` caps maximum-mode output;
+- `--canvas native|max|<scale>` controls output resolution; maximum is the
+  default;
+- `--max-megapixels` caps maximum-mode output at 82 MP by default;
+- `--resolution-reconstruction resample|multi-camera` selects ordinary pull
+  resampling or locally aligned, multiscale physical-sample reconstruction.
+  The latter gives high-frequency ownership to the finest verified optical
+  tier while retaining the reference camera's tone and colour. Locally sound
+  detail may be recovered even from a module rejected for ordinary fusion;
 - `--no-crop` renders the full reference view instead of the framed field;
 - `--camera` selects modules and can be repeated;
 - `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction; AMaZE

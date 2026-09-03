@@ -34,6 +34,7 @@ use crate::crosstalk::{
 use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
+use crate::resolution::{ResolutionReconstruction, refine_resolution_warp};
 use crate::synth::{
     ColorPipeline, CropWindow, GainField, ModuleColor, SynthOptions, SynthReport, SynthSource,
     auto_exposure, canvas_scale, photometric_field, photometric_match, synthesize,
@@ -846,6 +847,33 @@ pub fn fuse(
     } else {
         None
     };
+    let resolution_warps =
+        if options.synth.resolution_reconstruction == ResolutionReconstruction::MultiCamera {
+            progress(Progress {
+                stage: "align",
+                detail: "resolution-domain local refinement".to_owned(),
+                fraction: 0.50,
+            });
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if index == reference_index {
+                        None
+                    } else {
+                        Some(refine_resolution_warp(
+                            inputs[reference_index].luminance,
+                            input.luminance,
+                            &alignments[index].warp,
+                            inputs[reference_index].width,
+                            inputs[reference_index].height,
+                        ))
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![None; alignments.len()]
+        };
     if options.synth.highlight_recovery.uses_multi_camera() {
         progress(Progress {
             stage: "highlight",
@@ -1102,27 +1130,38 @@ pub fn fuse(
         .iter()
         .zip(&alignments)
         .zip(module_colors.iter().zip(&gain_fields))
-        .filter(|((_, alignment), _)| alignment.report.accepted)
-        .map(|((module, alignment), (color, gain_field))| SynthSource {
-            mosaic: &module.mosaic,
-            alignment,
-            reference: alignment.name == reference_name,
-            magnification: magnification(module),
-            confidence: synthesis_confidence(alignment)
-                * if module.focus.mirror_timeout {
-                    0.1
-                } else if module.focus.lens_timeout {
-                    0.25
-                } else {
-                    1.0
-                },
-            focus_distance: module
-                .camera
-                .as_ref()
-                .and_then(|camera| camera.focus_distance),
-            color: *color,
-            gain_field: gain_field.clone(),
+        .zip(&resolution_warps)
+        .filter(|(((_, alignment), _), resolution_warp)| {
+            alignment.report.accepted
+                || resolution_warp.as_ref().is_some_and(|refined| {
+                    refined.report.supported_fraction >= 0.005
+                        && refined.report.mean_confidence >= 0.5
+                })
         })
+        .map(
+            |(((module, alignment), (color, gain_field)), resolution_warp)| SynthSource {
+                mosaic: &module.mosaic,
+                alignment,
+                resolution_warp: resolution_warp.as_ref(),
+                fusion_enabled: alignment.report.accepted,
+                reference: alignment.name == reference_name,
+                magnification: magnification(module),
+                confidence: synthesis_confidence(alignment)
+                    * if module.focus.mirror_timeout {
+                        0.1
+                    } else if module.focus.lens_timeout {
+                        0.25
+                    } else {
+                        1.0
+                    },
+                focus_distance: module
+                    .camera
+                    .as_ref()
+                    .and_then(|camera| camera.focus_distance),
+                color: *color,
+                gain_field: gain_field.clone(),
+            },
+        )
         .collect::<Vec<_>>();
     let synthesis = synthesize(
         output,

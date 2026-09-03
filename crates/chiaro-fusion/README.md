@@ -43,7 +43,16 @@ command-line application.
    Strong near-side residual parallax relative to a magnified module's
    calibrated focus plane suppresses that module locally. Centre-surround
    contrast preserves thin branches and wires even when their centres have
-   little directional gradient. For display-ready output, a smooth sensor-white
+   little directional gradient. In multi-camera resolution mode, a separate
+   locally verified warp matches each source at reference-camera bandwidth,
+   retrieves the original physical samples, and selects the finest locally
+   available optical tier. Edge-aligned compact Hann kernels form two detail
+   bands; agreeing sources bias toward the strongest reliable coefficient.
+   A denser tele module may transfer detail directly, while same-resolution
+   reconstruction requires distinct subpixel phases. Colour and low-frequency
+   tone remain on the robust fusion path. A module rejected from ordinary
+   fusion may still contribute resolution-only islands when this independent
+   local registration is strong. For display-ready output, a smooth sensor-white
    shoulder neutralises false colour from unequally clipped raw channels without
    introducing a hard highlight boundary.
 
@@ -75,12 +84,19 @@ belong to the same physical camera.
 
 - **Native** renders approximately the reference sensor's 13 MP resolution.
 - **Maximum** uses the finest participating module that covers the view, capped
-  by a caller-provided megapixel limit.
+  by a caller-provided megapixel limit. The applications default this cap to
+  82 MP so the measured A/B magnification is not truncated below the L16's
+  approximately 81.6 MP wide-output class.
 - **Scale** specifies canvas pixels per reference pixel directly.
 
 The output is cropped to the focal length framed by the photographer by
 default. Full-reference rendering can be requested instead. Monochrome modules
 contribute luminance unless explicitly excluded.
+
+Resolution reconstruction is classical and deterministic: it uses no learned
+model or GPU. Local registration renders one half-resolution matching buffer
+at a time, and synthesis streams narrow output bands, so an 82 MP canvas does
+not require an 82 MP floating-point output allocation.
 
 ## Important limitations
 

@@ -10,6 +10,7 @@ use std::{
 use chiaro_fusion::{
     crosstalk::CrosstalkMode,
     pipeline::{FusionOptions, HotpixelStage, fuse},
+    resolution::ResolutionReconstruction,
     synth::{CanvasMode, OutputColor},
 };
 use chiaro_hotpixel_core::{
@@ -31,7 +32,9 @@ const FIELD_ZOOM_CALIBRATION: PickField = 4;
 /// Native sensor resolution, the size of a "native" canvas.
 const NATIVE_PIXELS: u64 = 4160 * 3120;
 /// Cap for the "maximum detail" canvas.
-const MAX_MEGAPIXELS: f32 = 64.0;
+// Lumen's full-resolution 28 mm output is 10432 x 7824 (81.6 MP). Keep the
+// cap just above that tier so calibrated A/B magnification is not truncated.
+const MAX_MEGAPIXELS: f32 = 82.0;
 
 /// Canvas choices offered in the dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +56,7 @@ pub struct FusionExport {
     demosaic: DemosaicMethod,
     highlight_recovery: HighlightRecovery,
     crosstalk: CrosstalkMode,
+    resolution_reconstruction: ResolutionReconstruction,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -70,12 +74,13 @@ impl Default for FusionExport {
             calibration: CalibrationPath::default(),
             zoom_calibration: CalibrationPath::default(),
             hotpixel_enabled: true,
-            canvas: CanvasChoice::Native,
+            canvas: CanvasChoice::Maximum,
             crop_to_framing: true,
             color: OutputColor::Display,
             demosaic: DemosaicMethod::default(),
             highlight_recovery: HighlightRecovery::default(),
             crosstalk: CrosstalkMode::default(),
+            resolution_reconstruction: ResolutionReconstruction::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -112,6 +117,7 @@ impl FusionExport {
         options.synth.demosaic = self.demosaic;
         options.synth.highlight_recovery = self.highlight_recovery;
         options.crosstalk = self.crosstalk;
+        options.synth.resolution_reconstruction = self.resolution_reconstruction;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -251,6 +257,26 @@ impl ExportPipeline for FusionExport {
              smooth capture-specific residual from aligned low-texture regions.",
         );
         ui.horizontal(|ui| {
+            ui.label("Resolution reconstruction");
+            egui::ComboBox::from_id_salt("fusion-resolution-reconstruction")
+                .selected_text(self.resolution_reconstruction.label())
+                .show_ui(ui, |ui| {
+                    for mode in ResolutionReconstruction::ALL {
+                        ui.selectable_value(
+                            &mut self.resolution_reconstruction,
+                            mode,
+                            mode.label(),
+                        );
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Multi-camera locally refines alignment at reference-camera bandwidth, then projects \
+             original physical sensor samples through edge-aligned Hann kernels and combines \
+             only consistent, distinct subpixel phases. Resample retains the previous path.",
+        );
+        ui.horizontal(|ui| {
             ui.label("Resolution");
             ui.radio_value(&mut self.canvas, CanvasChoice::Native, "Native (13 MP)");
             ui.radio_value(
@@ -259,8 +285,8 @@ impl ExportPipeline for FusionExport {
                 format!("Maximum detail (up to {MAX_MEGAPIXELS:.0} MP)"),
             )
             .on_hover_text(
-                "As many pixels as the finest module covering the view justifies: about \
-                 2.5x the native resolution where the B modules cover, 5.5x for C.",
+                "As many pixels as the calibrated magnification of the finest participating \
+                 module justifies, capped at 82 MP to preserve the L16's full wide-output tier.",
             );
         });
         ui.horizontal(|ui| {
@@ -548,15 +574,15 @@ mod tests {
         };
         assert_eq!(
             export.estimate(std::slice::from_ref(&target)).bytes,
-            4160 * 3120 * 6
+            82_000_000 * 6
         );
-        let big = FusionExport {
-            canvas: CanvasChoice::Maximum,
+        let native = FusionExport {
+            canvas: CanvasChoice::Native,
             ..FusionExport::default()
         };
         assert_eq!(
-            big.estimate(&[target.clone(), target]).bytes,
-            2 * 64_000_000 * 6
+            native.estimate(&[target.clone(), target]).bytes,
+            2 * 4160 * 3120 * 6
         );
     }
 

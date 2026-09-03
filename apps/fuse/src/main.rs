@@ -6,6 +6,7 @@ use clap::{Parser, ValueEnum};
 use chiaro_fusion::calibration::IntrinsicsMode;
 use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
+use chiaro_fusion::resolution::ResolutionReconstruction;
 use chiaro_fusion::synth::{CanvasMode, OutputColor};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::HighlightRecovery;
@@ -96,11 +97,11 @@ struct Cli {
     /// Canvas size: `native` (13 MP), `max` (as the finest covering module
     /// allows, capped by --max-megapixels), or a number of canvas pixels per
     /// reference pixel.
-    #[arg(long, default_value = "native")]
+    #[arg(long, default_value = "max")]
     canvas: String,
 
     /// Cap for `--canvas max`.
-    #[arg(long, default_value_t = 64.0)]
+    #[arg(long, default_value_t = 82.0)]
     max_megapixels: f32,
 
     /// Render the full wide frame instead of cropping to the framed focal length.
@@ -121,6 +122,10 @@ struct Cli {
     /// Apply no crosstalk, the factory mesh, or a capture-adaptive residual.
     #[arg(long, default_value = "adaptive")]
     crosstalk: CrosstalkMode,
+
+    /// Resample cameras independently or reconstruct from their physical samples.
+    #[arg(long, default_value = "multi-camera")]
+    resolution_reconstruction: ResolutionReconstruction,
 
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
@@ -216,6 +221,7 @@ fn main() -> Result<()> {
     options.synth.demosaic = cli.demosaic.into();
     options.synth.highlight_recovery = cli.highlight_recovery.into();
     options.crosstalk = cli.crosstalk;
+    options.synth.resolution_reconstruction = cli.resolution_reconstruction;
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;
@@ -267,6 +273,32 @@ fn main() -> Result<()> {
         "robust detail/edge rejection: {:.2}% of compared non-reference samples",
         report.synthesis.edge_rejected_fraction * 100.0
     );
+    let resolution = &report.synthesis.resolution_reconstruction;
+    println!(
+        "resolution reconstruction: {} - {:.2}% candidates, {:.2}% sampling-supported, {:.2}% reconstructed, {:.2} cameras, {:.3} px phase spread, {:.3} confidence",
+        resolution.mode,
+        resolution.candidate_fraction * 100.0,
+        resolution.phase_supported_fraction * 100.0,
+        resolution.reconstructed_fraction * 100.0,
+        resolution.mean_cameras,
+        resolution.mean_phase_spread,
+        resolution.mean_confidence,
+    );
+    for source in &report.synthesis.source_contributions {
+        if let Some(local) = &source.resolution_alignment {
+            println!(
+                "  {:<3} {:>4.2}x resolution alignment {:>5.1}% verified/{:>5.1}% supported, median correction {:.2} px, confidence {:.2}; candidate {:>5.1}%, accepted {:>5.1}%",
+                source.camera,
+                source.magnification,
+                local.verified_fraction * 100.0,
+                local.supported_fraction * 100.0,
+                local.median_correction_px,
+                local.mean_confidence,
+                source.resolution_candidate_fraction * 100.0,
+                source.resolution_contributor_fraction * 100.0,
+            );
+        }
+    }
     println!(
         "timings: load {:.1}s, hotpixel {:.1}s, align {:.1}s, synthesize {:.1}s",
         report.seconds.load,

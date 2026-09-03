@@ -30,7 +30,7 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Local catalog | ✅ Inspectable SQLite capture, thumbnail, and export history | ✅ Proprietary imported-photo library |
 | Per-camera batch export | ✅ Corrected 16-bit RGB or Bayer PNG stacks; five demosaicing methods | ❌ Not exposed |
 | Night-mode denoising | 🟡 Gallery and CLI export with gyro-seeded, motion-aware temporal and multi-camera fusion | ✅ Integrated night processing |
-| Computational fusion | 🟡 Calibrated global alignment, dense confidence-aware depth reconstruction, and high-resolution PNG synthesis | ✅ Depth-aware multi-camera fusion |
+| Computational fusion | 🟡 Calibrated global and dense depth alignment, locally verified multi-camera subpixel reconstruction, and up to 82 MP PNG synthesis | ✅ Depth-aware multi-camera fusion |
 | Depth and focus editing | 🚧 Planned | ✅ Focus adjustment, depth effect, and depth-map repair |
 | Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
 | Best fit | Open browsing, inspection, research, and per-module workflows | Finished-photo fusion and depth editing |
@@ -41,7 +41,11 @@ finite depths reproduced by independent camera evidence. Distant, ambiguous,
 or unsupported regions safely retain the global warp rather than receiving
 completed depth. Per-camera local refinement and reference-guided robust
 blending protect object boundaries from double edges. Motion seen differently
-by every exposure can still lose detail. Night captures can be processed with
+by every exposure can still lose detail. A classical, bounded-memory resolution
+stage matches modules at common bandwidth, selects the finest locally verified
+optical tier, and combines its multiscale coefficients. A denser tele observation
+can transfer real detail directly; same-resolution reconstruction still requires
+coherent subpixel phases. Night captures can be processed with
 temporal and multi-camera fusion in Gallery or Chiaro Stack.
 
 ## Installation

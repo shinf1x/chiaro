@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chiaro_fusion::calibration::{CalibrationDatabase, LriMessages};
 use chiaro_fusion::crosstalk::CrosstalkMode;
+use chiaro_fusion::resolution::ResolutionReconstruction;
 use chiaro_hotpixel_core::{
     demosaic::DemosaicMethod,
     highlight::HighlightRecovery,
@@ -112,6 +113,10 @@ struct Cli {
     #[arg(long, default_value = "adaptive")]
     crosstalk: CrosstalkMode,
 
+    /// Resample cameras independently or reconstruct from their physical samples.
+    #[arg(long, default_value = "multi-camera")]
+    resolution_reconstruction: ResolutionReconstruction,
+
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -146,6 +151,7 @@ fn main() -> Result<()> {
         options.synth.demosaic = cli.demosaic.into();
         options.synth.highlight_recovery = cli.highlight_recovery;
         options.crosstalk = cli.crosstalk;
+        options.synth.resolution_reconstruction = cli.resolution_reconstruction;
         set_output_color(&mut options, cli.linear);
         let report = fuse_night(&lri, &options, &cli.output, &mut |detail| {
             eprintln!("{detail}…");
@@ -171,6 +177,16 @@ fn main() -> Result<()> {
         eprintln!(
             "robust detail/edge rejection: {:.2}% of compared non-reference samples",
             report.synthesis.edge_rejected_fraction * 100.0
+        );
+        let resolution = &report.synthesis.resolution_reconstruction;
+        eprintln!(
+            "resolution reconstruction: {} - {:.2}% candidates, {:.2}% sampling-supported, {:.2}% reconstructed, {:.2} cameras, {:.3} px phase spread",
+            resolution.mode,
+            resolution.candidate_fraction * 100.0,
+            resolution.phase_supported_fraction * 100.0,
+            resolution.reconstructed_fraction * 100.0,
+            resolution.mean_cameras,
+            resolution.mean_phase_spread,
         );
         eprintln!(
             "report: {}",

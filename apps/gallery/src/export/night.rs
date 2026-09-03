@@ -8,6 +8,7 @@ use std::{
 
 use chiaro_fusion::{
     crosstalk::CrosstalkMode,
+    resolution::ResolutionReconstruction,
     synth::{CanvasMode, OutputColor},
 };
 use chiaro_hotpixel_core::{
@@ -28,7 +29,9 @@ const FIELD_CALIBRATION: PickField = 3;
 const FIELD_ZOOM_CALIBRATION: PickField = 4;
 
 const NATIVE_PIXELS: u64 = 4160 * 3120;
-const MAX_MEGAPIXELS: f32 = 64.0;
+// Lumen's full-resolution 28 mm output is 10432 x 7824 (81.6 MP). Keep the
+// cap just above that tier so calibrated A/B magnification is not truncated.
+const MAX_MEGAPIXELS: f32 = 82.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanvasChoice {
@@ -54,6 +57,7 @@ pub struct NightStackExport {
     demosaic: DemosaicMethod,
     highlight_recovery: HighlightRecovery,
     crosstalk: CrosstalkMode,
+    resolution_reconstruction: ResolutionReconstruction,
     include_mono: bool,
     highlight_correction: bool,
     fast_compression: bool,
@@ -82,6 +86,7 @@ impl Default for NightStackExport {
             demosaic: DemosaicMethod::Lmmse,
             highlight_recovery: HighlightRecovery::MultiCamera,
             crosstalk: CrosstalkMode::default(),
+            resolution_reconstruction: ResolutionReconstruction::default(),
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -120,6 +125,7 @@ impl NightStackExport {
         options.synth.demosaic = self.demosaic;
         options.synth.highlight_recovery = self.highlight_recovery;
         options.crosstalk = self.crosstalk;
+        options.synth.resolution_reconstruction = self.resolution_reconstruction;
         options.synth.include_mono = self.include_mono;
         options.synth.highlight_correction = self.highlight_correction;
         options.synth.png_level = if self.fast_compression {
@@ -302,6 +308,25 @@ impl ExportPipeline for NightStackExport {
         .on_hover_text(
             "Adaptive preserves the factory mesh and fits a constrained capture-specific \
              residual from smooth aligned overlap between camera modules.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("Resolution reconstruction");
+            egui::ComboBox::from_id_salt("night-resolution-reconstruction")
+                .selected_text(self.resolution_reconstruction.label())
+                .show_ui(ui, |ui| {
+                    for mode in ResolutionReconstruction::ALL {
+                        ui.selectable_value(
+                            &mut self.resolution_reconstruction,
+                            mode,
+                            mode.label(),
+                        );
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Multi-camera reconstructs luminance detail from independently projected physical \
+             sensor samples while retaining the robust colour fusion path.",
         );
         ui.horizontal(|ui| {
             ui.radio_value(
@@ -604,7 +629,7 @@ mod tests {
             canvas: CanvasChoice::Maximum,
             ..NightStackExport::default()
         };
-        assert_eq!(maximum.estimate(&[target(true)]).bytes, 64_000_000 * 6);
+        assert_eq!(maximum.estimate(&[target(true)]).bytes, 82_000_000 * 6);
         assert!(maximum.estimate(&[target(true)]).approximate);
     }
 
@@ -639,6 +664,7 @@ mod tests {
             demosaic: DemosaicMethod::Igv,
             highlight_recovery: HighlightRecovery::LocalBayer,
             crosstalk: CrosstalkMode::Factory,
+            resolution_reconstruction: ResolutionReconstruction::Resample,
             include_mono: false,
             highlight_correction: false,
             fast_compression: true,
@@ -665,6 +691,10 @@ mod tests {
             HighlightRecovery::LocalBayer
         );
         assert_eq!(options.crosstalk, CrosstalkMode::Factory);
+        assert_eq!(
+            options.synth.resolution_reconstruction,
+            ResolutionReconstruction::Resample
+        );
         assert!(!options.synth.include_mono);
         assert!(!options.synth.highlight_correction);
         assert_eq!(options.synth.png_level, 1);

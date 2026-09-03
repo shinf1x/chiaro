@@ -24,6 +24,7 @@ use chiaro_fusion::{
         RawHighlightSource, cross_camera_highlight_updates, group_equivalent_focal_mm,
         nominal_focal_px,
     },
+    resolution::{ResolutionReconstruction, refine_resolution_warp},
     synth::{
         CanvasMode, ColorPipeline, CropWindow, GainField, ModuleColor, OutputColor, SynthOptions,
         SynthReport, SynthSource, auto_exposure, canvas_scale, photometric_field,
@@ -334,6 +335,29 @@ pub fn fuse_night(
     } else {
         None
     };
+    let resolution_warps =
+        if options.synth.resolution_reconstruction == ResolutionReconstruction::MultiCamera {
+            progress("refine local resolution alignment");
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if index == reference_index {
+                        None
+                    } else {
+                        Some(refine_resolution_warp(
+                            inputs[reference_index].luminance,
+                            input.luminance,
+                            &alignments[index].warp,
+                            inputs[reference_index].width,
+                            inputs[reference_index].height,
+                        ))
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![None; alignments.len()]
+        };
     if options.synth.highlight_recovery.uses_multi_camera() {
         progress("recover cross-camera RAW highlights");
         let reference_dimensions = (
@@ -494,21 +518,35 @@ pub fn fuse_night(
         .zip(&alignments)
         .zip(colors.iter().zip(&gain_fields))
         .zip(&magnifications)
-        .filter(|(((_, alignment), _), _)| alignment.report.accepted)
+        .zip(&resolution_warps)
+        .filter(|((((_, alignment), _), _), resolution_warp)| {
+            alignment.report.accepted
+                || resolution_warp.as_ref().is_some_and(|refined| {
+                    refined.report.supported_fraction >= 0.005
+                        && refined.report.mean_confidence >= 0.5
+                })
+        })
         .map(
-            |(((module, alignment), (color, gain_field)), magnification)| SynthSource {
-                mosaic: &module.mosaic,
-                alignment,
-                reference: alignment.name == reference_name,
-                magnification: *magnification,
-                confidence: alignment_confidence(alignment, &reference_name, &options.module_align)
-                    * noise_confidence(reference_noise, module.dark_noise_variance),
-                focus_distance: module
-                    .camera
-                    .as_ref()
-                    .and_then(|camera| camera.focus_distance),
-                color: *color,
-                gain_field: gain_field.clone(),
+            |((((module, alignment), (color, gain_field)), magnification), resolution_warp)| {
+                SynthSource {
+                    mosaic: &module.mosaic,
+                    alignment,
+                    resolution_warp: resolution_warp.as_ref(),
+                    fusion_enabled: alignment.report.accepted,
+                    reference: alignment.name == reference_name,
+                    magnification: *magnification,
+                    confidence: alignment_confidence(
+                        alignment,
+                        &reference_name,
+                        &options.module_align,
+                    ) * noise_confidence(reference_noise, module.dark_noise_variance),
+                    focus_distance: module
+                        .camera
+                        .as_ref()
+                        .and_then(|camera| camera.focus_distance),
+                    color: *color,
+                    gain_field: gain_field.clone(),
+                }
             },
         )
         .collect::<Vec<_>>();

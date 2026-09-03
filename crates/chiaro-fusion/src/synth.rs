@@ -30,6 +30,10 @@ use std::path::Path;
 use crate::align::ModuleAlignment;
 use crate::depth::DenseDepthMap;
 use crate::image::Mosaic;
+use crate::resolution::{
+    ResolutionAlignmentReport, ResolutionReconstruction, ResolutionReconstructionReport,
+    ResolutionWarp, edge_aligned_hann_weight, inverse_warp_jacobian, reconstruction_confidence,
+};
 
 /// Output colour handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -67,6 +71,8 @@ pub struct SynthOptions {
     /// Clipped-sample reconstruction applied to the RAW Bayer mosaic before
     /// crosstalk correction and demosaicing.
     pub highlight_recovery: HighlightRecovery,
+    /// Pull resampling or physical-sample multi-camera reconstruction.
+    pub resolution_reconstruction: ResolutionReconstruction,
     /// Include monochrome modules (as luminance).
     pub include_mono: bool,
     /// Smoothly reconstruct false colour caused by unequal raw-channel clipping
@@ -87,6 +93,7 @@ impl Default for SynthOptions {
             color: OutputColor::Display,
             demosaic: DemosaicMethod::default(),
             highlight_recovery: HighlightRecovery::default(),
+            resolution_reconstruction: ResolutionReconstruction::default(),
             include_mono: true,
             highlight_correction: true,
             threads: 0,
@@ -339,6 +346,13 @@ impl GainField {
 pub struct SynthSource<'a> {
     pub mosaic: &'a Mosaic,
     pub alignment: &'a ModuleAlignment,
+    /// Locally verified mapping used only to retrieve high-frequency samples.
+    /// The normal fusion path continues to use `alignment`.
+    pub resolution_warp: Option<&'a ResolutionWarp>,
+    /// Whether this source may contribute ordinary tone and colour. A module
+    /// rejected globally can still be admitted as resolution-only when its
+    /// independent local registration has reliable islands.
+    pub fusion_enabled: bool,
     /// The reference module anchors edge ownership during robust blending.
     pub reference: bool,
     /// Linear resolution relative to the reference (focal length ratio).
@@ -357,6 +371,9 @@ pub struct SynthSource<'a> {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SourceContributionReport {
     pub camera: String,
+    pub fusion_enabled: bool,
+    /// Linear optical sampling density relative to the reference module.
+    pub magnification: f32,
     /// RGB legend colour used by the optional ownership diagnostics.
     pub diagnostic_rgb: [u8; 3],
     /// Fraction of covered output pixels where this source supplied the
@@ -369,6 +386,14 @@ pub struct SourceContributionReport {
     pub focus_suppressed_fraction: f32,
     /// Fraction of colour samples suppressed by reference chromaticity.
     pub chroma_suppressed_fraction: f32,
+    /// Fraction of covered output pixels where this module supplied a locally
+    /// registered physical sample to a resolution candidate.
+    pub resolution_candidate_fraction: f32,
+    /// Fraction where that candidate passed phase and consistency checks.
+    pub resolution_contributor_fraction: f32,
+    /// Texture-supported local registration used only by resolution recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_alignment: Option<ResolutionAlignmentReport>,
 }
 
 #[derive(Default)]
@@ -379,6 +404,136 @@ struct SourceCounters {
     focus_suppressed: std::sync::atomic::AtomicUsize,
     color_sampled: std::sync::atomic::AtomicUsize,
     chroma_suppressed: std::sync::atomic::AtomicUsize,
+    resolution_candidate: std::sync::atomic::AtomicUsize,
+    resolution_contributor: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct ResolutionCounters {
+    candidates: std::sync::atomic::AtomicUsize,
+    phase_supported: std::sync::atomic::AtomicUsize,
+    reconstructed: std::sync::atomic::AtomicUsize,
+    cameras_milli: std::sync::atomic::AtomicUsize,
+    phase_spread_micro: std::sync::atomic::AtomicUsize,
+    confidence_micro: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedCameraSample {
+    detail: f32,
+    support: f32,
+    phase: [f32; 2],
+}
+
+#[derive(Default)]
+struct ResolutionAccumulator {
+    weighted_detail: f32,
+    weighted_absolute_detail: f32,
+    weight: f32,
+    phase_x: f32,
+    phase_y: f32,
+    phase_squared: f32,
+    cameras: usize,
+    contributors: u32,
+    detail_magnification: f32,
+    strongest_detail: f32,
+    strongest_score: f32,
+}
+
+struct ReconstructedDetail {
+    detail: f32,
+    cameras: usize,
+    phase_spread: f32,
+    confidence: f32,
+    contributors: u32,
+    sampling_supported: bool,
+}
+
+impl ResolutionAccumulator {
+    fn add(
+        &mut self,
+        source_index: usize,
+        sample: ProjectedCameraSample,
+        reliability: f32,
+        magnification: f32,
+    ) {
+        // Use the finest locally available optical tier for high-frequency
+        // reconstruction. Averaging a C coefficient with several B
+        // coefficients dilutes the detail that justified the larger canvas.
+        if self.cameras > 0 && magnification > self.detail_magnification * 1.20 {
+            *self = Self::default();
+        } else if self.cameras > 0 && magnification * 1.20 < self.detail_magnification {
+            return;
+        }
+        let weight = sample.support * reliability.max(0.0);
+        if weight <= 1.0e-8 {
+            return;
+        }
+        self.weighted_detail += weight * sample.detail;
+        self.weighted_absolute_detail += weight * sample.detail.abs();
+        let detail_score = sample.detail.abs() * weight.sqrt();
+        if detail_score > self.strongest_score {
+            self.strongest_detail = sample.detail;
+            self.strongest_score = detail_score;
+        }
+        self.weight += weight;
+        self.phase_x += weight * sample.phase[0];
+        self.phase_y += weight * sample.phase[1];
+        self.phase_squared +=
+            weight * (sample.phase[0] * sample.phase[0] + sample.phase[1] * sample.phase[1]);
+        self.cameras += 1;
+        self.detail_magnification = self.detail_magnification.max(magnification);
+        if source_index < u32::BITS as usize {
+            self.contributors |= 1u32 << source_index;
+        }
+    }
+
+    fn finish(self) -> Option<ReconstructedDetail> {
+        let optical_transfer = self.detail_magnification > 1.35;
+        if self.weight <= 1.0e-8 || (self.cameras < 2 && !optical_transfer) {
+            return None;
+        }
+        let mean = [self.phase_x / self.weight, self.phase_y / self.weight];
+        let variance =
+            (self.phase_squared / self.weight - mean[0] * mean[0] - mean[1] * mean[1]).max(0.0);
+        let phase_spread = variance.sqrt();
+        let mean_detail = self.weighted_detail / self.weight;
+        let sign_consensus = self.weighted_detail.abs() / self.weighted_absolute_detail.max(1.0e-8);
+        // A sharper tele camera is expected to contain a coefficient that is
+        // absent or much weaker in the wide cameras. Variance of coefficient
+        // magnitude is therefore evidence of added resolution, not a reason
+        // to reject it. Reject only contradictory signs and coefficients too
+        // close to the calibrated linear-light noise floor.
+        let agreement = smoothstep((sign_consensus - 0.08) / 0.52);
+        // Noise-aware wavelet fusion commonly favours the strongest reliable
+        // coefficient. Blend towards it only when its polarity agrees with the
+        // tier mean; disagreement remains handled by the confidence gate.
+        let selection = smoothstep((sign_consensus - 0.45) / 0.45) * 0.55;
+        let detail = if mean_detail * self.strongest_detail > 0.0 {
+            mean_detail * (1.0 - selection) + self.strongest_detail * selection
+        } else {
+            mean_detail
+        };
+        let signal = smoothstep((detail.abs() - 0.00025) / 0.0025);
+        let phase_confidence = reconstruction_confidence(self.cameras, phase_spread);
+        // One locally verified tele observation already carries frequencies
+        // absent from the reference tier. Additional distinct phases increase
+        // confidence, but are mandatory only for same-resolution sources.
+        let sampling_confidence = if optical_transfer {
+            0.72 + 0.28 * phase_confidence
+        } else {
+            phase_confidence
+        };
+        let confidence = sampling_confidence * agreement * signal;
+        Some(ReconstructedDetail {
+            detail,
+            cameras: self.cameras,
+            phase_spread,
+            confidence,
+            contributors: self.contributors,
+            sampling_supported: sampling_confidence > 0.0,
+        })
+    }
 }
 
 /// Per-module statistics of a synthesis run.
@@ -398,6 +553,7 @@ pub struct SynthReport {
     pub highlight_correction: bool,
     pub raw_highlight_recovery: HighlightRecovery,
     pub demosaic: DemosaicMethod,
+    pub resolution_reconstruction: ResolutionReconstructionReport,
     /// Fraction of non-reference samples rejected as strong photometric or
     /// local-detail contradictions. Agreeing modules remain fully blended.
     pub edge_rejected_fraction: f32,
@@ -472,6 +628,7 @@ pub fn synthesize(
     let covered = std::sync::atomic::AtomicUsize::new(0);
     let edge_checked = std::sync::atomic::AtomicUsize::new(0);
     let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
+    let resolution_counters = ResolutionCounters::default();
     let source_counters = (0..usable.len())
         .map(|_| SourceCounters::default())
         .collect::<Vec<_>>();
@@ -525,6 +682,7 @@ pub fn synthesize(
                     let mut reference_color_weight = 0.0f32;
                     let mut reference_luminance_sum = 0.0f32;
                     let mut reference_luminance_weight = 0.0f32;
+                    let mut resolution = ResolutionAccumulator::default();
                     let mut sharpest_agreeing_detail = 1.0f32;
                     let mut luminance_owner = None::<(usize, f32)>;
                     let mut color_owner = None::<(usize, f32)>;
@@ -587,10 +745,12 @@ pub fn synthesize(
                                         sample_structure,
                                         source.reference,
                                     );
-                            sharpest_agreeing_detail = sharpest_agreeing_detail.max(
-                                agreeing_detail_gain(reference_structure, sample_structure)
-                                    * focus_weight,
-                            );
+                            if source.fusion_enabled {
+                                sharpest_agreeing_detail = sharpest_agreeing_detail.max(
+                                    agreeing_detail_gain(reference_structure, sample_structure)
+                                        * focus_weight,
+                                );
+                            }
                             let rejected = edge_weight < 0.1;
                             if rejected {
                                 edge_weight = 0.0;
@@ -600,6 +760,35 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
+                            if options.resolution_reconstruction
+                                == ResolutionReconstruction::MultiCamera
+                                && let Some(projected) = projected_camera_luminance(
+                                    source,
+                                    rx,
+                                    ry,
+                                    scale,
+                                    reference_structure,
+                                    options,
+                                )
+                            {
+                                source_counters[source_index]
+                                    .resolution_candidate
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                resolution.add(
+                                    source_index,
+                                    projected,
+                                    feather
+                                        * local_confidence
+                                        * source.confidence
+                                        * source.magnification
+                                        * source.magnification
+                                        * edge_weight,
+                                    source.magnification,
+                                );
+                            }
+                            if !source.fusion_enabled {
+                                continue;
+                            }
                             let weight = base_weight * edge_weight;
                             luminance += weight * y;
                             luminance_weight += weight;
@@ -634,10 +823,12 @@ pub fn synthesize(
                                 sample_structure,
                                 source.reference,
                             );
-                            sharpest_agreeing_detail = sharpest_agreeing_detail.max(
-                                agreeing_detail_gain(reference_structure, sample_structure)
-                                    * focus_weight,
-                            );
+                            if source.fusion_enabled {
+                                sharpest_agreeing_detail = sharpest_agreeing_detail.max(
+                                    agreeing_detail_gain(reference_structure, sample_structure)
+                                        * focus_weight,
+                                );
+                            }
                             let rejected = edge_weight < 0.1;
                             if rejected {
                                 edge_weight = 0.0;
@@ -647,6 +838,35 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
+                            if options.resolution_reconstruction
+                                == ResolutionReconstruction::MultiCamera
+                                && let Some(projected) = projected_camera_luminance(
+                                    source,
+                                    rx,
+                                    ry,
+                                    scale,
+                                    reference_structure,
+                                    options,
+                                )
+                            {
+                                source_counters[source_index]
+                                    .resolution_candidate
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                resolution.add(
+                                    source_index,
+                                    projected,
+                                    feather
+                                        * local_confidence
+                                        * source.confidence
+                                        * source.magnification
+                                        * source.magnification
+                                        * edge_weight,
+                                    source.magnification,
+                                );
+                            }
+                            if !source.fusion_enabled {
+                                continue;
+                            }
                             let luminance_source_weight = base_weight * edge_weight;
                             let chroma_weight = chroma_consistency_weight(
                                 reference_color,
@@ -751,7 +971,59 @@ pub fn synthesize(
                                 );
                             }
                         }
-                        let target_luminance = luminance / luminance_weight;
+                        let mut target_luminance = luminance / luminance_weight;
+                        if let Some(reconstructed) = resolution.finish() {
+                            resolution_counters
+                                .candidates
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if reconstructed.sampling_supported {
+                                resolution_counters
+                                    .phase_supported
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if reconstructed.confidence > 0.0 {
+                                // Only a fine-minus-coarse coefficient is added;
+                                // low-frequency colour/exposure remains owned by
+                                // the robust existing synthesis path.
+                                let maximum_delta = 0.004 + 0.12 * target_luminance.max(0.0);
+                                let delta =
+                                    reconstructed.detail.clamp(-maximum_delta, maximum_delta);
+                                // Confidence has already combined independent
+                                // cameras, phase diversity, detail agreement, and
+                                // the locally verified resolution warp. Its square
+                                // root avoids making a good but conservative chain
+                                // of probabilities visually irrelevant, while the
+                                // bounded coefficient still prevents overshoot.
+                                let blend = (reconstructed.confidence.sqrt() * 1.10).min(1.0);
+                                target_luminance = (target_luminance + blend * delta).max(0.0);
+                                resolution_counters
+                                    .reconstructed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                resolution_counters.cameras_milli.fetch_add(
+                                    reconstructed.cameras.saturating_mul(1_000),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                resolution_counters.phase_spread_micro.fetch_add(
+                                    (reconstructed.phase_spread.min(16.0) * 1_000_000.0) as usize,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                resolution_counters.confidence_micro.fetch_add(
+                                    (reconstructed.confidence * 1_000_000.0) as usize,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                for (source_index, counters) in source_counters
+                                    .iter()
+                                    .enumerate()
+                                    .take(usable.len().min(u32::BITS as usize))
+                                {
+                                    if reconstructed.contributors & (1u32 << source_index) != 0 {
+                                        counters
+                                            .resolution_contributor
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
                         let blended = if color_weight > 0.0 {
                             let mean = xyz.map(|v| v / color_weight);
                             if mean[1] > 1e-6 {
@@ -797,6 +1069,38 @@ pub fn synthesize(
         .collect::<Vec<_>>();
     modules.sort_by(|a, b| b.1.total_cmp(&a.1));
     let covered_pixels = covered.load(std::sync::atomic::Ordering::Relaxed);
+    let reconstructed_pixels = resolution_counters
+        .reconstructed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let resolution_reconstruction = ResolutionReconstructionReport {
+        mode: options.resolution_reconstruction,
+        candidate_fraction: fraction(
+            resolution_counters
+                .candidates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            covered_pixels,
+        ),
+        phase_supported_fraction: fraction(
+            resolution_counters
+                .phase_supported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            covered_pixels,
+        ),
+        reconstructed_fraction: fraction(reconstructed_pixels, covered_pixels),
+        mean_cameras: resolution_counters
+            .cameras_milli
+            .load(std::sync::atomic::Ordering::Relaxed) as f32
+            / (reconstructed_pixels.max(1) * 1_000) as f32,
+        mean_phase_spread: resolution_counters
+            .phase_spread_micro
+            .load(std::sync::atomic::Ordering::Relaxed) as f32
+            / (reconstructed_pixels.max(1) * 1_000_000) as f32,
+        mean_confidence: resolution_counters
+            .confidence_micro
+            .load(std::sync::atomic::Ordering::Relaxed) as f32
+            / (reconstructed_pixels.max(1) * 1_000_000) as f32,
+        hann_radius_px: RECONSTRUCTION_RADIUS,
+    };
     let source_contributions = usable
         .iter()
         .zip(&source_counters)
@@ -808,6 +1112,8 @@ pub fn synthesize(
                 .load(std::sync::atomic::Ordering::Relaxed);
             SourceContributionReport {
                 camera: source.alignment.name.clone(),
+                fusion_enabled: source.fusion_enabled,
+                magnification: source.magnification,
                 diagnostic_rgb: ownership_color(source_index),
                 luminance_owner_fraction: fraction(
                     counters
@@ -833,6 +1139,19 @@ pub fn synthesize(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     color_sampled,
                 ),
+                resolution_candidate_fraction: fraction(
+                    counters
+                        .resolution_candidate
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    covered_pixels,
+                ),
+                resolution_contributor_fraction: fraction(
+                    counters
+                        .resolution_contributor
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    covered_pixels,
+                ),
+                resolution_alignment: source.resolution_warp.map(|refined| refined.report.clone()),
             }
         })
         .collect();
@@ -846,6 +1165,7 @@ pub fn synthesize(
         highlight_correction: options.highlight_correction,
         raw_highlight_recovery: options.highlight_recovery,
         demosaic: options.demosaic,
+        resolution_reconstruction,
         edge_rejected_fraction: fraction(
             edge_rejected.load(std::sync::atomic::Ordering::Relaxed),
             edge_checked.load(std::sync::atomic::Ordering::Relaxed),
@@ -932,6 +1252,155 @@ fn fraction(count: usize, total: usize) -> f32 {
         0.0
     } else {
         count as f32 / total as f32
+    }
+}
+
+/// Radii of a compact two-scale decomposition in output pixels. The narrow
+/// field retains independently located sensor samples; subtracting the broad
+/// field removes exposure/colour drift and leaves a local detail coefficient.
+const RECONSTRUCTION_RADIUS: f32 = 0.90;
+const RECONSTRUCTION_COARSE_RADIUS: f32 = 1.80;
+const RECONSTRUCTION_BROAD_RADIUS: f32 = 3.20;
+const OPTICAL_MID_BAND_GAIN: f32 = 0.70;
+
+/// Project nearby physical module samples into one output pixel through the
+/// local inverse of the final warp. The return value is deliberately not
+/// normalized across cameras: their sensor grids must meet in one accumulator
+/// for distinct sampling phases to carry new information.
+fn projected_camera_luminance(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    scale: f32,
+    reference_structure: Option<[f32; 3]>,
+    options: &SynthOptions,
+) -> Option<ProjectedCameraSample> {
+    let warp = source
+        .resolution_warp
+        .map_or(&source.alignment.warp, |refined| &refined.warp);
+    let local_confidence = warp.confidence(rx, ry);
+    if local_confidence <= 0.0 {
+        return None;
+    }
+    let q = warp.map(rx, ry)?;
+    let inverse = inverse_warp_jacobian(warp, rx, ry)?;
+    let transfer_mid_band = source.magnification > 1.35;
+    // The steered kernel extends up to 1.5x along a strong edge. Magnified
+    // modules also restore a lower-frequency optical band that would otherwise
+    // remain dominated by the wider reference cameras.
+    let largest_radius = if transfer_mid_band {
+        RECONSTRUCTION_BROAD_RADIUS
+    } else {
+        RECONSTRUCTION_COARSE_RADIUS
+    };
+    let radius = inverse.source_radius(largest_radius * 1.5, scale);
+    if radius == 0 {
+        return None;
+    }
+    let centre_x = q[0].round() as isize;
+    let centre_y = q[1].round() as isize;
+    let mut fine_luminance = 0.0f32;
+    let mut fine_weight = 0.0f32;
+    let mut coarse_luminance = 0.0f32;
+    let mut coarse_weight = 0.0f32;
+    let mut broad_luminance = 0.0f32;
+    let mut broad_weight = 0.0f32;
+    let mut phase = [0.0f32; 2];
+    for sy in centre_y - radius as isize..=centre_y + radius as isize {
+        if sy < 0 || sy >= source.mosaic.height as isize {
+            continue;
+        }
+        for sx in centre_x - radius as isize..=centre_x + radius as isize {
+            if sx < 0 || sx >= source.mosaic.width as isize {
+                continue;
+            }
+            let displacement = inverse.map(sx as f32 - q[0], sy as f32 - q[1]);
+            let output_dx = displacement[0] * scale;
+            let output_dy = displacement[1] * scale;
+            let broad_kernel = transfer_mid_band.then(|| {
+                edge_aligned_hann_weight(
+                    output_dx,
+                    output_dy,
+                    RECONSTRUCTION_BROAD_RADIUS,
+                    reference_structure,
+                )
+            });
+            let coarse_kernel = edge_aligned_hann_weight(
+                output_dx,
+                output_dy,
+                RECONSTRUCTION_COARSE_RADIUS,
+                reference_structure,
+            );
+            if coarse_kernel <= 0.0 && broad_kernel.unwrap_or(0.0) <= 0.0 {
+                continue;
+            }
+            let luminance = source_luminance_at_sensor(source, sx as f32, sy as f32, options)?;
+            if coarse_kernel > 0.0 {
+                coarse_luminance += coarse_kernel * luminance;
+                coarse_weight += coarse_kernel;
+            }
+            if let Some(broad_kernel) = broad_kernel
+                && broad_kernel > 0.0
+            {
+                broad_luminance += broad_kernel * luminance;
+                broad_weight += broad_kernel;
+            }
+            let fine_kernel = edge_aligned_hann_weight(
+                output_dx,
+                output_dy,
+                RECONSTRUCTION_RADIUS,
+                reference_structure,
+            );
+            if fine_kernel > 0.0 {
+                fine_luminance += fine_kernel * luminance;
+                fine_weight += fine_kernel;
+                phase[0] += fine_kernel * output_dx;
+                phase[1] += fine_kernel * output_dy;
+            }
+        }
+    }
+    if fine_weight <= 1.0e-8 || coarse_weight <= 1.0e-8 {
+        return None;
+    }
+    let fine_detail = fine_luminance / fine_weight - coarse_luminance / coarse_weight;
+    let mid_detail = if transfer_mid_band && broad_weight > 1.0e-8 {
+        coarse_luminance / coarse_weight - broad_luminance / broad_weight
+    } else {
+        0.0
+    };
+    Some(ProjectedCameraSample {
+        detail: fine_detail + OPTICAL_MID_BAND_GAIN * mid_detail,
+        support: fine_weight * local_confidence,
+        phase: phase.map(|value| value / fine_weight),
+    })
+}
+
+/// Calibrated luminance at an actual module-raster sample position. This is
+/// the same photometric path as pull synthesis without its subpixel bilinear
+/// lookup in the module raster.
+fn source_luminance_at_sensor(
+    source: &SynthSource<'_>,
+    x: f32,
+    y: f32,
+    options: &SynthOptions,
+) -> Option<f32> {
+    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(x, y)?;
+    let gain = source.alignment.gain;
+    let offset = source.alignment.offset;
+    let field = source
+        .gain_field
+        .at(x, y, source.mosaic.width, source.mosaic.height);
+    if source.mosaic.is_mono() || !source.color.calibrated {
+        Some((gain * (rgb[1] - offset)).max(0.0) * field[1])
+    } else {
+        let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
+        let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
+        Some(
+            source
+                .color
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction)[1]
+                * field[1],
+        )
     }
 }
 
@@ -1485,6 +1954,33 @@ pub fn photometric_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn projected_detail(detail: f32, phase: [f32; 2]) -> ProjectedCameraSample {
+        ProjectedCameraSample {
+            detail,
+            support: 1.0,
+            phase,
+        }
+    }
+
+    #[test]
+    fn tele_detail_replaces_the_coarser_optical_tier() {
+        let mut reconstruction = ResolutionAccumulator::default();
+        reconstruction.add(0, projected_detail(0.01, [0.0, 0.0]), 1.0, 1.0);
+        reconstruction.add(1, projected_detail(0.04, [0.0, 0.0]), 1.0, 2.2);
+        let result = reconstruction.finish().expect("verified tele transfer");
+        assert!((result.detail - 0.04).abs() < 1.0e-6);
+        assert_eq!(result.cameras, 1);
+        assert_eq!(result.contributors, 1 << 1);
+        assert!(result.confidence > 0.0);
+    }
+
+    #[test]
+    fn same_resolution_reconstruction_still_requires_multiple_phases() {
+        let mut reconstruction = ResolutionAccumulator::default();
+        reconstruction.add(0, projected_detail(0.04, [0.0, 0.0]), 1.0, 1.0);
+        assert!(reconstruction.finish().is_none());
+    }
 
     #[test]
     fn edge_consistency_keeps_matches_and_rejects_contradictions() {

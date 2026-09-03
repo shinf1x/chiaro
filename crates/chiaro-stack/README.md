@@ -21,3 +21,9 @@ white-balance-aware residual is fitted over the factory 17x13 four-phase mesh
 using smooth aligned overlap and accepted only when held-out measurements
 improve. Individual cameras fall back to their factory mesh when evidence is
 insufficient.
+
+All-module synthesis also supports the shared classical resolution stage. It
+locally verifies cross-camera registration at common bandwidth, selects the
+finest optical tier, then combines noise-weighted multiscale coefficients
+through compact edge-aligned kernels. Equal-resolution sources require distinct
+subpixel phases; no learned model or GPU is required.
