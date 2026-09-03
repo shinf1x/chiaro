@@ -22,6 +22,7 @@
 
 pub mod align;
 pub mod calibration;
+pub mod color_profile;
 pub mod crosstalk;
 pub mod depth;
 pub mod geometry;

@@ -33,7 +33,10 @@ command-line application.
    falls back independently to the factory mesh for any module without enough
    evidence or a measurable validation improvement. Then reconstruct Bayer
    colour with the selected demosaicing method and apply
-   module-specific colour and flat-field calibration, match overlapping
+   module-specific colour and flat-field calibration. The capture white balance
+   locates the scene between the factory A, F11, and D65 anchors in log neutral-
+   ratio space; their ForwardMatrices are interpolated by reciprocal colour
+   temperature and clamped outside the calibrated range. Match overlapping
    modules photometrically, and blend them into a 16-bit PNG. AMaZE is the
    default; Simple, RCD, LMMSE, and IGV are also available. Warp
    discontinuities are not interpolated across visible scene edges, and a
@@ -61,8 +64,8 @@ command-line application.
 
 Every run also writes a `.fusion.json` report with alignment, RAW highlight
 confidence/counts, cleanup availability and correction statistics, per-module
-crosstalk fit/validation measurements, coverage, photometric, and timing
-diagnostics.
+crosstalk fit/validation measurements, colour-profile weights and confidence,
+coverage, photometric, and timing diagnostics.
 
 ## Calibration
 
@@ -131,8 +134,9 @@ not require an 82 MP floating-point output allocation.
 - Capture-adaptive crosstalk estimates only a strongly regularised residual on
   the supplied factory mesh. The reference module remains the colour anchor,
   because one scene cannot identify its absolute error. Capture gain, exposure,
-  and AWB are recorded for analysis, but Chiaro does not yet select among
-  multiple factory families because no reliable family mapping is available.
+  and AWB are recorded for analysis. Colour conversion does select among the
+  explicitly labelled A/F11/D65 ForwardMatrix profiles, but crosstalk does not
+  invent or select undocumented matrix families.
   Spatial leakage kernels are intentionally deferred until residual diagnostics
   demonstrate leakage beyond the existing phase matrix.
 
@@ -141,6 +145,12 @@ not require an 82 MP floating-point output allocation.
 `pipeline::fuse` accepts an in-memory LRI, `FusionOptions`, an output path, and
 a progress callback. The processing stages use plain data structures so
 alignment and synthesis can also be inspected independently.
+
+`chiaro-color-profile` exports all factory and `gold_cc` colour records and
+performs leave-one-patch-out CIEDE2000 evaluation of the supplied ForwardMatrix,
+a robust linear fit, and a strongly regularized quadratic candidate. Candidate
+fits remain diagnostic unless held-out accuracy, neutrals, inter-module
+agreement, and real-image stability all improve.
 
 With a debug directory, `<camera>_highlight-uncertainty.png` marks recovered
 RAW samples by inverse confidence in addition to the depth, alignment, and

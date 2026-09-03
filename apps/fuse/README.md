@@ -21,7 +21,9 @@ chiaro-fuse capture.lri -o fused.png \
 ```
 
 The command writes `fused.png` and a neighbouring `fused.fusion.json`
-diagnostic report.
+diagnostic report. Its `color` section records the available factory
+illuminants, the reciprocal-temperature interpolation weights, confidence, and
+whether a held-out-validated Macbeth refit was used.
 
 Supply `calibration.lri` and `zoom_calib_v0.lri` whenever possible. Capture
 headers contain only part of the camera model; without device mirror-aiming and
@@ -64,6 +66,18 @@ Common options include:
   source-ownership maps, quantitative inverse-depth, log-colour depth, and
   colour-coded provenance control grids.
 
+Factory colour records can be inspected independently:
+
+```bash
+chiaro-color-profile calibration.lri -o colour-profile.json
+```
+
+The report preserves ColorMatrix, ForwardMatrix, grey ratios, all 24 Macbeth
+measurements, illuminant spectra, sensor spectra, and separate `gold_cc`
+records. It also compares the existing D65-only path, each illuminant's factory
+matrix, a robust linear refit, and a small regularized nonlinear candidate using
+leave-one-patch-out CIEDE2000 statistics. `--raw-only` skips the fitting pass.
+
 Run `chiaro-fuse --help` for all options.
 
 Fusion builds a calibrated multi-camera inverse-depth cost field after global
@@ -89,5 +103,10 @@ unclipped modules agree. The default adaptive crosstalk stage retains the
 factory 17x13 matrix mesh as a prior and fits only a small, white-balance-aware
 residual from smooth aligned regions. Display-ready output retains the smooth
 sensor-white shoulder as a final neutral safeguard.
+Factory colour conversion uses the capture white balance to interpolate the A,
+F11, and D65 profiles in mired space instead of forcing D65. A conservative
+Macbeth refit is reported but is promoted only if held-out accuracy, neutral
+stability, and inter-module consistency all improve; current device data keeps
+the supplied factory matrices.
 Night-sky captures may retain visible module boundaries. Use Chiaro Hotpixel
 and a stacker for astrophotography.
