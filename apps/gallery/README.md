@@ -65,12 +65,14 @@ Available pipelines:
   one 16-bit PNG plus a `.fusion.json` diagnostic report per capture. It uses
   the same pipeline as [`chiaro-fuse`](../fuse/README.md), defaults to the
   camera-justified maximum canvas (up to 82 MP), and exposes selectable
-  multi-camera resolution reconstruction and demosaicing. AMaZE is the default.
+  multi-camera resolution reconstruction, demosaicing, and an optional
+  `.chiaro-cleanup` profile. AMaZE is the default.
 - **Night stack** accepts only captures marked as night mode. It motion-aligns
   and denoises every temporal burst, then performs calibrated multi-camera
   fusion through [`chiaro-stack`](../stack/README.md). Its settings expose the
   motion rejection threshold, gyro seed, alignment refinement, calibration,
-  output resolution and colour, multi-camera reconstruction, demosaicing, adaptive RAW crosstalk,
+  output resolution and colour, multi-camera reconstruction, demosaicing,
+  optional per-frame `.chiaro-cleanup`, adaptive RAW crosstalk,
   flat-field/highlight corrections, compression, and resume behavior. Each PNG is accompanied by a
   `.night-fusion.json` diagnostic report. LMMSE is the night-stack default;
   IGV is the other noise-tolerant stack option.

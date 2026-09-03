@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chiaro_fusion::calibration::{CalibrationDatabase, LriMessages};
 use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::resolution::ResolutionReconstruction;
 use chiaro_hotpixel_core::{
+    cleanup::CleanupProfile,
     demosaic::DemosaicMethod,
     highlight::HighlightRecovery,
     hotpixel::HotpixelRec,
@@ -62,6 +63,11 @@ struct Cli {
     /// applied independently to every temporal frame.
     #[arg(long)]
     hotpixel_rec: Option<PathBuf>,
+
+    /// Camera-specific learned defect/line profile. Requires the exact
+    /// hotpixel.rec against which the profile was trained.
+    #[arg(long, value_name = "CAMERA.chiaro-cleanup")]
+    cleanup_profile: Option<PathBuf>,
 
     /// Device calibration overlays (calibration.lri, zoom_calib_v0.lri).
     #[arg(long = "calibration", value_name = "FILE")]
@@ -128,6 +134,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    validate_cleanup_pair(&cli.cleanup_profile, &cli.hotpixel_rec)?;
     let lri = mmap_file(&cli.input)?;
     if let Some(parent) = cli.output.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -137,6 +144,7 @@ fn main() -> Result<()> {
             reference: cli.reference.clone(),
             overlays: cli.overlays.clone(),
             hotpixel_rec: cli.hotpixel_rec.clone(),
+            cleanup_profile: cli.cleanup_profile.clone(),
             motion_sigma: cli.motion_sigma,
             gyro_seed: !cli.no_gyro_seed,
             threads: cli.threads,
@@ -174,6 +182,9 @@ fn main() -> Result<()> {
             report.temporal.len(),
             report.reference_frame
         );
+        for temporal in &report.temporal {
+            print_cleanup_summary(&temporal.camera, temporal);
+        }
         eprintln!(
             "robust detail/edge rejection: {:.2}% of compared non-reference samples",
             report.synthesis.edge_rejected_fraction * 100.0
@@ -235,6 +246,11 @@ fn main() -> Result<()> {
             .with_context(|| format!("capture has no {} frame", options.camera))?;
         options.severity_map =
             Some(rec.load_rotated_map(camera_id, frame.camera.width, frame.camera.height)?);
+        if let Some(cleanup_path) = &cli.cleanup_profile {
+            let cleanup = CleanupProfile::open(cleanup_path, &rec)?;
+            options.cleanup_profile = cleanup.load_camera(&frame.camera)?;
+            options.cleanup_profile_supplied = true;
+        }
     }
     eprintln!("stacking {} temporal frames…", options.camera);
     let result = stack_burst(&lri, &options)?;
@@ -271,7 +287,44 @@ fn main() -> Result<()> {
         result.report.mean_effective_frames,
         result.report.fallback_fraction * 100.0
     );
+    print_cleanup_summary(&result.report.camera, &result.report);
     eprintln!("report: {}", report_path.display());
+    Ok(())
+}
+
+fn print_cleanup_summary(camera: &str, report: &chiaro_stack::StackReport) {
+    let cleanup = &report.cleanup;
+    if !cleanup.profile_supplied {
+        return;
+    }
+    eprintln!(
+        "{camera} cleanup {} on {}/{} frames: temperature {:?}->{:?} C{}, defects {}, rows {}, columns {}, mean/max correction {:.3}/{:.3} RAW",
+        if cleanup.profile_available {
+            "available"
+        } else {
+            "not calibrated"
+        },
+        report.cleanup_frames_applied,
+        report.input_frames,
+        cleanup.correction.requested_temperature_c,
+        cleanup.correction.applied_temperature_c,
+        if cleanup.correction.temperature_clamped {
+            " (clamped)"
+        } else {
+            ""
+        },
+        cleanup.active_learned_defects,
+        cleanup.correction.active_rows,
+        cleanup.correction.active_columns,
+        cleanup.correction.mean_absolute_change,
+        cleanup.correction.maximum_absolute_change,
+    );
+}
+
+fn validate_cleanup_pair(cleanup: &Option<PathBuf>, hotpixel: &Option<PathBuf>) -> Result<()> {
+    if cleanup.is_some() && hotpixel.is_none() {
+        bail!("--cleanup-profile requires the corresponding --hotpixel-rec");
+    }
     Ok(())
 }
 
@@ -358,5 +411,22 @@ impl DisplayTreatment {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_profile_requires_hotpixel_rec() {
+        let cleanup = Some(PathBuf::from("camera.chiaro-cleanup"));
+        assert!(
+            validate_cleanup_pair(&cleanup, &None)
+                .unwrap_err()
+                .to_string()
+                .contains("--hotpixel-rec")
+        );
+        assert!(validate_cleanup_pair(&cleanup, &Some(PathBuf::from("hotpixel.rec"))).is_ok());
     }
 }

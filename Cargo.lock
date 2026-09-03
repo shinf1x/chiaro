@@ -551,6 +551,8 @@ dependencies = [
  "chiaro-fusion",
  "chiaro-hotpixel-core",
  "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

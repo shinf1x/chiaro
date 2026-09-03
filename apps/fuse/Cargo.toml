@@ -14,3 +14,5 @@ anyhow.workspace = true
 clap.workspace = true
 chiaro-fusion.workspace = true
 chiaro-hotpixel-core.workspace = true
+serde_json.workspace = true
+serde.workspace = true

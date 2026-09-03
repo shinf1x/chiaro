@@ -8,6 +8,12 @@ noise tables take priority, while device-matched calibration overlays fill
 missing sensor families or gain points. Monochrome modules use the factory
 panchromatic model rather than a Bayer colour channel.
 
+An optional loaded `.chiaro-cleanup` camera entry is applied through the shared
+RAW `FramePipeline` to every temporal source frame before sharpness measurement,
+alignment, or noise-aware fusion. Night fusion opens and validates the archive
+and bundled correction models once, then shares them across module stacks.
+Reports retain both a per-camera summary and every frame's correction statistics.
+
 The final mosaics use the shared selectable Simple, AMaZE, RCD, LMMSE, or IGV
 reconstruction. LMMSE is the night-stack default; IGV is the other
 noise-tolerant stack option, while RCD is intended for individual night-sky

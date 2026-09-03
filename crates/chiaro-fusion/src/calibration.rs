@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use chiaro::lri::{SensorNoiseProfile, inspect_lelr_block_header, parse_sensor_noise_profile};
 use chiaro_proto::{
     Message,
+    color_calibration::ColorCalibration,
     geometric_calibration::geometric_calibration::MirrorType,
     lightheader::LightHeader,
     matrix3x3f::Matrix3x3F,
@@ -133,6 +134,45 @@ fn point2(message: &Point2F) -> Vec2 {
         f64::from(message.x.unwrap_or(0.0)),
         f64::from(message.y.unwrap_or(0.0)),
     ]
+}
+
+fn color_profile(
+    color: &ColorCalibration,
+    provenance: ColorProfileProvenance,
+) -> Option<ColorProfile> {
+    let (kind, forward_matrix, rg_ratio, bg_ratio) = (
+        color.type_?,
+        color.forward_matrix.as_ref()?,
+        color.rg_ratio?,
+        color.bg_ratio?,
+    );
+    let profile = ColorProfile {
+        illuminant: kind.value(),
+        forward_matrix: matrix3(forward_matrix),
+        validated_matrix: None,
+        color_matrix: color.color_matrix.as_ref().map(matrix3),
+        rg_ratio: f64::from(rg_ratio),
+        bg_ratio: f64::from(bg_ratio),
+        macbeth_data: color.macbeth_data.iter().map(point3).collect(),
+        illuminant_spd: color.illuminant_spd.iter().map(point2).collect(),
+        spectral_data: color
+            .spectral_data
+            .as_ref()
+            .map(|spectral| SpectralProfile {
+                format: spectral.format.map(|value| value.value()),
+                channels: spectral
+                    .channel_data
+                    .iter()
+                    .map(|channel| SpectralChannel {
+                        start_nm: channel.start,
+                        end_nm: channel.end,
+                        values: channel.data.clone(),
+                    })
+                    .collect(),
+            }),
+        provenance,
+    };
+    Some(profile)
 }
 
 /// One calibrated focus state.
@@ -274,8 +314,37 @@ pub struct PolynomialDistortion {
 pub struct ColorProfile {
     pub illuminant: i32,
     pub forward_matrix: Mat3,
+    /// Macbeth-derived replacement accepted by held-out validation. Kept
+    /// separate so the factory matrix remains the unconditional fallback.
+    pub validated_matrix: Option<Mat3>,
+    pub color_matrix: Option<Mat3>,
     pub rg_ratio: f64,
     pub bg_ratio: f64,
+    /// Linear, pre-white-balance camera RGB in ColorChecker row-major order.
+    pub macbeth_data: Vec<Vec3>,
+    /// Explicit wavelength/value pairs when supplied by the calibration.
+    pub illuminant_spd: Vec<Vec2>,
+    pub spectral_data: Option<SpectralProfile>,
+    pub provenance: ColorProfileProvenance,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpectralProfile {
+    pub format: Option<i32>,
+    pub channels: Vec<SpectralChannel>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpectralChannel {
+    pub start_nm: Option<u32>,
+    pub end_nm: Option<u32>,
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorProfileProvenance {
+    Module,
+    Gold,
 }
 
 /// Flat-field gain mesh: nodes span the sensor inclusively (`columns` across
@@ -529,6 +598,9 @@ pub struct CalibrationDatabase {
     /// Gain-indexed sensor noise profiles. Earlier headers take priority at a
     /// duplicate gain; device-matched overlays supplement missing points.
     pub sensor_noise_profiles: HashMap<u64, SensorNoiseProfile>,
+    /// Separate reference-camera target measurements. They are retained for
+    /// diagnostics but never substituted for a physical module implicitly.
+    pub gold_color: BTreeMap<String, Vec<ColorProfile>>,
 }
 
 impl CalibrationDatabase {
@@ -580,24 +652,13 @@ impl CalibrationDatabase {
                         ..Default::default()
                     });
                 for color in &item.color {
-                    if let (Some(kind), Some(matrix), Some(rg), Some(bg)) = (
-                        color.type_,
-                        color.forward_matrix.as_ref(),
-                        color.rg_ratio,
-                        color.bg_ratio,
-                    ) {
-                        let profile = ColorProfile {
-                            illuminant: kind.value(),
-                            forward_matrix: matrix3(matrix),
-                            rg_ratio: f64::from(rg),
-                            bg_ratio: f64::from(bg),
-                        };
-                        if !camera.color.iter().any(|existing| {
+                    if let Some(profile) = color_profile(color, ColorProfileProvenance::Module)
+                        && !camera.color.iter().any(|existing| {
                             existing.illuminant == profile.illuminant
                                 && existing.forward_matrix == profile.forward_matrix
-                        }) {
-                            camera.color.push(profile);
-                        }
+                        })
+                    {
+                        camera.color.push(profile);
                     }
                 }
                 if let Some(characterization) = item.vignetting.as_ref() {
@@ -703,6 +764,21 @@ impl CalibrationDatabase {
                         normalization: point2(normalization),
                         coeffs: polynomial.coeffs.iter().map(|&c| f64::from(c)).collect(),
                     });
+                }
+            }
+            for gold in &header.gold_cc {
+                let Some(id) = gold.camera_id else { continue };
+                let name = camera_name(id.value());
+                let profiles = db.gold_color.entry(name).or_default();
+                for color in &gold.data {
+                    if let Some(profile) = color_profile(color, ColorProfileProvenance::Gold)
+                        && !profiles.iter().any(|existing| {
+                            existing.illuminant == profile.illuminant
+                                && existing.forward_matrix == profile.forward_matrix
+                        })
+                    {
+                        profiles.push(profile);
+                    }
                 }
             }
         }

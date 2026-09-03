@@ -19,6 +19,9 @@ and Chiaro Gallery.
 The bundled sensor-family assets are compiled into the library. They contain no
 camera-specific defect coordinates, so callers still need the `hotpixel.rec`
 belonging to the camera being processed.
+Fuse, Stack, Night Fusion, and Gallery all use this same `FramePipeline` for an
+optional `.chiaro-cleanup` stage before highlight analysis, alignment, or
+temporal fusion.
 
 ## API
 

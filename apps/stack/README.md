@@ -22,6 +22,7 @@ lies outside the default 0.5 metre–10 kilometre interval.
 ```bash
 chiaro-stack capture.lri \
   --hotpixel-rec /path/to/hotpixel.rec \
+  --cleanup-profile /path/to/camera.chiaro-cleanup \
   --calibration /path/to/calibration.lri \
   --calibration /path/to/zoom_calib_v0.lri \
   --output capture-night.png
@@ -55,6 +56,10 @@ chiaro-stack capture.lri --camera A1 --output A1-night.png --diagnostics
 ```
 
 The factory hot-pixel file should come from the camera that made the capture.
+An optional `--cleanup-profile` must match that exact factory file. Its learned
+defect and line correction runs independently on every temporal RAW frame before
+sharpness selection or alignment; the archive and bundled models are loaded
+only once per run. Per-camera and per-frame results appear in the JSON report.
 `--diagnostics` also writes the selected reference image, an effective-frame
 count map, and a JSON report with alignment quality. Use `--linear` to preserve
 linear camera RGB for downstream processing. `--demosaic` accepts `simple`,

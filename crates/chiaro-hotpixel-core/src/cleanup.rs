@@ -126,6 +126,35 @@ pub struct CleanupCorrectionStats {
     pub maximum_absolute_change: f64,
 }
 
+/// Cleanup availability and correction statistics suitable for run reports.
+///
+/// Keeping availability separate from `applied` distinguishes an omitted
+/// profile from a supplied profile that has no calibration for this module.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CleanupDiagnostics {
+    pub profile_supplied: bool,
+    pub profile_available: bool,
+    /// Learned temperature-dependent defects active for this frame.
+    pub active_learned_defects: usize,
+    #[serde(flatten)]
+    pub correction: CleanupCorrectionStats,
+}
+
+impl CleanupDiagnostics {
+    pub fn new(
+        profile_supplied: bool,
+        profile_available: bool,
+        correction: CleanupCorrectionStats,
+    ) -> Self {
+        Self {
+            profile_supplied,
+            profile_available,
+            active_learned_defects: correction.temperature_active_hot_pixels,
+            correction,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CleanupState {
     temperature: f32,
@@ -1041,6 +1070,80 @@ fn write_profile_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        hotpixel::{HotpixelRec, write_hotpixel_rec},
+        pipeline::{CleanupStage, FramePipeline},
+    };
+
+    fn test_camera() -> RawCamera {
+        RawCamera {
+            id: 0,
+            name: "A1".to_owned(),
+            width: 4,
+            height: 4,
+            row_stride: 5,
+            absolute_offset: 0,
+            byte_len: 20,
+            pattern: SensorPattern::Bggr,
+            sensor_temperature_c: Some(30),
+            analog_gain: 2.0,
+            digital_gain: 1.0,
+            exposure_ns: 1_000_000,
+            black_level: 0.0,
+            white_level: 1023.0,
+        }
+    }
+
+    fn test_manifest(
+        camera: Option<CleanupCameraManifest>,
+        sha256: String,
+    ) -> CleanupProfileManifest {
+        CleanupProfileManifest {
+            format: PROFILE_FORMAT.to_owned(),
+            version: PROFILE_VERSION,
+            source: "test".to_owned(),
+            hotpixel_sha256: sha256,
+            severity_threshold: 16,
+            line_neighborhood_radius: 2,
+            cameras: camera.into_iter().collect(),
+        }
+    }
+
+    fn test_camera_manifest(camera: &RawCamera) -> CleanupCameraManifest {
+        CleanupCameraManifest {
+            camera: camera.name.clone(),
+            camera_index: camera.id,
+            width: camera.width,
+            height: camera.height,
+            pattern: camera.pattern.as_str().to_owned(),
+            frame_count: 3,
+            temperature_min_c: 20,
+            temperature_max_c: 40,
+            reference_temperature_c: 30.0,
+            temperature_model: "quadratic".to_owned(),
+            exposure_ns: camera.exposure_ns,
+            analog_gain: camera.analog_gain,
+            digital_gain: camera.digital_gain,
+            defects: "A1.defects".to_owned(),
+            lines: "A1.lines".to_owned(),
+            defect_count: 0,
+            hot_only_count: 0,
+            hot_or_dead_count: 0,
+            defect_layout: "test".to_owned(),
+            line_layout: "test".to_owned(),
+        }
+    }
+
+    fn test_line_coefficients(camera: &RawCamera) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((camera.width + camera.height) * LINE_ENTRY_BYTES);
+        for line in 0..camera.width + camera.height {
+            let reference_q8 = if line == 0 { 256i16 } else { 0 };
+            bytes.extend_from_slice(&reference_q8.to_le_bytes());
+            bytes.extend_from_slice(&0i16.to_le_bytes());
+            bytes.extend_from_slice(&0i16.to_le_bytes());
+        }
+        bytes
+    }
 
     #[test]
     fn cleanup_state_scales_exposure_and_both_gains() {
@@ -1120,6 +1223,138 @@ mod tests {
         assert_eq!(
             read_profile_entry(&path, "A1.defects").unwrap(),
             [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn valid_profile_changes_raw_while_disabled_cleanup_is_exactly_inert() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rec_path = temporary.path().join("hotpixel.rec");
+        write_hotpixel_rec(&rec_path, &[(4, 4, vec![0; 16])]).unwrap();
+        let rec = HotpixelRec::open(&rec_path).unwrap();
+        let camera = test_camera();
+        let profile_path = temporary.path().join("camera.chiaro-cleanup");
+        write_profile_archive(
+            &profile_path,
+            &test_manifest(Some(test_camera_manifest(&camera)), rec.sha256.clone()),
+            &[
+                ("A1.defects".to_owned(), Vec::new()),
+                ("A1.lines".to_owned(), test_line_coefficients(&camera)),
+            ],
+        )
+        .unwrap();
+        let profile = CleanupProfile::open(&profile_path, &rec).unwrap();
+        let loaded = profile.load_camera(&camera).unwrap().unwrap();
+        let severity = rec.load_rotated_map(0, 4, 4).unwrap();
+        let raw = vec![100; 16];
+        let disabled = FramePipeline::default()
+            .correct_raw(&camera, raw.clone(), &severity)
+            .unwrap();
+        assert_eq!(disabled.samples_q6, vec![100 * 64; 16]);
+        assert!(!disabled.cleanup.applied);
+
+        let corrected = FramePipeline {
+            cleanup: CleanupStage::Profile(&loaded),
+            ..FramePipeline::default()
+        }
+        .correct_raw(&camera, raw, &severity)
+        .unwrap();
+        assert!(corrected.cleanup.applied);
+        assert!(corrected.cleanup.mean_absolute_change > 0.0);
+        assert_eq!(&corrected.samples_q6[..4], &[99 * 64; 4]);
+        assert_eq!(&corrected.samples_q6[4..], &[100 * 64; 12]);
+    }
+
+    #[test]
+    fn profile_trained_against_another_factory_map_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_path = temporary.path().join("first.rec");
+        let second_path = temporary.path().join("second.rec");
+        write_hotpixel_rec(&first_path, &[(4, 4, vec![0; 16])]).unwrap();
+        write_hotpixel_rec(&second_path, &[(4, 4, vec![1; 16])]).unwrap();
+        let first = HotpixelRec::open(first_path).unwrap();
+        let second = HotpixelRec::open(second_path).unwrap();
+        let profile_path = temporary.path().join("camera.chiaro-cleanup");
+        write_profile_archive(&profile_path, &test_manifest(None, first.sha256), &[]).unwrap();
+        let error = CleanupProfile::open(profile_path, &second).unwrap_err();
+        assert!(error.to_string().contains("trained with factory map"));
+    }
+
+    #[test]
+    fn missing_camera_is_a_safe_not_calibrated_stage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rec_path = temporary.path().join("hotpixel.rec");
+        write_hotpixel_rec(&rec_path, &[(4, 4, vec![0; 16])]).unwrap();
+        let rec = HotpixelRec::open(rec_path).unwrap();
+        let profile_path = temporary.path().join("camera.chiaro-cleanup");
+        write_profile_archive(&profile_path, &test_manifest(None, rec.sha256.clone()), &[])
+            .unwrap();
+        let profile = CleanupProfile::open(profile_path, &rec).unwrap();
+        let camera = test_camera();
+        assert!(profile.load_camera(&camera).unwrap().is_none());
+        let corrected = FramePipeline {
+            cleanup: CleanupStage::from_loaded(true, None),
+            ..FramePipeline::default()
+        }
+        .correct_raw(&camera, vec![100; 16], &[0; 16])
+        .unwrap();
+        assert!(!corrected.cleanup.applied);
+        assert!(
+            corrected
+                .cleanup
+                .reason
+                .unwrap()
+                .contains("no entry for this camera")
+        );
+    }
+
+    #[test]
+    fn camera_dimensions_and_pattern_must_match_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rec_path = temporary.path().join("hotpixel.rec");
+        write_hotpixel_rec(&rec_path, &[(4, 4, vec![0; 16])]).unwrap();
+        let rec = HotpixelRec::open(rec_path).unwrap();
+        let camera = test_camera();
+        let dimensions_path = temporary.path().join("dimensions.chiaro-cleanup");
+        write_profile_archive(
+            &dimensions_path,
+            &test_manifest(Some(test_camera_manifest(&camera)), rec.sha256.clone()),
+            &[
+                ("A1.defects".to_owned(), Vec::new()),
+                ("A1.lines".to_owned(), test_line_coefficients(&camera)),
+            ],
+        )
+        .unwrap();
+        let dimensions_profile = CleanupProfile::open(dimensions_path, &rec).unwrap();
+        let mut wrong_dimensions = camera.clone();
+        wrong_dimensions.width += 1;
+        assert!(
+            dimensions_profile
+                .load_camera(&wrong_dimensions)
+                .unwrap_err()
+                .to_string()
+                .contains("metadata does not match")
+        );
+
+        let mut manifest = test_camera_manifest(&camera);
+        manifest.pattern = SensorPattern::Rggb.as_str().to_owned();
+        let profile_path = temporary.path().join("camera.chiaro-cleanup");
+        write_profile_archive(
+            &profile_path,
+            &test_manifest(Some(manifest), rec.sha256.clone()),
+            &[
+                ("A1.defects".to_owned(), Vec::new()),
+                ("A1.lines".to_owned(), test_line_coefficients(&camera)),
+            ],
+        )
+        .unwrap();
+        let profile = CleanupProfile::open(profile_path, &rec).unwrap();
+        assert!(
+            profile
+                .load_camera(&camera)
+                .unwrap_err()
+                .to_string()
+                .contains("metadata does not match")
         );
     }
 
