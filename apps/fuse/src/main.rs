@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
 use chiaro_fusion::calibration::IntrinsicsMode;
@@ -81,6 +81,11 @@ struct Cli {
     /// Factory hotpixel.rec; enables the hot-pixel stage.
     #[arg(long)]
     hotpixel_rec: Option<PathBuf>,
+
+    /// Camera-specific learned defect/line profile. Requires the exact
+    /// hotpixel.rec against which the profile was trained.
+    #[arg(long, value_name = "CAMERA.chiaro-cleanup")]
+    cleanup_profile: Option<PathBuf>,
 
     /// Device calibration overlays (calibration.lri, zoom_calib_v0.lri). Repeatable.
     #[arg(long = "calibration", value_name = "FILE")]
@@ -183,6 +188,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    validate_cleanup_pair(&cli.cleanup_profile, &cli.hotpixel_rec)?;
     let lri = mmap_file(&cli.input)?;
     let mut options = FusionOptions {
         reference: cli.reference.clone(),
@@ -195,6 +201,7 @@ fn main() -> Result<()> {
             rec,
             universal_model: !cli.no_universal_hotpixel_model,
             glow_correction: !cli.no_glow_correction,
+            cleanup_profile: cli.cleanup_profile.clone(),
         }),
         cameras: cli.camera.clone(),
         threads: cli.threads,
@@ -269,6 +276,30 @@ fn main() -> Result<()> {
             module.status
         );
     }
+    for (camera, cleanup) in &report.cleanup {
+        if cleanup.profile_supplied {
+            println!(
+                "  {camera:<3} cleanup {}: temperature {:?}->{:?} C{}, defects {}, rows {}, columns {}, mean/max correction {:.3}/{:.3} RAW",
+                if cleanup.profile_available {
+                    "available"
+                } else {
+                    "not calibrated"
+                },
+                cleanup.correction.requested_temperature_c,
+                cleanup.correction.applied_temperature_c,
+                if cleanup.correction.temperature_clamped {
+                    " (clamped)"
+                } else {
+                    ""
+                },
+                cleanup.active_learned_defects,
+                cleanup.correction.active_rows,
+                cleanup.correction.active_columns,
+                cleanup.correction.mean_absolute_change,
+                cleanup.correction.maximum_absolute_change,
+            );
+        }
+    }
     println!(
         "robust detail/edge rejection: {:.2}% of compared non-reference samples",
         report.synthesis.edge_rejected_fraction * 100.0
@@ -307,4 +338,28 @@ fn main() -> Result<()> {
         report.seconds.synthesize
     );
     Ok(())
+}
+
+fn validate_cleanup_pair(cleanup: &Option<PathBuf>, hotpixel: &Option<PathBuf>) -> Result<()> {
+    if cleanup.is_some() && hotpixel.is_none() {
+        bail!("--cleanup-profile requires the corresponding --hotpixel-rec");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_profile_requires_hotpixel_rec() {
+        let cleanup = Some(PathBuf::from("camera.chiaro-cleanup"));
+        assert!(
+            validate_cleanup_pair(&cleanup, &None)
+                .unwrap_err()
+                .to_string()
+                .contains("--hotpixel-rec")
+        );
+        assert!(validate_cleanup_pair(&cleanup, &Some(PathBuf::from("hotpixel.rec"))).is_ok());
+    }
 }

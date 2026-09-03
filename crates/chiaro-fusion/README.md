@@ -7,7 +7,10 @@ command-line application.
 ## Pipeline
 
 1. Decode each participating RAW module and optionally run the shared
-   hot-pixel and corner-glow correction pipeline. Detect near-clipped CFA
+   hot-pixel, camera-specific cleanup, and corner-glow correction pipeline.
+   A `.chiaro-cleanup` archive is validated against `hotpixel.rec`, opened once,
+   and its selected camera entries are applied before highlight analysis or
+   alignment. Detect near-clipped CFA
    measurements, reconstruct small edges locally, and use a clipping-aware RGB
    pyramid for larger low-confidence regions. One bit of fractional RAW
    precision is reserved as radiometric headroom above sensor white.
@@ -57,8 +60,9 @@ command-line application.
    introducing a hard highlight boundary.
 
 Every run also writes a `.fusion.json` report with alignment, RAW highlight
-confidence/counts, per-module crosstalk fit/validation measurements, coverage,
-photometric, and timing diagnostics.
+confidence/counts, cleanup availability and correction statistics, per-module
+crosstalk fit/validation measurements, coverage, photometric, and timing
+diagnostics.
 
 ## Calibration
 
@@ -78,7 +82,9 @@ diagnostic `--intrinsics clamp` mode freezes out-of-range captures at the
 nearest sample instead.
 
 `hotpixel.rec` is optional at the fusion API level, but when enabled it must
-belong to the same physical camera.
+belong to the same physical camera. A cleanup profile is also optional and can
+only be supplied as part of that hot-pixel stage because its manifest is tied
+cryptographically to the factory map.
 
 ## Output modes
 

@@ -27,6 +27,7 @@ const FIELD_OUTPUT: PickField = 1;
 const FIELD_HOTPIXEL_REC: PickField = 2;
 const FIELD_CALIBRATION: PickField = 3;
 const FIELD_ZOOM_CALIBRATION: PickField = 4;
+const FIELD_CLEANUP_PROFILE: PickField = 5;
 
 const NATIVE_PIXELS: u64 = 4160 * 3120;
 // Lumen's full-resolution 28 mm output is 10432 x 7824 (81.6 MP). Keep the
@@ -43,6 +44,7 @@ enum CanvasChoice {
 pub struct NightStackExport {
     output_dir: String,
     hotpixel_rec: CalibrationPath,
+    cleanup_profile: String,
     calibration: CalibrationPath,
     zoom_calibration: CalibrationPath,
     hotpixel_enabled: bool,
@@ -72,6 +74,7 @@ impl Default for NightStackExport {
         Self {
             output_dir,
             hotpixel_rec: CalibrationPath::default(),
+            cleanup_profile: String::new(),
             calibration: CalibrationPath::default(),
             zoom_calibration: CalibrationPath::default(),
             hotpixel_enabled: true,
@@ -106,6 +109,8 @@ impl NightStackExport {
                 .hotpixel_enabled
                 .then(|| self.hotpixel_rec.path())
                 .flatten(),
+            cleanup_profile: (!self.cleanup_profile.trim().is_empty())
+                .then(|| PathBuf::from(self.cleanup_profile.trim())),
             motion_sigma: self.motion_sigma,
             gyro_seed: self.gyro_seed,
             flat_field: self.flat_field,
@@ -200,6 +205,24 @@ impl ExportPipeline for NightStackExport {
             );
             calibration_status(ui, services, &self.hotpixel_rec, "hotpixel.rec");
         }
+        path_row(
+            ui,
+            services,
+            &mut self.cleanup_profile,
+            PathRow {
+                field: FIELD_CLEANUP_PROFILE,
+                hint: if self.hotpixel_enabled {
+                    "Optional camera-specific .chiaro-cleanup profile"
+                } else {
+                    ".chiaro-cleanup requires hot-pixel removal"
+                },
+                title: "Choose the camera's cleanup profile",
+                kind: PickKind::File {
+                    filter: Some(("Chiaro cleanup profile", &["chiaro-cleanup"])),
+                },
+                clearable: true,
+            },
+        );
         path_row(
             ui,
             services,
@@ -368,6 +391,7 @@ impl ExportPipeline for NightStackExport {
         match field {
             FIELD_OUTPUT => self.output_dir = path.display().to_string(),
             FIELD_HOTPIXEL_REC => self.hotpixel_rec.set_manual(path),
+            FIELD_CLEANUP_PROFILE => self.cleanup_profile = path.display().to_string(),
             FIELD_CALIBRATION => self.calibration.set_manual(path),
             FIELD_ZOOM_CALIBRATION => self.zoom_calibration.set_manual(path),
             _ => {}
@@ -395,6 +419,17 @@ impl ExportPipeline for NightStackExport {
                     return Err("hotpixel.rec was not found at that path".to_owned());
                 }
                 _ => {}
+            }
+        }
+        if !self.cleanup_profile.trim().is_empty() {
+            if !self.hotpixel_enabled {
+                return Err(
+                    "A cleanup profile requires hot-pixel removal and its matching hotpixel.rec"
+                        .to_owned(),
+                );
+            }
+            if !Path::new(self.cleanup_profile.trim()).is_file() {
+                return Err("The .chiaro-cleanup profile was not found at that path".to_owned());
             }
         }
         for (field, name) in [
@@ -510,10 +545,11 @@ fn run_job(
     let _ = fs::write(
         output_root.join("night-export-log.txt"),
         format!(
-            "Chiaro Gallery night-stack export\nhotpixel.rec: {}\ncalibration: {} / {}\n\
+            "Chiaro Gallery night-stack export\nhotpixel.rec: {}\ncleanup profile: {}\ncalibration: {} / {}\n\
              motion rejection: {:.1} sigma, gyro seed: {}, refinement: {}\n\
              canvas: {:?}, crop to framing: {}, demosaicing: {}, RAW highlight recovery: {}, RAW crosstalk: {}, output color: {:?}\n\n{}\n",
             export.hotpixel_rec.value.trim(),
+            export.cleanup_profile.trim(),
             export.calibration.value.trim(),
             export.zoom_calibration.value.trim(),
             export.motion_sigma,
@@ -647,6 +683,34 @@ mod tests {
         export.motion_sigma = 4.0;
         export.calibration.value = dir.path().join("missing.lri").display().to_string();
         assert!(export.validate().unwrap_err().contains("calibration.lri"));
+    }
+
+    #[test]
+    fn cleanup_picker_requires_and_forwards_hotpixel_calibration() {
+        let dir = tempfile::tempdir().unwrap();
+        let cleanup = dir.path().join("camera.chiaro-cleanup");
+        let rec = dir.path().join("hotpixel.rec");
+        fs::write(&cleanup, []).unwrap();
+        fs::write(&rec, []).unwrap();
+        let mut export = NightStackExport {
+            output_dir: dir.path().join("out").display().to_string(),
+            cleanup_profile: cleanup.display().to_string(),
+            hotpixel_enabled: false,
+            ..NightStackExport::default()
+        };
+        assert!(
+            export
+                .validate()
+                .unwrap_err()
+                .contains("requires hot-pixel")
+        );
+        export.hotpixel_enabled = true;
+        export.hotpixel_rec.set_manual(rec);
+        assert!(export.validate().is_ok());
+        assert_eq!(
+            export.options().cleanup_profile.as_deref(),
+            Some(cleanup.as_path())
+        );
     }
 
     #[test]

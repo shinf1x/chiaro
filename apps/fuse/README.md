@@ -15,6 +15,7 @@ cargo install --git https://github.com/shinf1x/chiaro.git chiaro-fuse
 ```bash
 chiaro-fuse capture.lri -o fused.png \
   --hotpixel-rec hotpixel.rec \
+  --cleanup-profile camera.chiaro-cleanup \
   --calibration calibration.lri \
   --calibration zoom_calib_v0.lri
 ```
@@ -26,13 +27,17 @@ Supply `calibration.lri` and `zoom_calib_v0.lri` whenever possible. Capture
 headers contain only part of the camera model; without device mirror-aiming and
 remaining geometry data, cross-module alignment is likely to be poor.
 If `hotpixel.rec` is used, it must belong to the same physical camera as the
-capture.
+capture. `--cleanup-profile` optionally applies learned temperature-, exposure-,
+and gain-dependent defect and row/column correction before highlight recovery
+and alignment. It requires the exact `hotpixel.rec` used to train the profile.
 
 Common options include:
 
 - `--canvas native|max|<scale>` controls output resolution; maximum is the
   default;
 - `--max-megapixels` caps maximum-mode output at 82 MP by default;
+- `--cleanup-profile` applies an optional `.chiaro-cleanup` calibration and
+  records per-module availability and correction statistics in the report;
 - `--resolution-reconstruction resample|multi-camera` selects ordinary pull
   resampling or locally aligned, multiscale physical-sample reconstruction.
   The latter gives high-frequency ownership to the finest verified optical

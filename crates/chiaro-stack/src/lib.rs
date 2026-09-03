@@ -8,7 +8,7 @@
 
 pub mod fusion;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use chiaro::lri::{
@@ -21,13 +21,14 @@ use chiaro_fusion::{
     math::{self, Mat3},
 };
 use chiaro_hotpixel_core::{
+    cleanup::{CleanupCameraProfile, CleanupDiagnostics},
     demosaic::{DemosaicMethod, demosaic},
     highlight::{
         HighlightRecovery, HighlightRecoveryReport, HighlightRecoveryState,
         recover_bayer_highlights,
     },
     parallel::map_row_bands,
-    pipeline::FramePipeline,
+    pipeline::{CleanupStage, FramePipeline},
     thermal::ThermalProfile,
     universal_hotpixel::UniversalHotpixelProfile,
 };
@@ -42,6 +43,16 @@ pub struct StackOptions {
     /// Factory severity map in decoded stream order. An all-zero map is used
     /// when omitted, leaving factory hot-pixel correction inactive.
     pub severity_map: Option<Vec<u8>>,
+    /// Whether a `.chiaro-cleanup` archive was supplied for this run. This is
+    /// kept separately so a profile without this selected camera is reported
+    /// as `NotCalibrated` instead of looking disabled.
+    pub cleanup_profile_supplied: bool,
+    /// Camera entry loaded once from the validated cleanup archive.
+    pub cleanup_profile: Option<CleanupCameraProfile>,
+    /// Preloaded bundled models. Night fusion shares these across physical
+    /// camera stacks so they are decoded only once per processing run.
+    pub universal_hotpixel_model: Option<Arc<UniversalHotpixelProfile>>,
+    pub thermal_model: Option<Arc<ThermalProfile>>,
     /// Force every physical module to use the same temporal reference.
     pub reference_frame: Option<u64>,
     /// Use the ordered row-indexed gyroscope packets as a soft rotation seed.
@@ -72,6 +83,10 @@ impl Default for StackOptions {
             },
             motion_sigma: 4.0,
             severity_map: None,
+            cleanup_profile_supplied: false,
+            cleanup_profile: None,
+            universal_hotpixel_model: None,
+            thermal_model: None,
             reference_frame: None,
             gyro_seed: true,
             focal_px: None,
@@ -92,6 +107,7 @@ pub struct FrameReport {
     pub is_reference: bool,
     pub accepted: bool,
     pub alignment: AlignmentReport,
+    pub cleanup: CleanupDiagnostics,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,6 +117,10 @@ pub struct StackReport {
     pub input_frames: usize,
     pub accepted_frames: usize,
     pub reference_frame: u64,
+    /// Cleanup result for the selected reference frame. Per-frame values
+    /// follow in `frames` when temperatures or exposure settings differ.
+    pub cleanup: CleanupDiagnostics,
+    pub cleanup_frames_applied: usize,
     pub motion_sigma: f32,
     pub noise_model_gain: Option<u32>,
     /// Predicted variance around 5% linear signal after temporal averaging.
@@ -144,6 +164,7 @@ struct PreparedFrame {
     luminance: Plane,
     sharpness: f32,
     noise_model: Option<NoiseModel>,
+    cleanup: CleanupDiagnostics,
 }
 
 struct AlignedFrame {
@@ -237,6 +258,9 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         .checked_mul(first.height)
         .context("frame dimensions overflow")?;
     let severity = options.severity_map.as_deref().unwrap_or(&[]);
+    if options.cleanup_profile_supplied && options.severity_map.is_none() {
+        bail!("a cleanup profile requires the corresponding hotpixel.rec factory map");
+    }
     if !severity.is_empty() && severity.len() != sample_count {
         bail!("hotpixel severity map dimensions do not match the selected camera");
     }
@@ -246,19 +270,29 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
     // camera's factory map also enables the bundled sensor-family corrections.
     // Long, high-gain night frames are precisely where uncorrected corner glow
     // can turn a global colour transform into a strong magenta cast.
-    let universal = options
-        .severity_map
-        .is_some()
-        .then(UniversalHotpixelProfile::bundled)
-        .transpose()?;
-    let thermal = options
-        .severity_map
-        .is_some()
-        .then(ThermalProfile::bundled)
-        .transpose()?;
+    let universal = if options.severity_map.is_some() {
+        Some(match &options.universal_hotpixel_model {
+            Some(profile) => Arc::clone(profile),
+            None => Arc::new(UniversalHotpixelProfile::bundled()?),
+        })
+    } else {
+        None
+    };
+    let thermal = if options.severity_map.is_some() {
+        Some(match &options.thermal_model {
+            Some(profile) => Arc::clone(profile),
+            None => Arc::new(ThermalProfile::bundled()?),
+        })
+    } else {
+        None
+    };
     let pipeline = FramePipeline {
-        universal_hotpixel: universal.as_ref(),
-        thermal: thermal.as_ref(),
+        universal_hotpixel: universal.as_deref(),
+        thermal: thermal.as_deref(),
+        cleanup: CleanupStage::from_loaded(
+            options.cleanup_profile_supplied,
+            options.cleanup_profile.as_ref(),
+        ),
         threads: options.threads,
         ..FramePipeline::default()
     };
@@ -282,6 +316,11 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             .with_context(|| {
                 format!("correct {} frame {}", frame.camera.name, frame.frame_index)
             })?;
+        let cleanup = CleanupDiagnostics::new(
+            options.cleanup_profile_supplied,
+            options.cleanup_profile.is_some(),
+            corrected.cleanup,
+        );
         let mosaic = Mosaic::from_stream_q6(
             corrected.samples_q6,
             frame.camera.width,
@@ -298,6 +337,7 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             luminance,
             sharpness,
             noise_model,
+            cleanup,
         });
     }
     let reference_index = match options.reference_frame {
@@ -504,6 +544,11 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         .iter()
         .map(|alignment| (alignment.frame_index, alignment.warp.clone()))
         .collect();
+    let cleanup = reference.cleanup.clone();
+    let cleanup_frames_applied = prepared
+        .iter()
+        .filter(|frame| frame.cleanup.correction.applied)
+        .count();
     let frames = prepared
         .iter()
         .zip(alignments)
@@ -514,6 +559,7 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             is_reference: frame.frame.frame_index == reference.frame.frame_index,
             accepted: alignment.accepted,
             alignment: alignment.report,
+            cleanup: frame.cleanup.clone(),
         })
         .collect();
     Ok(MosaicStackResult {
@@ -530,6 +576,8 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             input_frames: prepared.len(),
             accepted_frames,
             reference_frame: reference.frame.frame_index,
+            cleanup,
+            cleanup_frames_applied,
             motion_sigma: options.motion_sigma,
             noise_model_gain: noise_model.map(|model| model.gain),
             dark_noise_variance,
@@ -773,6 +821,67 @@ fn gray_to_rgb(gray: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chiaro::mock::{MockCamera, MockCapture};
+    use chiaro_hotpixel_core::{
+        cleanup::{BuildCleanupProfileOptions, CleanupProfile, build_cleanup_profile},
+        hotpixel::{HotpixelRec, write_hotpixel_rec},
+    };
+    use std::{collections::HashSet, fs, path::Path};
+
+    fn row_biased_camera(temperature: i32, frame_delta: u16) -> MockCamera {
+        let mut camera = MockCamera::gradient("A1", 64, 48, SensorPattern::Bggr, 80, 180);
+        camera.sensor_temperature_c = Some(temperature);
+        for (index, sample) in camera.samples.iter_mut().enumerate() {
+            let row_bias = if index / camera.width == 24 { 48 } else { 0 };
+            *sample = sample.saturating_add(row_bias + frame_delta).min(1023);
+        }
+        camera
+    }
+
+    fn build_cleanup_fixture(root: &Path) -> (HotpixelRec, CleanupProfile) {
+        let rec_path = root.join("hotpixel.rec");
+        write_hotpixel_rec(
+            &rec_path,
+            &(0..16)
+                .map(|_| (64, 48, vec![0; 64 * 48]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let rec = HotpixelRec::open(&rec_path).unwrap();
+        let training = root.join("training");
+        fs::create_dir(&training).unwrap();
+        for (index, temperature) in [20, 30, 40].into_iter().enumerate() {
+            let capture = MockCapture {
+                cameras: vec![row_biased_camera(temperature, 0)],
+                reference_camera: Some("A1".to_owned()),
+                ..MockCapture::default()
+            };
+            fs::write(
+                training.join(format!("dark-{index}.lri")),
+                capture.encode().unwrap(),
+            )
+            .unwrap();
+        }
+        let profile_path = root.join("camera.chiaro-cleanup");
+        build_cleanup_profile(
+            &BuildCleanupProfileOptions {
+                input: training,
+                output: profile_path.clone(),
+                recursive: false,
+                selected_cameras: HashSet::from(["A1".to_owned()]),
+                pattern_overrides: HashMap::new(),
+                overwrite: false,
+                severity_threshold: 16,
+                line_neighborhood_radius: 4,
+                max_frames_per_camera: None,
+            },
+            &rec,
+            |_| {},
+        )
+        .unwrap();
+        let profile = CleanupProfile::open(profile_path, &rec).unwrap();
+        (rec, profile)
+    }
 
     #[test]
     fn temporal_stack_defaults_to_lmmse() {
@@ -846,5 +955,65 @@ mod tests {
         };
         let integrated = integrate_gyro(&sequence, 0.5, 100, 0.02).unwrap();
         assert_eq!(integrated, [0.01, 0.02, 0.03]);
+    }
+
+    #[test]
+    fn mock_capture_can_represent_repeated_physical_frames() {
+        let camera = MockCamera::gradient("A1", 64, 48, SensorPattern::Bggr, 64, 700);
+        let capture = MockCapture {
+            cameras: vec![camera.clone(), camera.clone(), camera],
+            reference_camera: Some("A1".to_owned()),
+            ..MockCapture::default()
+        }
+        .encode()
+        .unwrap();
+        let layout = parse_frame_layout(&capture, &HashMap::new()).unwrap();
+        assert_eq!(
+            layout
+                .frames
+                .iter()
+                .filter(|frame| frame.camera.name == "A1")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn cleanup_is_applied_to_every_temporal_frame() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (rec, profile) = build_cleanup_fixture(temporary.path());
+        let capture = MockCapture {
+            cameras: vec![
+                row_biased_camera(30, 0),
+                row_biased_camera(30, 1),
+                row_biased_camera(30, 2),
+            ],
+            reference_camera: Some("A1".to_owned()),
+            ..MockCapture::default()
+        }
+        .encode()
+        .unwrap();
+        let layout = parse_frame_layout(&capture, &HashMap::new()).unwrap();
+        let camera = &layout.frames[0].camera;
+        let options = StackOptions {
+            camera: "A1".to_owned(),
+            severity_map: Some(
+                rec.load_rotated_map(camera.id, camera.width, camera.height)
+                    .unwrap(),
+            ),
+            cleanup_profile_supplied: true,
+            cleanup_profile: profile.load_camera(camera).unwrap(),
+            highlight_recovery: HighlightRecovery::None,
+            ..StackOptions::default()
+        };
+
+        let result = stack_mosaic_burst(&capture, &options).unwrap();
+        assert_eq!(result.report.frames.len(), 3);
+        assert!(result.report.frames.iter().all(|frame| {
+            frame.cleanup.profile_supplied
+                && frame.cleanup.profile_available
+                && frame.cleanup.correction.applied
+                && frame.cleanup.correction.mean_absolute_change > 0.0
+        }));
     }
 }

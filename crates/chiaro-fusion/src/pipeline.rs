@@ -15,6 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chiaro::lri::{RawCamera, parse_raw_layout};
 use chiaro_hotpixel_core::{
+    cleanup::{CleanupCameraProfile, CleanupDiagnostics, CleanupProfile},
     highlight::{HighlightRecoveryReport, HighlightRecoveryState, recover_bayer_highlights},
     hotpixel::HotpixelRec,
     pipeline::{CleanupStage, FramePipeline, extract_raw_plane_threaded},
@@ -46,6 +47,9 @@ pub struct HotpixelStage {
     pub rec: PathBuf,
     pub universal_model: bool,
     pub glow_correction: bool,
+    /// Optional camera-specific learned defect and line calibration. The
+    /// archive is validated against `rec` and opened once per fusion run.
+    pub cleanup_profile: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +120,8 @@ pub struct FusionReport {
     pub modules: Vec<AlignmentReport>,
     /// RAW-domain clipped-sample reconstruction performed per module.
     pub highlights: Vec<(String, HighlightRecoveryReport)>,
+    /// Camera-specific learned cleanup availability and correction results.
+    pub cleanup: Vec<(String, CleanupDiagnostics)>,
     /// Per-module factory-prior and capture-adaptive crosstalk fit.
     pub crosstalk: Vec<(String, AdaptiveCrosstalkReport)>,
     /// Per module: `(name, luminance gain, luminance offset)`.
@@ -249,8 +255,48 @@ struct LoadedModule {
     camera: Option<ResolvedCamera>,
     focus: ModuleFocusState,
     highlight: HighlightRecoveryState,
+    cleanup: CleanupDiagnostics,
     capture_gain: f32,
     exposure_ns: u64,
+}
+
+struct LoadedHotpixelModels {
+    rec: HotpixelRec,
+    universal: Option<UniversalHotpixelProfile>,
+    thermal: Option<ThermalProfile>,
+    cleanup_requested: bool,
+    cleanup_cameras: HashMap<usize, CleanupCameraProfile>,
+}
+
+fn correct_fusion_raw(
+    lri: &[u8],
+    raw: &RawCamera,
+    models: &LoadedHotpixelModels,
+    threads: usize,
+) -> Result<(Vec<u16>, CleanupDiagnostics)> {
+    let map = models
+        .rec
+        .load_rotated_map(raw.id, raw.width, raw.height)
+        .map_err(|e| anyhow::anyhow!("{}: {e:#}", raw.name))?;
+    let cleanup_camera = models.cleanup_cameras.get(&raw.id);
+    let pipeline = FramePipeline {
+        universal_hotpixel: models.universal.as_ref(),
+        thermal: models.thermal.as_ref(),
+        cleanup: CleanupStage::from_loaded(models.cleanup_requested, cleanup_camera),
+        threads,
+        ..FramePipeline::default()
+    };
+    let corrected = pipeline
+        .correct_lri(lri, raw, &map)
+        .map_err(|e| anyhow::anyhow!("{}: {e:#}", raw.name))?;
+    Ok((
+        corrected.samples_q6,
+        CleanupDiagnostics::new(
+            models.cleanup_requested,
+            cleanup_camera.is_some(),
+            corrected.cleanup,
+        ),
+    ))
 }
 
 /// Replace only low-confidence spatial reconstructions for which at least two
@@ -666,17 +712,40 @@ pub fn fuse(
 
     // Stage 1: hot-pixel removal per module, producing calibration-raster mosaics.
     let hotpixel_models = match &options.hotpixel {
-        Some(stage) => Some((
-            HotpixelRec::open(&stage.rec).map_err(|e| anyhow::anyhow!("hotpixel.rec: {e:#}"))?,
-            stage
-                .universal_model
-                .then(UniversalHotpixelProfile::bundled)
-                .transpose()?,
-            stage
-                .glow_correction
-                .then(ThermalProfile::bundled)
-                .transpose()?,
-        )),
+        Some(stage) => {
+            let rec = HotpixelRec::open(&stage.rec)
+                .map_err(|e| anyhow::anyhow!("hotpixel.rec: {e:#}"))?;
+            let cleanup = stage
+                .cleanup_profile
+                .as_ref()
+                .map(|path| CleanupProfile::open(path, &rec))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("cleanup profile: {e:#}"))?;
+            let mut cleanup_cameras = HashMap::new();
+            if let Some(profile) = &cleanup {
+                for camera in &selected {
+                    if let Some(camera_profile) = profile
+                        .load_camera(camera)
+                        .with_context(|| format!("load cleanup profile for {}", camera.name))?
+                    {
+                        cleanup_cameras.insert(camera.id, camera_profile);
+                    }
+                }
+            }
+            Some(LoadedHotpixelModels {
+                rec,
+                universal: stage
+                    .universal_model
+                    .then(UniversalHotpixelProfile::bundled)
+                    .transpose()?,
+                thermal: stage
+                    .glow_correction
+                    .then(ThermalProfile::bundled)
+                    .transpose()?,
+                cleanup_requested: cleanup.is_some(),
+                cleanup_cameras,
+            })
+        }
         None => None,
     };
     timings.load = started.elapsed().as_secs_f32();
@@ -688,28 +757,16 @@ pub fn fuse(
             detail: raw.name.clone(),
             fraction: 0.05 + 0.25 * index as f32 / selected.len() as f32,
         });
-        let samples_q6 = match &hotpixel_models {
-            Some((rec, universal, thermal)) => {
-                let map = rec
-                    .load_rotated_map(raw.id, raw.width, raw.height)
-                    .map_err(|e| anyhow::anyhow!("{}: {e:#}", raw.name))?;
-                let pipeline = FramePipeline {
-                    universal_hotpixel: universal.as_ref(),
-                    thermal: thermal.as_ref(),
-                    cleanup: CleanupStage::Disabled,
-                    threads: options.threads,
-                    ..FramePipeline::default()
-                };
-                pipeline
-                    .correct_lri(lri, raw, &map)
+        let (samples_q6, cleanup) = match &hotpixel_models {
+            Some(models) => correct_fusion_raw(lri, raw, models, options.threads)?,
+            None => (
+                extract_raw_plane_threaded(lri, raw, options.threads)
                     .map_err(|e| anyhow::anyhow!("{}: {e:#}", raw.name))?
-                    .samples_q6
-            }
-            None => extract_raw_plane_threaded(lri, raw, options.threads)
-                .map_err(|e| anyhow::anyhow!("{}: {e:#}", raw.name))?
-                .into_iter()
-                .map(|s| s << 6)
-                .collect(),
+                    .into_iter()
+                    .map(|s| s << 6)
+                    .collect(),
+                CleanupDiagnostics::default(),
+            ),
         };
         let mut mosaic = Mosaic::from_stream_q6(
             samples_q6,
@@ -769,6 +826,7 @@ pub fn fuse(
             camera,
             focus,
             highlight,
+            cleanup,
             capture_gain,
             exposure_ns,
         });
@@ -1184,6 +1242,10 @@ pub fn fuse(
             .iter()
             .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
             .collect(),
+        cleanup: modules
+            .iter()
+            .map(|module| (module.raw.name.clone(), module.cleanup.clone()))
+            .collect(),
         crosstalk: crosstalk_reports,
         gains: alignments
             .iter()
@@ -1207,7 +1269,24 @@ pub fn fuse(
 mod tests {
     use super::*;
     use chiaro::lri::SensorPattern;
-    use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryReport};
+    use chiaro::mock::{MockCamera, MockCapture};
+    use chiaro_hotpixel_core::{
+        cleanup::{BuildCleanupProfileOptions, CleanupProfile, build_cleanup_profile},
+        highlight::{HighlightRecovery, HighlightRecoveryReport},
+        hotpixel::write_hotpixel_rec,
+    };
+    use std::{collections::HashSet, fs};
+
+    fn row_biased_camera(temperature: i32) -> MockCamera {
+        let mut camera = MockCamera::gradient("A1", 64, 48, SensorPattern::Bggr, 80, 180);
+        camera.sensor_temperature_c = Some(temperature);
+        for (index, sample) in camera.samples.iter_mut().enumerate() {
+            if index / camera.width == 24 {
+                *sample = sample.saturating_add(48).min(1023);
+            }
+        }
+        camera
+    }
 
     #[test]
     fn framing_crop_is_relative_to_the_reference_camera_group() {
@@ -1335,5 +1414,97 @@ mod tests {
             .unwrap();
         assert!(recovered.value >= 65_000);
         assert!(recovered.confidence >= 180);
+    }
+
+    #[test]
+    fn fuse_cleanup_matches_the_shared_hotpixel_frame_pipeline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rec_path = temporary.path().join("hotpixel.rec");
+        write_hotpixel_rec(
+            &rec_path,
+            &(0..16)
+                .map(|_| (64, 48, vec![0; 64 * 48]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let rec = HotpixelRec::open(&rec_path).unwrap();
+        let training = temporary.path().join("training");
+        fs::create_dir(&training).unwrap();
+        for (index, temperature) in [20, 30, 40].into_iter().enumerate() {
+            let data = MockCapture {
+                cameras: vec![row_biased_camera(temperature)],
+                reference_camera: Some("A1".to_owned()),
+                ..MockCapture::default()
+            }
+            .encode()
+            .unwrap();
+            fs::write(training.join(format!("dark-{index}.lri")), data).unwrap();
+        }
+        let profile_path = temporary.path().join("camera.chiaro-cleanup");
+        build_cleanup_profile(
+            &BuildCleanupProfileOptions {
+                input: training,
+                output: profile_path.clone(),
+                recursive: false,
+                selected_cameras: HashSet::from(["A1".to_owned()]),
+                pattern_overrides: HashMap::new(),
+                overwrite: false,
+                severity_threshold: 16,
+                line_neighborhood_radius: 4,
+                max_frames_per_camera: None,
+            },
+            &rec,
+            |_| {},
+        )
+        .unwrap();
+        let cleanup = CleanupProfile::open(profile_path, &rec).unwrap();
+        let lri = MockCapture {
+            cameras: vec![row_biased_camera(30)],
+            reference_camera: Some("A1".to_owned()),
+            ..MockCapture::default()
+        }
+        .encode()
+        .unwrap();
+        let camera = parse_raw_layout(&lri, &HashMap::new()).unwrap().cameras[0].clone();
+        let loaded = cleanup.load_camera(&camera).unwrap().unwrap();
+        let mut models = LoadedHotpixelModels {
+            rec,
+            universal: None,
+            thermal: None,
+            cleanup_requested: true,
+            cleanup_cameras: HashMap::from([(camera.id, loaded)]),
+        };
+
+        let (fusion_samples, diagnostics) = correct_fusion_raw(&lri, &camera, &models, 1).unwrap();
+        let severity = models
+            .rec
+            .load_rotated_map(camera.id, camera.width, camera.height)
+            .unwrap();
+        let direct = FramePipeline {
+            cleanup: CleanupStage::Profile(models.cleanup_cameras.get(&camera.id).unwrap()),
+            threads: 1,
+            ..FramePipeline::default()
+        }
+        .correct_lri(&lri, &camera, &severity)
+        .unwrap();
+        assert_eq!(fusion_samples, direct.samples_q6);
+        assert_eq!(
+            diagnostics.correction.mean_absolute_change,
+            direct.cleanup.mean_absolute_change
+        );
+        assert!(diagnostics.profile_supplied);
+        assert!(diagnostics.profile_available);
+
+        models.cleanup_cameras.clear();
+        let (_, missing) = correct_fusion_raw(&lri, &camera, &models, 1).unwrap();
+        assert!(missing.profile_supplied);
+        assert!(!missing.profile_available);
+        assert!(
+            missing
+                .correction
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no entry for this camera"))
+        );
     }
 }

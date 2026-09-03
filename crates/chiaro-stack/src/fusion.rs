@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,9 +33,12 @@ use chiaro_fusion::{
     },
 };
 use chiaro_hotpixel_core::{
+    cleanup::CleanupProfile,
     demosaic::DemosaicMethod,
     highlight::{HighlightRecoveryReport, HighlightRecoveryState},
     hotpixel::HotpixelRec,
+    thermal::ThermalProfile,
+    universal_hotpixel::UniversalHotpixelProfile,
 };
 use serde::Serialize;
 
@@ -46,6 +50,7 @@ pub struct NightFusionOptions {
     pub cameras: Vec<String>,
     pub overlays: Vec<PathBuf>,
     pub hotpixel_rec: Option<PathBuf>,
+    pub cleanup_profile: Option<PathBuf>,
     pub intrinsics_mode: IntrinsicsMode,
     pub temporal_align: AlignOptions,
     pub module_align: AlignOptions,
@@ -66,6 +71,7 @@ impl Default for NightFusionOptions {
             cameras: Vec::new(),
             overlays: Vec::new(),
             hotpixel_rec: None,
+            cleanup_profile: None,
             intrinsics_mode: IntrinsicsMode::LinearHall,
             temporal_align: AlignOptions {
                 min_inlier_ratio: 0.30,
@@ -173,11 +179,31 @@ pub fn fuse_night(
         bail!("reference module {reference_name} is not selected");
     }
     names.sort_by_key(|name| (name != &reference_name, name.clone()));
+    if options.cleanup_profile.is_some() && options.hotpixel_rec.is_none() {
+        bail!("--cleanup-profile requires the corresponding --hotpixel-rec");
+    }
     let hotpixel = options
         .hotpixel_rec
         .as_ref()
         .map(HotpixelRec::open)
         .transpose()?;
+    let cleanup = match (&options.cleanup_profile, &hotpixel) {
+        (Some(path), Some(rec)) => Some(
+            CleanupProfile::open(path, rec)
+                .with_context(|| format!("open cleanup profile {}", path.display()))?,
+        ),
+        _ => None,
+    };
+    let universal = hotpixel
+        .is_some()
+        .then(UniversalHotpixelProfile::bundled)
+        .transpose()?
+        .map(Arc::new);
+    let thermal = hotpixel
+        .is_some()
+        .then(ThermalProfile::bundled)
+        .transpose()?
+        .map(Arc::new);
 
     let mut modules = Vec::with_capacity(names.len());
     let mut temporal_reports = Vec::with_capacity(names.len());
@@ -213,6 +239,12 @@ pub fn fuse_night(
             .map(|rec| rec.load_rotated_map(raw.id, raw.width, raw.height))
             .transpose()
             .with_context(|| format!("load hotpixel map for {name}"))?;
+        let cleanup_camera = cleanup
+            .as_ref()
+            .map(|profile| profile.load_camera(raw))
+            .transpose()
+            .with_context(|| format!("load cleanup profile for {name}"))?
+            .flatten();
         let motion_seeds = match (&shared_raw, shared_motion.is_empty()) {
             (Some(source), false) => scale_motion_warps(
                 &shared_motion,
@@ -229,6 +261,10 @@ pub fn fuse_night(
             align: options.temporal_align.clone(),
             motion_sigma: options.motion_sigma,
             severity_map,
+            cleanup_profile_supplied: cleanup.is_some(),
+            cleanup_profile: cleanup_camera,
+            universal_hotpixel_model: universal.clone(),
+            thermal_model: thermal.clone(),
             reference_frame: shared_reference_frame,
             gyro_seed: options.gyro_seed,
             focal_px: Some(focal),
