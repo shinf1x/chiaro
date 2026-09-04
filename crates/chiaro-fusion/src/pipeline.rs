@@ -25,6 +25,10 @@ use chiaro_hotpixel_core::{
 use serde::Serialize;
 
 use crate::align::{AlignInput, AlignOptions, AlignmentReport, ModuleAlignment, align_module};
+use crate::array_color::{
+    ArrayColorSelectionReport, ArrayColorSource, ColorProfileMode, ProfileBlend,
+    blended_profile as blended_array_profile, module_color_for_blend, select_array_profile,
+};
 use crate::calibration::{
     CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, ModuleFocusState,
     awb_gains, image_focal_length_mm, module_states,
@@ -66,6 +70,8 @@ pub struct FusionOptions {
     pub synth: SynthOptions,
     /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
     pub crosstalk: CrosstalkMode,
+    /// Factory colour-profile selection strategy.
+    pub color_profile: ColorProfileMode,
     /// Apply the factory vignetting meshes as flat-field gains.
     pub flat_field: bool,
     /// Fit a coarse per-module gain field (in addition to the global match)
@@ -92,6 +98,7 @@ impl Default for FusionOptions {
             align: AlignOptions::default(),
             synth: SynthOptions::default(),
             crosstalk: CrosstalkMode::default(),
+            color_profile: ColorProfileMode::default(),
             flat_field: true,
             local_photometric: true,
             crop_to_framing: true,
@@ -126,6 +133,8 @@ pub struct FusionReport {
     pub crosstalk: Vec<(String, AdaptiveCrosstalkReport)>,
     /// Illuminant estimate and factory colour-profile interpolation per module.
     pub color: Vec<ColorSelectionReport>,
+    /// Sparse aligned-overlap evidence used for the common profile blend.
+    pub array_color: ArrayColorSelectionReport,
     /// Per module: `(name, luminance gain, luminance offset)`.
     pub gains: Vec<(String, f32, f32)>,
     pub synthesis: SynthReport,
@@ -166,6 +175,7 @@ const GAIN_FIELD_ROWS: usize = 9;
 /// describe the reference module; a module with different D65 grey ratios
 /// gets them rescaled so a grey object stays grey in its own camera space.
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 struct IlluminantSelection {
     first: i32,
     second: i32,
@@ -174,6 +184,7 @@ struct IlluminantSelection {
     confidence: f64,
 }
 
+#[cfg(test)]
 fn illuminant_mired(illuminant: i32) -> Option<f64> {
     match illuminant {
         0 => Some(1_000_000.0 / 2_856.0),     // A
@@ -187,6 +198,7 @@ fn illuminant_mired(illuminant: i32) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
 fn illuminant_selection(
     reference: Option<&CameraCalibration>,
     recorded_wb: Option<[f32; 3]>,
@@ -266,6 +278,7 @@ fn illuminant_selection(
         .map(|(_, selection)| selection)
 }
 
+#[cfg(test)]
 fn blended_profile(
     calibration: Option<&CameraCalibration>,
     selection: IlluminantSelection,
@@ -303,6 +316,7 @@ fn blended_profile(
     ))
 }
 
+#[cfg(test)]
 fn module_color(
     module_name: &str,
     module: Option<&CameraCalibration>,
@@ -390,6 +404,49 @@ fn module_color(
             confidence: 0.0,
             fallback_reason: Some("no usable colour calibration or white balance".to_owned()),
         }
+    };
+    (color, report)
+}
+
+fn module_color_for_selection(
+    module_name: &str,
+    module: Option<&CameraCalibration>,
+    reference: Option<&CameraCalibration>,
+    recorded_wb: Option<[f32; 3]>,
+    blend: ProfileBlend,
+    estimated_mired: Option<f32>,
+    confidence: f32,
+) -> (ModuleColor, ColorSelectionReport) {
+    let profile = blended_array_profile(module, blend);
+    let color = module_color_for_blend(module, reference, recorded_wb, blend).unwrap_or_default();
+    let available_illuminants = module
+        .map(|calibration| {
+            calibration
+                .color
+                .iter()
+                .map(|profile| {
+                    crate::color_profile::illuminant_name(Some(profile.illuminant)).to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let report = ColorSelectionReport {
+        module: module_name.to_owned(),
+        available_illuminants,
+        selected_illuminants: blend.named_weights(),
+        estimated_mired,
+        profile_source: if !color.calibrated {
+            "uncalibrated_luminance_only"
+        } else if profile.is_some_and(|profile| profile.uses_validated_matrix) {
+            "blended_validated_and_factory_matrices"
+        } else if blend.named_weights().len() == 1 {
+            "factory_forward_matrix"
+        } else {
+            "interpolated_factory_forward_matrices"
+        },
+        confidence: if color.calibrated { confidence } else { 0.0 },
+        fallback_reason: (!color.calibrated)
+            .then_some("selected profile blend is unavailable for this module".to_owned()),
     };
     (color, report)
 }
@@ -1209,20 +1266,50 @@ pub fn fuse(
         }
     }
 
-    // Colour per module: infer an illuminant from the recorded neutral gains,
-    // interpolate factory profiles in reciprocal-temperature space, then
-    // transfer white balance from the reference through each module's ratios.
-    // Synthesis adapts the resulting D50 XYZ to D65.
+    // Colour per module: use sparse, reliable aligned overlap to select one
+    // common A/F11/D65 blend for the array. Recorded neutral gains remain a
+    // soft prior and the unconditional fallback when evidence is weak.
     let reference_calibration = calibration.cameras.get(&reference_name);
     let recorded_wb = awb_gains(&messages).map(|g| [g[0] as f32, g[1] as f32, g[2] as f32]);
+    progress(Progress {
+        stage: "color",
+        detail: "scoring sparse aligned factory-profile blends".to_owned(),
+        fraction: 0.53,
+    });
+    let array_sources = modules
+        .iter()
+        .zip(&alignments)
+        .map(|(module, alignment)| ArrayColorSource {
+            name: &module.raw.name,
+            mosaic: &module.mosaic,
+            highlight: &module.highlight,
+            alignment,
+            calibration: calibration.cameras.get(&module.raw.name),
+        })
+        .collect::<Vec<_>>();
+    let array_selection = select_array_profile(
+        &array_sources,
+        reference_index,
+        modules[reference_index].raw.width,
+        modules[reference_index].raw.height,
+        depth_map.as_ref(),
+        recorded_wb,
+        options.color_profile,
+    );
+    let selected_blend = array_selection.blend;
+    let selected_mired = array_selection.report.estimated_mired;
+    let selection_confidence = array_selection.report.confidence;
     let (module_colors, color_reports): (Vec<_>, Vec<_>) = modules
         .iter()
         .map(|module| {
-            module_color(
+            module_color_for_selection(
                 &module.raw.name,
                 calibration.cameras.get(&module.raw.name),
                 reference_calibration,
                 recorded_wb,
+                selected_blend,
+                selected_mired,
+                selection_confidence,
             )
         })
         .unzip();
@@ -1456,6 +1543,7 @@ pub fn fuse(
             .collect(),
         crosstalk: crosstalk_reports,
         color: color_reports,
+        array_color: array_selection.report,
         gains: alignments
             .iter()
             .map(|a| (a.name.clone(), a.gain, a.offset))

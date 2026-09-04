@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chiaro-proto",
  "memmap2",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-fuse"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chiaro-fusion",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-fusion"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chiaro",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-gallery"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chiaro",
  "chiaro-fusion",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-hotpixel"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chiaro",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-hotpixel-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -626,14 +626,14 @@ dependencies = [
 
 [[package]]
 name = "chiaro-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "protobuf",
 ]
 
 [[package]]
 name = "chiaro-stack"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chiaro",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "chiaro-stack-app"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chiaro",

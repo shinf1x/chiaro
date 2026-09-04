@@ -33,10 +33,19 @@ command-line application.
    falls back independently to the factory mesh for any module without enough
    evidence or a measurable validation improvement. Then reconstruct Bayer
    colour with the selected demosaicing method and apply
-   module-specific colour and flat-field calibration. The capture white balance
-   locates the scene between the factory A, F11, and D65 anchors in log neutral-
-   ratio space; their ForwardMatrices are interpolated by reciprocal colour
-   temperature and clamped outside the calibrated range. Match overlapping
+   module-specific colour and flat-field calibration. By default, Chiaro uses
+   the original D65 factory matrix with the capture's recorded white balance.
+   The experimental CCT-only mode interpolates between factory A, F11, and D65
+   anchors. The experimental array-aware mode additionally samples unclipped,
+   sufficiently bright and geometrically reliable aligned overlap, rejects
+   depth boundaries and unstable structure, and searches the 5%-step
+   A/F11/D65 simplex for the common profile blend with the lowest robust
+   inter-module chroma disagreement. This sparse search does not run complete
+   fusion for each candidate. It falls back to the CCT prior when
+   sample/module/spatial coverage is insufficient or the score surface is too
+   weak to support an override. It also reports per-profile chroma
+   distributions, D65-relative ratios, and chroma-normalized disagreement so
+   contraction bias can be evaluated without affecting selection. Match overlapping
    modules photometrically, and blend them into a 16-bit PNG. AMaZE is the
    default; Simple, RCD, LMMSE, and IGV are also available. Warp
    discontinuities are not interpolated across visible scene edges, and a
@@ -64,8 +73,19 @@ command-line application.
 
 Every run also writes a `.fusion.json` report with alignment, RAW highlight
 confidence/counts, cleanup availability and correction statistics, per-module
-crosstalk fit/validation measurements, colour-profile weights and confidence,
+crosstalk fit/validation measurements, the CCT prior and selected colour-profile
+weights, best/runner-up array scores, evidence coverage and confidence,
+report-only forced-profile chroma distributions and normalized disagreement,
 coverage, photometric, and timing diagnostics.
+
+The CCT-only and array-aware selectors and forced A/F11 modes are retained as
+experimental diagnostics. On the initial four-capture validation set, F11
+slightly reduced median chroma relative to D65 in every capture, while its
+inter-module disagreement advantage became small or reversed after normalizing
+by scene chroma. A increased both chroma and disagreement substantially. Thus
+none of the experimental choices has yet demonstrated a consistent improvement
+over D65, so the original fixed-D65 path remains the production default pending
+a broader calibrated corpus.
 
 ## Calibration
 
@@ -131,6 +151,10 @@ not require an 82 MP floating-point output allocation.
   every local raw channel is saturated. Multi-camera mode can recover such
   samples only inside reliable overlap where at least two unclipped modules
   agree. The final smooth shoulder remains as a neutral fallback.
+- Array-aware profile selection can identify the factory blend that makes the
+  participating modules agree; it cannot prove absolute scene colour from an
+  unknown spectrum. CCT/AWB therefore remains a soft plausibility prior and the
+  fallback whenever aligned evidence is sparse or ambiguous.
 - Capture-adaptive crosstalk estimates only a strongly regularised residual on
   the supplied factory mesh. The reference module remains the colour anchor,
   because one scene cannot identify its absolute error. Capture gain, exposure,

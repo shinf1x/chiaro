@@ -22,8 +22,10 @@ chiaro-fuse capture.lri -o fused.png \
 
 The command writes `fused.png` and a neighbouring `fused.fusion.json`
 diagnostic report. Its `color` section records the available factory
-illuminants, the reciprocal-temperature interpolation weights, confidence, and
-whether a held-out-validated Macbeth refit was used.
+illuminants, selected weights, confidence, and whether a held-out-validated
+Macbeth refit was used. `array_color` records the CCT prior, selected simplex
+blend, best and runner-up scores, reliable sample/module/spatial coverage, and
+fallback reason when the array evidence is weak.
 
 Supply `calibration.lri` and `zoom_calib_v0.lri` whenever possible. Capture
 headers contain only part of the camera model; without device mirror-aiming and
@@ -45,6 +47,10 @@ Common options include:
   The latter gives high-frequency ownership to the finest verified optical
   tier while retaining the reference camera's tone and colour. Locally sound
   detail may be recovered even from a module rejected for ordinary fusion;
+- `--factory-profile cct-only|array-aware|a|f11|d65` controls factory colour
+  selection. D65 preserves the original processing behavior and is the
+  default. CCT-only and array-aware remain experimental; A and F11 are fixed
+  diagnostic profiles;
 - `--no-crop` renders the full reference view instead of the framed field;
 - `--camera` selects modules and can be repeated;
 - `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction; AMaZE
@@ -103,8 +109,10 @@ unclipped modules agree. The default adaptive crosstalk stage retains the
 factory 17x13 matrix mesh as a prior and fits only a small, white-balance-aware
 residual from smooth aligned regions. Display-ready output retains the smooth
 sensor-white shoulder as a final neutral safeguard.
-Factory colour conversion uses the capture white balance to interpolate the A,
-F11, and D65 profiles in mired space instead of forcing D65. A conservative
+Factory colour conversion searches non-negative A/F11/D65 blends against
+reliable aligned inter-module chroma while retaining capture white balance/CCT
+as a soft prior and fallback. This distinguishes warm LED spectra from tungsten
+when their nominal colour temperatures are similar. A conservative
 Macbeth refit is reported but is promoted only if held-out accuracy, neutral
 stability, and inter-module consistency all improve; current device data keeps
 the supplied factory matrices.
