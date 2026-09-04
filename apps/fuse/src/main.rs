@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
+use chiaro_fusion::array_color::ColorProfileMode;
 use chiaro_fusion::calibration::IntrinsicsMode;
 use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
@@ -16,6 +17,27 @@ use chiaro_hotpixel_core::scan::mmap_file;
 enum Color {
     Display,
     Linear,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FactoryProfile {
+    CctOnly,
+    ArrayAware,
+    A,
+    F11,
+    D65,
+}
+
+impl From<FactoryProfile> for ColorProfileMode {
+    fn from(value: FactoryProfile) -> Self {
+        match value {
+            FactoryProfile::ArrayAware => Self::ArrayAware,
+            FactoryProfile::CctOnly => Self::CctOnly,
+            FactoryProfile::A => Self::ForceA,
+            FactoryProfile::F11 => Self::ForceF11,
+            FactoryProfile::D65 => Self::ForceD65,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -115,6 +137,11 @@ struct Cli {
 
     #[arg(long, value_enum, default_value = "display")]
     color: Color,
+
+    /// Use the original D65 factory profile, or select an experimental colour
+    /// profile mode.
+    #[arg(long, value_enum, default_value = "d65")]
+    factory_profile: FactoryProfile,
 
     /// Bayer reconstruction method.
     #[arg(long, value_enum, default_value = "amaze")]
@@ -228,6 +255,7 @@ fn main() -> Result<()> {
     options.synth.demosaic = cli.demosaic.into();
     options.synth.highlight_recovery = cli.highlight_recovery.into();
     options.crosstalk = cli.crosstalk;
+    options.color_profile = cli.factory_profile.into();
     options.synth.resolution_reconstruction = cli.resolution_reconstruction;
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
@@ -299,6 +327,37 @@ fn main() -> Result<()> {
                 cleanup.correction.maximum_absolute_change,
             );
         }
+    }
+    let array_color = &report.array_color;
+    println!(
+        "factory colour: {} selected {:?}; prior {:?}; samples {}, modules {}, spatial {:.1}%, confidence {:.3}{}",
+        array_color.mode,
+        array_color.selected_weights,
+        array_color.prior_weights,
+        array_color.sample_count,
+        array_color.target_modules,
+        array_color.spatial_coverage * 100.0,
+        array_color.confidence,
+        array_color
+            .fallback_reason
+            .as_ref()
+            .map_or(String::new(), |reason| format!("; fallback: {reason}")),
+    );
+    if let Some(best) = &array_color.best_candidate {
+        println!(
+            "  best {:?}: array {:.6}, prior {:.6}, total {:.6}",
+            best.weights, best.array_disagreement, best.cct_prior_penalty, best.total_score,
+        );
+    }
+    if let Some(second) = &array_color.second_best_candidate {
+        println!(
+            "  second {:?}: array {:.6}, prior {:.6}, total {:.6}; gap {:.8}",
+            second.weights,
+            second.array_disagreement,
+            second.cct_prior_penalty,
+            second.total_score,
+            array_color.score_difference.unwrap_or(0.0),
+        );
     }
     println!(
         "robust detail/edge rejection: {:.2}% of compared non-reference samples",

@@ -1490,7 +1490,7 @@ fn focus_consistency_weight(
 /// Compare colour independently of luminance. A defocused chromatic halo may
 /// preserve total luminance and therefore pass the structural checks; D50 XYZ
 /// chromaticity exposes that disagreement without rejecting exposure changes.
-fn chroma_consistency_weight(
+pub(crate) fn chroma_consistency_weight(
     reference: Option<[f32; 3]>,
     sample: Option<[f32; 3]>,
     is_reference: bool,
@@ -1501,20 +1501,26 @@ fn chroma_consistency_weight(
     let (Some(reference), Some(sample)) = (reference, sample) else {
         return 1.0;
     };
-    let chromaticity = |xyz: [f32; 3]| {
-        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
-        [xyz[0] / sum, xyz[2] / sum]
-    };
-    let reference_chroma = chromaticity(reference);
-    let sample_chroma = chromaticity(sample);
-    let difference =
-        (reference_chroma[0] - sample_chroma[0]).hypot(reference_chroma[1] - sample_chroma[1]);
+    let difference = chroma_distance(reference, sample);
     let relative = difference / 0.055;
     let robust = 1.0 / (1.0 + relative.powi(4));
     // Chroma is unstable in deep shadows. Fade the decision in using the
     // darker of the two samples instead of manufacturing coloured speckle.
     let reliability = smoothstep(reference[1].min(sample[1]) / 0.02);
     1.0 - reliability * (1.0 - robust)
+}
+
+/// D50 XYZ chromaticity distance used by both synthesis rejection and the
+/// sparse array-aware factory-profile selector. Sharing this definition keeps
+/// profile selection aligned with the disagreement the final fusion observes.
+pub(crate) fn chroma_distance(first: [f32; 3], second: [f32; 3]) -> f32 {
+    let chromaticity = |xyz: [f32; 3]| {
+        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
+        [xyz[0] / sum, xyz[2] / sum]
+    };
+    let first = chromaticity(first);
+    let second = chromaticity(second);
+    (first[0] - second[0]).hypot(first[1] - second[1])
 }
 
 /// Reference-space log-luminance structure sampled through one module's warp.
