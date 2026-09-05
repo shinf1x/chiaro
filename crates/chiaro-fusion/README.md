@@ -127,6 +127,26 @@ model or GPU. Local registration renders one half-resolution matching buffer
 at a time, and synthesis streams narrow output bands, so an 82 MP canvas does
 not require an 82 MP floating-point output allocation.
 
+`ResolutionReconstruction::JointCfa` is a real-capture experiment. It retains
+physical CFA phase, sensor position, calibrated noise, highlight provenance,
+geometry confidence, and camera identity, then solves a robust local-affine
+D50 XYZ field directly from corrected mosaic observations. The affine terms
+are important: a constant-colour neighbourhood would reduce error by blurring
+fine detail. The solver is tileable and does not retain a frame-sized normal
+system.
+
+`FusionOptions::cfa_held_out` provides the primary validation path. Named
+non-reference cameras remain available for geometry but are excluded from all
+reconstruction. Sparse output locations are projected into each held-out
+sensor and compared with its real, measured, unclipped CFA sites in units of
+calibrated noise. Reports separate R, Gr, Gb, B, smooth, high-frequency,
+luminance-like, and chroma-like errors for the current MultiCamera baseline and
+the joint solver. Production work should proceed only if this advantage repeats
+across captures, camera subsets, and held-out modules without a smooth-region
+or artifact regression. Resource diagnostics include peak resident memory,
+runtime per output megapixel, observations/cameras per solve, iterations, and
+physical sampling-phase spread.
+
 ## Important limitations
 
 - Alignment uses a global homography followed by classical dense multi-view
@@ -194,6 +214,8 @@ and unsupported nodes black. With default settings, finite final nodes are
 green: SGM proposes where to search but cannot create final depth by itself.
 
 See [Chiaro Fuse](../../apps/fuse/README.md) for command-line usage.
+See [the real-capture CFA experiment](CFA_EXPERIMENT.md) for the current
+held-out measurements, ablations, resource costs, and production decision.
 
 ## Tests
 

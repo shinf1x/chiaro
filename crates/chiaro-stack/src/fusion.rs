@@ -25,7 +25,7 @@ use chiaro_fusion::{
         RawHighlightSource, cross_camera_highlight_updates, group_equivalent_focal_mm,
         nominal_focal_px,
     },
-    resolution::{ResolutionReconstruction, refine_resolution_warp},
+    resolution::refine_resolution_warp,
     synth::{
         CanvasMode, ColorPipeline, CropWindow, GainField, ModuleColor, OutputColor, SynthOptions,
         SynthReport, SynthSource, auto_exposure, canvas_scale, photometric_field,
@@ -371,29 +371,32 @@ pub fn fuse_night(
     } else {
         None
     };
-    let resolution_warps =
-        if options.synth.resolution_reconstruction == ResolutionReconstruction::MultiCamera {
-            progress("refine local resolution alignment");
-            inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    if index == reference_index {
-                        None
-                    } else {
-                        Some(refine_resolution_warp(
-                            inputs[reference_index].luminance,
-                            input.luminance,
-                            &alignments[index].warp,
-                            inputs[reference_index].width,
-                            inputs[reference_index].height,
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![None; alignments.len()]
-        };
+    let resolution_warps = if options
+        .synth
+        .resolution_reconstruction
+        .uses_resolution_warps()
+    {
+        progress("refine local resolution alignment");
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                if index == reference_index {
+                    None
+                } else {
+                    Some(refine_resolution_warp(
+                        inputs[reference_index].luminance,
+                        input.luminance,
+                        &alignments[index].warp,
+                        inputs[reference_index].width,
+                        inputs[reference_index].height,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![None; alignments.len()]
+    };
     if options.synth.highlight_recovery.uses_multi_camera() {
         progress("recover cross-camera RAW highlights");
         let reference_dimensions = (
@@ -565,7 +568,11 @@ pub fn fuse_night(
         .map(
             |((((module, alignment), (color, gain_field)), magnification), resolution_warp)| {
                 SynthSource {
+                    camera_id: module.raw.id,
                     mosaic: &module.mosaic,
+                    highlight: &module.highlight,
+                    noise_model: None,
+                    held_out: false,
                     alignment,
                     resolution_warp: resolution_warp.as_ref(),
                     fusion_enabled: alignment.report.accepted,

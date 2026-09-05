@@ -42,16 +42,24 @@ Common options include:
 - `--max-megapixels` caps maximum-mode output at 82 MP by default;
 - `--cleanup-profile` applies an optional `.chiaro-cleanup` calibration and
   records per-module availability and correction statistics in the report;
-- `--resolution-reconstruction resample|multi-camera` selects ordinary pull
-  resampling or locally aligned, multiscale physical-sample reconstruction.
-  The latter gives high-frequency ownership to the finest verified optical
+- `--resolution-reconstruction resample|multi-camera|joint-cfa` selects ordinary
+  pull resampling, the production locally aligned multiscale reconstruction,
+  or the experimental pre-demosaic joint-CFA solver.
+  MultiCamera gives high-frequency ownership to the finest verified optical
   tier while retaining the reference camera's tone and colour. Locally sound
-  detail may be recovered even from a module rejected for ordinary fusion;
+  detail may be recovered even from a module rejected for ordinary fusion.
+  `joint-cfa` is an evaluation path, not a production recommendation yet;
+- `--cfa-held-out CAMERA` excludes a physical Bayer module from both baseline
+  and joint reconstruction, then reports how well each predicts that camera's
+  unseen real CFA measurements. Repeat it for camera-wise cross-validation;
 - `--factory-profile cct-only|array-aware|a|f11|d65` controls factory colour
   selection. D65 preserves the original processing behavior and is the
   default. CCT-only and array-aware remain experimental; A and F11 are fixed
   diagnostic profiles;
 - `--no-crop` renders the full reference view instead of the framed field;
+- `--crop X,Y,W,H` selects a reproducible reference-raster region for matched
+  diagnostic renders (use `--canvas 1` for one output pixel per reference
+  pixel);
 - `--camera` selects modules and can be repeated;
 - `--demosaic simple|amaze|rcd|lmmse|igv` selects Bayer reconstruction; AMaZE
   is the default, RCD is intended for individual night photos, and LMMSE or IGV
@@ -85,6 +93,34 @@ matrix, a robust linear refit, and a small regularized nonlinear candidate using
 leave-one-patch-out CIEDE2000 statistics. `--raw-only` skips the fitting pass.
 
 Run `chiaro-fuse --help` for all options.
+
+## Experimental cross-camera CFA validation
+
+Joint CFA reconstruction operates on corrected physical R/Gr/Gb/B sites before
+demosaicing. It robustly fits a compact local XYZ field from calibrated camera
+response rows, sensor-noise variance, highlight provenance, alignment
+confidence, and an edge-aligned Hann window. A local affine field is used so
+the test does not obtain lower error merely by averaging away edges. The
+implementation is deterministic, CPU-only, and independently tileable.
+
+The primary real-capture experiment keeps the normal MultiCamera render as the
+baseline and withholds one non-reference module:
+
+```bash
+chiaro-fuse capture.lri -o held-out-B2.png \
+  --resolution-reconstruction multi-camera \
+  --cfa-held-out B2
+```
+
+The neighbouring report contains noise-normalized robust prediction loss for
+the baseline and joint solver, split into R, Gr, Gb, B, luminance-like,
+chroma-like, smooth, and high-frequency samples. Positive relative improvement
+means the joint solver predicted measurements from a camera it never observed
+more accurately. Use multiple held-out cameras, captures, and camera subsets;
+contributor fit alone is not evidence of added resolution. Joint diagnostics
+also record attempted/support counts, observations and cameras per solve,
+sampling-phase spread, application confidence, solver iterations, contributor
+reprojection, peak resident memory, and total/synthesis time per megapixel.
 
 Fusion builds a calibrated multi-camera inverse-depth cost field after global
 alignment. Eight-direction semi-global matching proposes coarse hypotheses;

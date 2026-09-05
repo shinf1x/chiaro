@@ -15,6 +15,51 @@ use chiaro_hotpixel_core::highlight::HighlightRecoveryState;
 
 use crate::calibration::{CrosstalkMesh, VignettingMesh};
 
+/// Physical colour-filter phase. The two green lattices stay distinct so CFA
+/// experiments can detect phase-specific reconstruction errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum CfaPhase {
+    R,
+    Gr,
+    Gb,
+    B,
+}
+
+impl CfaPhase {
+    pub fn color_channel(self) -> usize {
+        match self {
+            Self::R => 0,
+            Self::Gr | Self::Gb => 1,
+            Self::B => 2,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::R => 0,
+            Self::Gr => 1,
+            Self::Gb => 2,
+            Self::B => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CorrectedCfaSample {
+    pub phase: CfaPhase,
+    /// Black-subtracted, sensor-white-normalized and flat-field-corrected.
+    pub value: f32,
+    /// Equivalently corrected sensor clipping level.
+    pub white: f32,
+    /// 255 is directly measured; lower values came from highlight recovery.
+    pub highlight_confidence: u8,
+    /// Normalized pre-crosstalk R/Gr/Gb/B measurements used to propagate the
+    /// calibrated sensor noise through the four-phase correction matrix.
+    pub source_values: [f32; 4],
+    pub crosstalk_row: [f32; 4],
+    pub flat_field: f32,
+}
+
 /// Q6 samples of one module in calibration raster order.
 pub struct Mosaic {
     pub width: usize,
@@ -138,6 +183,73 @@ impl Mosaic {
             .flat_map(|row| (0..2usize).map(move |column| (row, column)))
             .find(|&(row, column)| self.pattern.color_at(row, column) == 0)
             .unwrap_or((0, 0))
+    }
+
+    pub fn cfa_phase_at(&self, x: usize, y: usize) -> Option<CfaPhase> {
+        if self.is_mono() {
+            return None;
+        }
+        let (red_row, red_col) = self.red_position();
+        Some(match (y & 1 == red_row, x & 1 == red_col) {
+            (true, true) => CfaPhase::R,
+            (true, false) => CfaPhase::Gr,
+            (false, true) => CfaPhase::Gb,
+            (false, false) => CfaPhase::B,
+        })
+    }
+
+    /// Read one actual CFA site after the same RAW-domain crosstalk and
+    /// flat-field corrections used by synthesis, without demosaicing it.
+    pub fn corrected_cfa_site(
+        &self,
+        x: usize,
+        y: usize,
+        highlight: &HighlightRecoveryState,
+    ) -> Option<CorrectedCfaSample> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let phase = self.cfa_phase_at(x, y)?;
+        let (red_row, red_col) = self.red_position();
+        let offsets = [
+            (red_col, red_row),
+            (1 - red_col, red_row),
+            (red_col, 1 - red_row),
+            (1 - red_col, 1 - red_row),
+        ];
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        let values = std::array::from_fn::<_, 4, _>(|plane| {
+            let (column, row) = offsets[plane];
+            self.bilinear_plane(x as f32, y as f32, column, row, 2) - self.black_q6
+        });
+        let phase_index = phase.index();
+        let (value, white, crosstalk_row) = if let Some(crosstalk) = &self.crosstalk {
+            let matrix = crosstalk.matrix(x as f32, y as f32, self.width, self.height);
+            let row = &matrix[phase_index * 4..phase_index * 4 + 4];
+            (
+                row.iter().zip(values).map(|(m, v)| m * v).sum::<f32>(),
+                row.iter().sum::<f32>() * range,
+                [row[0], row[1], row[2], row[3]],
+            )
+        } else {
+            let mut row = [0.0; 4];
+            row[phase_index] = 1.0;
+            (values[phase_index], range, row)
+        };
+        let flat = self.flat_field(x as f32, y as f32);
+        Some(CorrectedCfaSample {
+            phase,
+            value: (value / range).max(0.0) * flat,
+            white: (white / range).max(0.0) * flat,
+            highlight_confidence: highlight
+                .confidence
+                .get(y * self.width + x)
+                .copied()
+                .unwrap_or(255),
+            source_values: values.map(|value| (value / range).max(0.0)),
+            crosstalk_row,
+            flat_field: flat,
+        })
     }
 
     /// Flat-field gain at a raster position (1 without calibration).

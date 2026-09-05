@@ -8,7 +8,7 @@ use chiaro_fusion::calibration::IntrinsicsMode;
 use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::resolution::ResolutionReconstruction;
-use chiaro_fusion::synth::{CanvasMode, OutputColor};
+use chiaro_fusion::synth::{CanvasMode, CropWindow, OutputColor};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::HighlightRecovery;
 use chiaro_hotpixel_core::scan::mmap_file;
@@ -121,6 +121,11 @@ struct Cli {
     #[arg(long)]
     camera: Vec<String>,
 
+    /// Exclude a module from reconstruction but retain it for experimental
+    /// held-out physical-CFA validation; repeatable.
+    #[arg(long)]
+    cfa_held_out: Vec<String>,
+
     /// Canvas size: `native` (13 MP), `max` (as the finest covering module
     /// allows, capped by --max-megapixels), or a number of canvas pixels per
     /// reference pixel.
@@ -134,6 +139,11 @@ struct Cli {
     /// Render the full wide frame instead of cropping to the framed focal length.
     #[arg(long)]
     no_crop: bool,
+
+    /// Explicit reference-raster crop as x,y,width,height. Intended for
+    /// reproducible matched diagnostic crops.
+    #[arg(long, value_name = "X,Y,W,H", conflicts_with = "no_crop")]
+    crop: Option<String>,
 
     #[arg(long, value_enum, default_value = "display")]
     color: Color,
@@ -231,6 +241,7 @@ fn main() -> Result<()> {
             cleanup_profile: cli.cleanup_profile.clone(),
         }),
         cameras: cli.camera.clone(),
+        cfa_held_out: cli.cfa_held_out.clone(),
         threads: cli.threads,
         flat_field: !cli.no_flat_field,
         debug_dir: cli.debug_dir.clone(),
@@ -241,6 +252,7 @@ fn main() -> Result<()> {
     options.align.depth.near_depth = cli.depth_near;
     options.align.depth.far_depth = cli.depth_far;
     options.crop_to_framing = !cli.no_crop;
+    options.crop = cli.crop.as_deref().map(parse_crop).transpose()?;
     options.synth.canvas =
         match cli.canvas.to_ascii_lowercase().as_str() {
             "native" => CanvasMode::Native,
@@ -374,6 +386,31 @@ fn main() -> Result<()> {
         resolution.mean_phase_spread,
         resolution.mean_confidence,
     );
+    if let Some(joint) = &report.synthesis.joint_cfa {
+        println!(
+            "joint CFA: {:.2}% of {} attempted points reconstructed (stride {}), {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; contributor improvement {:+.2}%",
+            joint.reconstructed_fraction * 100.0,
+            joint.attempted_pixels,
+            joint.sampling_stride,
+            joint.mean_observations_per_pixel,
+            joint.mean_cameras_per_pixel,
+            joint.mean_phase_spread,
+            joint.mean_application_weight * 100.0,
+            joint.mean_solver_iterations,
+            joint.mean_weighted_residual,
+            joint.contributor_relative_improvement * 100.0,
+        );
+    }
+    for held_out in &report.synthesis.held_out_cfa {
+        println!(
+            "held-out {}: baseline {:.4}, joint CFA {:.4}, improvement {:+.2}% over {} real CFA samples",
+            held_out.camera,
+            held_out.overall.baseline,
+            held_out.overall.joint_cfa,
+            held_out.overall.relative_improvement * 100.0,
+            held_out.overall.samples,
+        );
+    }
     for source in &report.synthesis.source_contributions {
         if let Some(local) = &source.resolution_alignment {
             println!(
@@ -396,6 +433,16 @@ fn main() -> Result<()> {
         report.seconds.align,
         report.seconds.synthesize
     );
+    println!(
+        "resources: {:.2} MP, {:.2}s/MP total, {:.2}s/MP synthesis{}",
+        report.resources.output_megapixels,
+        report.resources.total_seconds_per_megapixel,
+        report.resources.synthesis_seconds_per_megapixel,
+        report.resources.peak_resident_bytes.map_or_else(
+            || String::from(", peak RSS unavailable"),
+            |bytes| format!(", peak RSS {:.1} MiB", bytes as f64 / 1_048_576.0),
+        ),
+    );
     Ok(())
 }
 
@@ -404,6 +451,23 @@ fn validate_cleanup_pair(cleanup: &Option<PathBuf>, hotpixel: &Option<PathBuf>) 
         bail!("--cleanup-profile requires the corresponding --hotpixel-rec");
     }
     Ok(())
+}
+
+fn parse_crop(value: &str) -> Result<CropWindow> {
+    let values = value
+        .split(',')
+        .map(|part| part.trim().parse::<f32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("--crop expects four numbers x,y,width,height, not {value}"))?;
+    if values.len() != 4 {
+        bail!("--crop expects four numbers x,y,width,height, not {value}");
+    }
+    Ok(CropWindow {
+        x: values[0],
+        y: values[1],
+        width: values[2],
+        height: values[3],
+    })
 }
 
 #[cfg(test)]
@@ -420,5 +484,16 @@ mod tests {
                 .contains("--hotpixel-rec")
         );
         assert!(validate_cleanup_pair(&cleanup, &Some(PathBuf::from("hotpixel.rec"))).is_ok());
+    }
+
+    #[test]
+    fn explicit_crop_parses_reference_coordinates() {
+        let crop = parse_crop("12.5, 20, 640,480").unwrap();
+        assert_eq!(crop.x, 12.5);
+        assert_eq!(crop.y, 20.0);
+        assert_eq!(crop.width, 640.0);
+        assert_eq!(crop.height, 480.0);
+        assert!(parse_crop("1,2,3").is_err());
+        assert!(parse_crop("1,2,no,4").is_err());
     }
 }

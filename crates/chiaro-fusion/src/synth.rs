@@ -19,8 +19,9 @@
 //! canvas is never held in memory.
 
 use anyhow::{Result, bail};
+use chiaro::lri::NoiseModel;
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
-use chiaro_hotpixel_core::highlight::HighlightRecovery;
+use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryState};
 use chiaro_hotpixel_core::png16::{
     PngColor, samples_to_be_bytes, write_png16_streaming_atomic_with_level,
     write_rgb16_native_atomic,
@@ -28,6 +29,10 @@ use chiaro_hotpixel_core::png16::{
 use std::path::Path;
 
 use crate::align::ModuleAlignment;
+use crate::cfa::{
+    CfaObservation, HighlightProvenance, JointCfaEstimate, Visibility, camera_response,
+    corrected_noise_variance, solve_joint_xyz,
+};
 use crate::depth::DenseDepthMap;
 use crate::image::Mosaic;
 use crate::resolution::{
@@ -344,7 +349,12 @@ impl GainField {
 
 /// One module ready for synthesis.
 pub struct SynthSource<'a> {
+    pub camera_id: usize,
     pub mosaic: &'a Mosaic,
+    pub highlight: &'a HighlightRecoveryState,
+    pub noise_model: Option<NoiseModel>,
+    /// Retained only as an unseen physical validation camera.
+    pub held_out: bool,
     pub alignment: &'a ModuleAlignment,
     /// Locally verified mapping used only to retrieve high-frequency samples.
     /// The normal fusion path continues to use `alignment`.
@@ -416,6 +426,20 @@ struct ResolutionCounters {
     cameras_milli: std::sync::atomic::AtomicUsize,
     phase_spread_micro: std::sync::atomic::AtomicUsize,
     confidence_micro: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct JointCfaCounters {
+    attempted: std::sync::atomic::AtomicUsize,
+    reconstructed: std::sync::atomic::AtomicUsize,
+    observations: std::sync::atomic::AtomicUsize,
+    cameras: std::sync::atomic::AtomicUsize,
+    phase_spread_micro: std::sync::atomic::AtomicUsize,
+    application_weight_micro: std::sync::atomic::AtomicUsize,
+    iterations: std::sync::atomic::AtomicUsize,
+    residual_micro: std::sync::atomic::AtomicUsize,
+    contributor_baseline_micro: std::sync::atomic::AtomicUsize,
+    contributor_joint_micro: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -554,12 +578,105 @@ pub struct SynthReport {
     pub raw_highlight_recovery: HighlightRecovery,
     pub demosaic: DemosaicMethod,
     pub resolution_reconstruction: ResolutionReconstructionReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint_cfa: Option<JointCfaReconstructionReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub held_out_cfa: Vec<HeldOutCfaReport>,
     /// Fraction of non-reference samples rejected as strong photometric or
     /// local-detail contradictions. Agreeing modules remain fully blended.
     pub edge_rejected_fraction: f32,
     pub source_contributions: Vec<SourceContributionReport>,
     /// Reference/output pixel stride of the ownership diagnostics.
     pub ownership_diagnostic_step: usize,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct JointCfaReconstructionReport {
+    pub attempted_pixels: usize,
+    pub reconstructed_pixels: usize,
+    /// Fraction of attempted validation/output locations with sufficient
+    /// multi-camera, multi-phase support for a joint solve.
+    pub reconstructed_fraction: f32,
+    /// Output-pixel stride used for held-out validation (one in JointCfa mode).
+    pub sampling_stride: usize,
+    pub mean_observations_per_pixel: f32,
+    pub mean_cameras_per_pixel: f32,
+    pub mean_phase_spread: f32,
+    /// Mean edge/chromatic-detail confidence used to blend the experimental
+    /// estimate over the production baseline.
+    pub mean_application_weight: f32,
+    pub mean_solver_iterations: f32,
+    pub mean_weighted_residual: f32,
+    pub mean_contributor_baseline_loss: f32,
+    pub mean_contributor_joint_loss: f32,
+    pub contributor_relative_improvement: f32,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct CfaPredictionErrorReport {
+    pub samples: usize,
+    /// Mean robust loss of the noise-normalized residual.
+    pub baseline: f32,
+    pub joint_cfa: f32,
+    /// Positive means the joint reconstruction predicted unseen samples better.
+    pub relative_improvement: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct HeldOutCfaReport {
+    pub camera: String,
+    pub overall: CfaPredictionErrorReport,
+    pub phases: Vec<(crate::image::CfaPhase, CfaPredictionErrorReport)>,
+    pub luminance_like: CfaPredictionErrorReport,
+    pub chroma_like: CfaPredictionErrorReport,
+    pub smooth: CfaPredictionErrorReport,
+    pub high_frequency: CfaPredictionErrorReport,
+    /// Sensitivity to nearest-output sampling: maximum held-out sensor-space
+    /// distance in pixels and the corresponding nested error population.
+    pub mapping_error_bins: Vec<(f32, CfaPredictionErrorReport)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ErrorAccumulator {
+    samples: usize,
+    baseline: f64,
+    joint: f64,
+}
+
+impl ErrorAccumulator {
+    fn add(&mut self, baseline: f32, joint: f32) {
+        self.samples += 1;
+        self.baseline += f64::from(baseline);
+        self.joint += f64::from(joint);
+    }
+
+    fn report(self) -> CfaPredictionErrorReport {
+        let baseline = (self.baseline / self.samples.max(1) as f64) as f32;
+        let joint_cfa = (self.joint / self.samples.max(1) as f64) as f32;
+        CfaPredictionErrorReport {
+            samples: self.samples,
+            baseline,
+            joint_cfa,
+            relative_improvement: (baseline - joint_cfa) / baseline.max(1.0e-8),
+        }
+    }
+
+    fn combined(self, other: Self) -> Self {
+        Self {
+            samples: self.samples + other.samples,
+            baseline: self.baseline + other.baseline,
+            joint: self.joint + other.joint,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct HeldOutAccumulator {
+    overall: ErrorAccumulator,
+    phases: [ErrorAccumulator; 4],
+    smooth: ErrorAccumulator,
+    high_frequency: ErrorAccumulator,
+    mapping_error_bins: [ErrorAccumulator; 3],
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -629,6 +746,15 @@ pub fn synthesize(
     let edge_checked = std::sync::atomic::AtomicUsize::new(0);
     let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
     let resolution_counters = ResolutionCounters::default();
+    let joint_cfa_counters = JointCfaCounters::default();
+    let held_out_counters = (0..sources.len())
+        .map(|_| std::sync::Mutex::new(HeldOutAccumulator::default()))
+        .collect::<Vec<_>>();
+    let has_held_out = sources.iter().any(|source| source.held_out);
+    // Keep validation density in reference-image units. A tiny diagnostic
+    // canvas should not accidentally reduce a held-out experiment to a few
+    // dozen samples, while a full-resolution export need not solve every pixel.
+    let held_out_stride = (8.0 * scale).round().max(1.0) as usize;
     let source_counters = (0..usable.len())
         .map(|_| SourceCounters::default())
         .collect::<Vec<_>>();
@@ -688,6 +814,9 @@ pub fn synthesize(
                     let mut color_owner = None::<(usize, f32)>;
                     let mut reference_source_index = None;
                     for (source_index, source) in &band_sources {
+                        if source.held_out {
+                            continue;
+                        }
                         let Some(q) = source.alignment.warp.map(rx, ry) else {
                             continue;
                         };
@@ -760,8 +889,7 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
-                            if options.resolution_reconstruction
-                                == ResolutionReconstruction::MultiCamera
+                            if options.resolution_reconstruction.uses_resolution_warps()
                                 && let Some(projected) = projected_camera_luminance(
                                     source,
                                     rx,
@@ -838,8 +966,7 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
-                            if options.resolution_reconstruction
-                                == ResolutionReconstruction::MultiCamera
+                            if options.resolution_reconstruction.uses_resolution_warps()
                                 && let Some(projected) = projected_camera_luminance(
                                     source,
                                     rx,
@@ -1024,7 +1151,7 @@ pub fn synthesize(
                                 }
                             }
                         }
-                        let blended = if color_weight > 0.0 {
+                        let mut blended = if color_weight > 0.0 {
                             let mean = xyz.map(|v| v / color_weight);
                             if mean[1] > 1e-6 {
                                 mean.map(|v| v * target_luminance / mean[1])
@@ -1034,6 +1161,87 @@ pub fn synthesize(
                         } else {
                             D50_WHITE.map(|v| v * target_luminance)
                         };
+                        let baseline_xyz = blended;
+                        let validation_sample = has_held_out
+                            && u % held_out_stride == held_out_stride / 2
+                            && v % held_out_stride == held_out_stride / 2;
+                        let attempt_joint = validation_sample
+                            || options.resolution_reconstruction
+                                == ResolutionReconstruction::JointCfa;
+                        if attempt_joint {
+                            joint_cfa_counters
+                                .attempted
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let joint_estimate = attempt_joint
+                            .then(|| {
+                                joint_cfa_at(
+                                    sources,
+                                    rx,
+                                    ry,
+                                    scale,
+                                    baseline_xyz,
+                                    reference_structure,
+                                    options,
+                                )
+                            })
+                            .flatten();
+                        if let Some(estimate) = joint_estimate {
+                            joint_cfa_counters
+                                .reconstructed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            joint_cfa_counters.observations.fetch_add(
+                                estimate.report.observations,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.cameras.fetch_add(
+                                estimate.report.cameras,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.phase_spread_micro.fetch_add(
+                                (estimate.report.phase_spread.min(16.0) * 1_000_000.0) as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.application_weight_micro.fetch_add(
+                                (estimate.application_weight * 1_000_000.0) as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.iterations.fetch_add(
+                                estimate.report.iterations,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.residual_micro.fetch_add(
+                                (estimate.report.weighted_residual.min(64.0) * 1_000_000.0)
+                                    as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.contributor_baseline_micro.fetch_add(
+                                (estimate.report.contributor_baseline_loss.min(1_000.0)
+                                    * 1_000_000.0) as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            joint_cfa_counters.contributor_joint_micro.fetch_add(
+                                (estimate.report.contributor_joint_loss.min(1_000.0) * 1_000_000.0)
+                                    as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if options.resolution_reconstruction
+                                == ResolutionReconstruction::JointCfa
+                            {
+                                blended = estimate.xyz;
+                            }
+                        }
+                        if validation_sample && let Some(estimate) = joint_estimate {
+                            evaluate_held_out_cfa(
+                                sources,
+                                rx,
+                                ry,
+                                baseline_xyz,
+                                estimate.xyz,
+                                estimate.application_weight,
+                                &held_out_counters,
+                            );
+                        }
                         let rgb = color.apply(blended, options.color);
                         for c in 0..3 {
                             pixel[c] = (rgb[c].clamp(0.0, 1.0) * 65535.0).round() as u16;
@@ -1155,6 +1363,110 @@ pub fn synthesize(
             }
         })
         .collect();
+    let joint_cfa = (has_held_out
+        || options.resolution_reconstruction == ResolutionReconstruction::JointCfa)
+        .then(|| {
+            let attempted = joint_cfa_counters
+                .attempted
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let reconstructed = joint_cfa_counters
+                .reconstructed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let contributor_baseline = joint_cfa_counters
+                .contributor_baseline_micro
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as f32
+                / (reconstructed.max(1) * 1_000_000) as f32;
+            let contributor_joint = joint_cfa_counters
+                .contributor_joint_micro
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as f32
+                / (reconstructed.max(1) * 1_000_000) as f32;
+            JointCfaReconstructionReport {
+                attempted_pixels: attempted,
+                reconstructed_pixels: reconstructed,
+                reconstructed_fraction: fraction(reconstructed, attempted),
+                sampling_stride: if options.resolution_reconstruction
+                    == ResolutionReconstruction::JointCfa
+                {
+                    1
+                } else {
+                    held_out_stride
+                },
+                mean_observations_per_pixel: joint_cfa_counters
+                    .observations
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / reconstructed.max(1) as f32,
+                mean_cameras_per_pixel: joint_cfa_counters
+                    .cameras
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / reconstructed.max(1) as f32,
+                mean_phase_spread: joint_cfa_counters
+                    .phase_spread_micro
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / (reconstructed.max(1) * 1_000_000) as f32,
+                mean_application_weight: joint_cfa_counters
+                    .application_weight_micro
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / (reconstructed.max(1) * 1_000_000) as f32,
+                mean_solver_iterations: joint_cfa_counters
+                    .iterations
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / reconstructed.max(1) as f32,
+                mean_weighted_residual: joint_cfa_counters
+                    .residual_micro
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / (reconstructed.max(1) * 1_000_000) as f32,
+                mean_contributor_baseline_loss: contributor_baseline,
+                mean_contributor_joint_loss: contributor_joint,
+                contributor_relative_improvement: (contributor_baseline - contributor_joint)
+                    / contributor_baseline.max(1.0e-8),
+            }
+        });
+    let phases = [
+        crate::image::CfaPhase::R,
+        crate::image::CfaPhase::Gr,
+        crate::image::CfaPhase::Gb,
+        crate::image::CfaPhase::B,
+    ];
+    let held_out_cfa = sources
+        .iter()
+        .zip(&held_out_counters)
+        .filter(|(source, _)| source.held_out)
+        .filter_map(|(source, accumulator)| {
+            let accumulator = *accumulator.lock().ok()?;
+            Some(HeldOutCfaReport {
+                camera: source.alignment.name.clone(),
+                overall: accumulator.overall.report(),
+                phases: phases
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, phase)| (phase, accumulator.phases[index].report()))
+                    .collect(),
+                luminance_like: accumulator.phases[1]
+                    .combined(accumulator.phases[2])
+                    .report(),
+                chroma_like: accumulator.phases[0]
+                    .combined(accumulator.phases[3])
+                    .report(),
+                smooth: accumulator.smooth.report(),
+                high_frequency: accumulator.high_frequency.report(),
+                mapping_error_bins: [0.10_f32, 0.20, 0.40]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, threshold)| {
+                        (threshold, accumulator.mapping_error_bins[index].report())
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
     Ok(SynthReport {
         canvas_width: width,
         canvas_height: height,
@@ -1166,6 +1478,8 @@ pub fn synthesize(
         raw_highlight_recovery: options.highlight_recovery,
         demosaic: options.demosaic,
         resolution_reconstruction,
+        joint_cfa,
+        held_out_cfa,
         edge_rejected_fraction: fraction(
             edge_rejected.load(std::sync::atomic::Ordering::Relaxed),
             edge_checked.load(std::sync::atomic::Ordering::Relaxed),
@@ -1373,6 +1687,256 @@ fn projected_camera_luminance(
         support: fine_weight * local_confidence,
         phase: phase.map(|value| value / fine_weight),
     })
+}
+
+/// Gather actual Bayer sites from every accepted colour camera around one
+/// output point and solve their calibrated measurement equations jointly.
+/// The compact support keeps this independently tileable.
+fn joint_cfa_at(
+    sources: &[SynthSource<'_>],
+    rx: f32,
+    ry: f32,
+    scale: f32,
+    prior_xyz: [f32; 3],
+    reference_structure: Option<[f32; 3]>,
+    options: &SynthOptions,
+) -> Option<JointCfaEstimate> {
+    const SUPPORT_RADIUS: f32 = 1.65;
+    const PRIOR_WEIGHT: f32 = 0.025;
+    let mut observations = Vec::with_capacity(sources.len() * 12);
+    for (camera_index, source) in sources.iter().enumerate() {
+        if source.held_out
+            || !source.fusion_enabled
+            || source.mosaic.is_mono()
+            || !source.color.calibrated
+        {
+            continue;
+        }
+        let warp = source
+            .resolution_warp
+            .map_or(&source.alignment.warp, |refined| &refined.warp);
+        let geometry_confidence = warp.confidence(rx, ry) * source.confidence;
+        if geometry_confidence < 0.35 {
+            continue;
+        }
+        let Some(q) = warp.map(rx, ry) else {
+            continue;
+        };
+        let Some(inverse) = inverse_warp_jacobian(warp, rx, ry) else {
+            continue;
+        };
+        let radius = inverse.source_radius(SUPPORT_RADIUS * 1.5, scale);
+        if radius == 0 {
+            continue;
+        }
+        let centre_x = q[0].round() as isize;
+        let centre_y = q[1].round() as isize;
+        for sy in centre_y - radius as isize..=centre_y + radius as isize {
+            if sy < 0 || sy >= source.mosaic.height as isize {
+                continue;
+            }
+            for sx in centre_x - radius as isize..=centre_x + radius as isize {
+                if sx < 0 || sx >= source.mosaic.width as isize {
+                    continue;
+                }
+                let displacement = inverse.map(sx as f32 - q[0], sy as f32 - q[1]);
+                let output_offset = [displacement[0] * scale, displacement[1] * scale];
+                let spatial_weight = edge_aligned_hann_weight(
+                    output_offset[0],
+                    output_offset[1],
+                    SUPPORT_RADIUS,
+                    reference_structure,
+                );
+                if spatial_weight <= 0.0 {
+                    continue;
+                }
+                let Some(sample) =
+                    source
+                        .mosaic
+                        .corrected_cfa_site(sx as usize, sy as usize, source.highlight)
+                else {
+                    continue;
+                };
+                if sample.white <= 0.0 || sample.value >= sample.white * 0.995 {
+                    continue;
+                }
+                let field = source.gain_field.at(
+                    sx as f32,
+                    sy as f32,
+                    source.mosaic.width,
+                    source.mosaic.height,
+                );
+                let Some(response) = camera_response(&source.color, field, sample.phase) else {
+                    continue;
+                };
+                let gain = source.alignment.gain;
+                let value = (gain * (sample.value - source.alignment.offset)).max(0.0);
+                let code_range = (source.mosaic.white_q6 - source.mosaic.black_q6) / 64.0;
+                let variance = corrected_noise_variance(&sample, source.noise_model, code_range)
+                    * gain.powi(2);
+                observations.push(CfaObservation {
+                    camera_index,
+                    camera_id: source.camera_id,
+                    sensor_xy: [sx as u16, sy as u16],
+                    output_offset,
+                    phase: sample.phase,
+                    value,
+                    noise_variance: variance,
+                    highlight_provenance: HighlightProvenance::from_confidence(
+                        sample.highlight_confidence,
+                    ),
+                    highlight_confidence: sample.highlight_confidence,
+                    geometry_confidence,
+                    visibility: Visibility::Visible,
+                    response,
+                    spatial_weight,
+                });
+            }
+        }
+    }
+    let mut estimate = solve_joint_xyz(&observations, prior_xyz, PRIOR_WEIGHT)?;
+    if estimate.report.cameras < 2 || estimate.report.phase_mask.count_ones() < 3 {
+        return None;
+    }
+    // Joint CFA exists to recover supported spatial detail, not to replace the
+    // production fusion path with a noisier fit in flat fields. Luminance alone
+    // is insufficient: an isoluminant coloured edge must also open the gate.
+    let luminance_structure =
+        reference_structure.map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
+    let chroma_structure = sources
+        .iter()
+        .find(|source| source.reference)
+        .and_then(|source| source_chroma_structure(source, rx, ry, options))
+        .unwrap_or(0.0);
+    let luminance_weight = smoothstep((luminance_structure - 0.012) / (0.045 - 0.012));
+    let chroma_weight = smoothstep((chroma_structure - 0.010) / (0.045 - 0.010));
+    estimate.application_weight = luminance_weight.max(chroma_weight);
+    for (value, prior) in estimate.xyz.iter_mut().zip(prior_xyz) {
+        *value = prior + estimate.application_weight * (*value - prior);
+    }
+    Some(estimate)
+}
+
+fn source_chroma_structure(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<f32> {
+    const RADIUS: f32 = 1.5;
+    let chroma = |x, y| {
+        source_xyz(source, x, y, options).map(|xyz| {
+            let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
+            ([xyz[0] / sum, xyz[2] / sum], xyz[1])
+        })
+    };
+    let centre = chroma(rx, ry)?;
+    let neighbours = [
+        chroma(rx - RADIUS, ry)?,
+        chroma(rx + RADIUS, ry)?,
+        chroma(rx, ry - RADIUS)?,
+        chroma(rx, ry + RADIUS)?,
+    ];
+    let minimum_luminance = neighbours
+        .iter()
+        .map(|(_, luminance)| *luminance)
+        .chain(std::iter::once(centre.1))
+        .fold(f32::INFINITY, f32::min);
+    let difference = neighbours
+        .into_iter()
+        .map(|(value, _)| (value[0] - centre.0[0]).hypot(value[1] - centre.0[1]))
+        .fold(0.0_f32, f32::max);
+    // Chromaticity is numerically unstable in shadows. Do not interpret
+    // demosaic noise there as an isoluminant colour edge.
+    Some(difference * smoothstep(minimum_luminance / 0.025))
+}
+
+fn evaluate_held_out_cfa(
+    sources: &[SynthSource<'_>],
+    rx: f32,
+    ry: f32,
+    baseline_xyz: [f32; 3],
+    joint_xyz: [f32; 3],
+    detail_weight: f32,
+    accumulators: &[std::sync::Mutex<HeldOutAccumulator>],
+) {
+    for (index, source) in sources.iter().enumerate() {
+        if !source.held_out
+            || !source.alignment.report.accepted
+            || source.mosaic.is_mono()
+            || !source.color.calibrated
+        {
+            continue;
+        }
+        let Some(q) = source.alignment.warp.map(rx, ry) else {
+            continue;
+        };
+        let sx = q[0].round();
+        let sy = q[1].round();
+        let mapping_error = (q[0] - sx).abs().max((q[1] - sy).abs());
+        if mapping_error > 0.40 {
+            continue;
+        }
+        let Some(sample) =
+            source
+                .mosaic
+                .corrected_cfa_site(sx as usize, sy as usize, source.highlight)
+        else {
+            continue;
+        };
+        if sample.highlight_confidence != 255
+            || sample.white <= 0.0
+            || sample.value >= sample.white * 0.98
+        {
+            continue;
+        }
+        let field = source
+            .gain_field
+            .at(sx, sy, source.mosaic.width, source.mosaic.height);
+        let Some(response) = camera_response(&source.color, field, sample.phase) else {
+            continue;
+        };
+        let gain = source.alignment.gain;
+        let measured = (gain * (sample.value - source.alignment.offset)).max(0.0);
+        let code_range = (source.mosaic.white_q6 - source.mosaic.black_q6) / 64.0;
+        let variance =
+            corrected_noise_variance(&sample, source.noise_model, code_range) * gain.powi(2);
+        let sigma = variance.max(1.0e-10).sqrt();
+        let baseline_error = robust_noise_loss((measured - dot3(response, baseline_xyz)) / sigma);
+        let joint_error = robust_noise_loss((measured - dot3(response, joint_xyz)) / sigma);
+        let Ok(mut accumulator) = accumulators[index].lock() else {
+            continue;
+        };
+        accumulator.overall.add(baseline_error, joint_error);
+        for (bin, threshold) in accumulator
+            .mapping_error_bins
+            .iter_mut()
+            .zip([0.10_f32, 0.20, 0.40])
+        {
+            if mapping_error <= threshold {
+                bin.add(baseline_error, joint_error);
+            }
+        }
+        accumulator.phases[sample.phase.index()].add(baseline_error, joint_error);
+        if detail_weight <= 1.0e-6 {
+            accumulator.smooth.add(baseline_error, joint_error);
+        } else if detail_weight >= 1.0 - 1.0e-6 {
+            accumulator.high_frequency.add(baseline_error, joint_error);
+        }
+    }
+}
+
+fn robust_noise_loss(residual: f32) -> f32 {
+    let absolute = residual.abs();
+    if absolute <= 2.5 {
+        0.5 * absolute * absolute
+    } else {
+        2.5 * (absolute - 1.25)
+    }
+}
+
+fn dot3(first: [f32; 3], second: [f32; 3]) -> f32 {
+    first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
 }
 
 /// Calibrated luminance at an actual module-raster sample position. This is

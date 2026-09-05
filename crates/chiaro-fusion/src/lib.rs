@@ -26,6 +26,7 @@
 pub mod align;
 pub mod array_color;
 pub mod calibration;
+pub mod cfa;
 pub mod color_profile;
 pub mod crosstalk;
 pub mod depth;

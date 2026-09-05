@@ -29,15 +29,22 @@ pub enum ResolutionReconstruction {
     /// Project physical samples from multiple cameras onto the output lattice.
     #[default]
     MultiCamera,
+    /// Experimental joint solve from projected physical Bayer measurements.
+    JointCfa,
 }
 
 impl ResolutionReconstruction {
-    pub const ALL: [Self; 2] = [Self::Resample, Self::MultiCamera];
+    pub const ALL: [Self; 3] = [Self::Resample, Self::MultiCamera, Self::JointCfa];
+
+    pub fn uses_resolution_warps(self) -> bool {
+        matches!(self, Self::MultiCamera | Self::JointCfa)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Resample => "Resample",
             Self::MultiCamera => "Multi-camera",
+            Self::JointCfa => "Joint CFA (experimental)",
         }
     }
 }
@@ -47,6 +54,7 @@ impl fmt::Display for ResolutionReconstruction {
         formatter.write_str(match self {
             Self::Resample => "resample",
             Self::MultiCamera => "multi-camera",
+            Self::JointCfa => "joint-cfa",
         })
     }
 }
@@ -58,8 +66,9 @@ impl FromStr for ResolutionReconstruction {
         match value.trim().to_ascii_lowercase().as_str() {
             "resample" => Ok(Self::Resample),
             "multi-camera" | "multicamera" => Ok(Self::MultiCamera),
+            "joint-cfa" | "jointcfa" => Ok(Self::JointCfa),
             _ => Err(format!(
-                "unknown resolution reconstruction {value:?}; expected resample or multi-camera"
+                "unknown resolution reconstruction {value:?}; expected resample, multi-camera, or joint-cfa"
             )),
         }
     }

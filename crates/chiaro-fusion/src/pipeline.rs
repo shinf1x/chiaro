@@ -13,7 +13,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chiaro::lri::{RawCamera, parse_raw_layout};
+use chiaro::lri::{
+    NoiseModel, RawCamera, parse_frame_layout, parse_raw_layout, sensor_characterization_type,
+};
 use chiaro_hotpixel_core::{
     cleanup::{CleanupCameraProfile, CleanupDiagnostics, CleanupProfile},
     highlight::{HighlightRecoveryReport, HighlightRecoveryState, recover_bayer_highlights},
@@ -39,7 +41,7 @@ use crate::crosstalk::{
 use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
-use crate::resolution::{ResolutionReconstruction, refine_resolution_warp};
+use crate::resolution::refine_resolution_warp;
 use crate::synth::{
     ColorPipeline, CropWindow, GainField, ModuleColor, SynthOptions, SynthReport, SynthSource,
     auto_exposure, canvas_scale, photometric_field, photometric_match, synthesize,
@@ -66,6 +68,9 @@ pub struct FusionOptions {
     pub hotpixel: Option<HotpixelStage>,
     /// Modules to use; empty means every RAW module in the capture.
     pub cameras: Vec<String>,
+    /// Physical modules retained for geometry and real-CFA validation but
+    /// excluded completely from reconstruction.
+    pub cfa_held_out: Vec<String>,
     pub align: AlignOptions,
     pub synth: SynthOptions,
     /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
@@ -81,6 +86,9 @@ pub struct FusionOptions {
     /// (`image_focal_length`, 35 mm equivalent) instead of the full reference
     /// frame.
     pub crop_to_framing: bool,
+    /// Explicit reference-raster crop for diagnostics and matched experiments.
+    /// When present this takes precedence over `crop_to_framing`.
+    pub crop: Option<CropWindow>,
     /// Write per-module alignment checkerboards (`<module>_check.png`) here.
     pub debug_dir: Option<PathBuf>,
     /// Threads for per-frame kernels (`0` = all cores).
@@ -95,6 +103,7 @@ impl Default for FusionOptions {
             intrinsics_mode: IntrinsicsMode::LinearHall,
             hotpixel: None,
             cameras: Vec::new(),
+            cfa_held_out: Vec::new(),
             align: AlignOptions::default(),
             synth: SynthOptions::default(),
             crosstalk: CrosstalkMode::default(),
@@ -102,6 +111,7 @@ impl Default for FusionOptions {
             flat_field: true,
             local_photometric: true,
             crop_to_framing: true,
+            crop: None,
             debug_dir: None,
             threads: 0,
         }
@@ -139,6 +149,7 @@ pub struct FusionReport {
     pub gains: Vec<(String, f32, f32)>,
     pub synthesis: SynthReport,
     pub seconds: FusionTimings,
+    pub resources: FusionResources,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +169,16 @@ pub struct FusionTimings {
     pub hotpixel: f32,
     pub align: f32,
     pub synthesize: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FusionResources {
+    /// Process high-water resident set where the host exposes it (Linux
+    /// `/proc/self/status`). This includes alignment and all synthesis stages.
+    pub peak_resident_bytes: Option<u64>,
+    pub output_megapixels: f32,
+    pub total_seconds_per_megapixel: f32,
+    pub synthesis_seconds_per_megapixel: f32,
 }
 
 /// 35 mm-equivalent focal length of the wide (A) modules, the reference view.
@@ -521,6 +542,7 @@ struct LoadedModule {
     cleanup: CleanupDiagnostics,
     capture_gain: f32,
     exposure_ns: u64,
+    noise_model: Option<NoiseModel>,
 }
 
 struct LoadedHotpixelModels {
@@ -942,6 +964,8 @@ pub fn fuse(
         .map(|state| (state.name.clone(), state))
         .collect::<HashMap<_, _>>();
     let layout = parse_raw_layout(lri, &HashMap::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let frame_layout = parse_frame_layout(lri, &HashMap::new())
+        .map_err(|e| anyhow::anyhow!("noise metadata: {e}"))?;
     let selected = layout
         .cameras
         .iter()
@@ -949,6 +973,10 @@ pub fn fuse(
             options.cameras.is_empty()
                 || options
                     .cameras
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(&camera.name))
+                || options
+                    .cfa_held_out
                     .iter()
                     .any(|wanted| wanted.eq_ignore_ascii_case(&camera.name))
         })
@@ -971,6 +999,13 @@ pub fn fuse(
         .to_ascii_uppercase();
     if !selected.iter().any(|camera| camera.name == reference_name) {
         bail!("reference module {reference_name} is not among the selected modules");
+    }
+    if options
+        .cfa_held_out
+        .iter()
+        .any(|camera| camera.eq_ignore_ascii_case(&reference_name))
+    {
+        bail!("reference module {reference_name} cannot be held out");
     }
 
     // Stage 1: hot-pixel removal per module, producing calibration-raster mosaics.
@@ -1083,6 +1118,21 @@ pub fn fuse(
             .map_or_else(ModuleFocusState::default, |state| state.focus.clone());
         let capture_gain = state.as_ref().map_or(1.0, |state| state.gain as f32);
         let exposure_ns = state.as_ref().map_or(0, |state| state.exposure_ns);
+        let noise_model = frame_layout
+            .frames
+            .iter()
+            .find(|frame| frame.camera.id == raw.id)
+            .and_then(|frame| {
+                calibration
+                    .sensor_noise_profiles
+                    .get(&frame.sensor_type)
+                    .or_else(|| {
+                        calibration
+                            .sensor_noise_profiles
+                            .get(&sensor_characterization_type(frame.sensor_type))
+                    })
+            })
+            .and_then(|profile| profile.model_for_gain(raw.analog_gain, raw.digital_gain));
         modules.push(LoadedModule {
             raw: raw.clone(),
             mosaic,
@@ -1092,9 +1142,24 @@ pub fn fuse(
             cleanup,
             capture_gain,
             exposure_ns,
+            noise_model,
         });
     }
     timings.hotpixel = stage_started.elapsed().as_secs_f32();
+    for held_out in &options.cfa_held_out {
+        let Some(module) = modules
+            .iter()
+            .find(|module| module.raw.name.eq_ignore_ascii_case(held_out))
+        else {
+            bail!("held-out module {held_out} is not present in this capture");
+        };
+        if module.mosaic.is_mono() {
+            bail!(
+                "held-out module {} is monochrome; joint-CFA validation requires a Bayer module",
+                module.raw.name
+            );
+        }
+    }
 
     // Stage 2: alignment to the reference, modules in parallel.
     let stage_started = Instant::now();
@@ -1168,33 +1233,36 @@ pub fn fuse(
     } else {
         None
     };
-    let resolution_warps =
-        if options.synth.resolution_reconstruction == ResolutionReconstruction::MultiCamera {
-            progress(Progress {
-                stage: "align",
-                detail: "resolution-domain local refinement".to_owned(),
-                fraction: 0.50,
-            });
-            inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    if index == reference_index {
-                        None
-                    } else {
-                        Some(refine_resolution_warp(
-                            inputs[reference_index].luminance,
-                            input.luminance,
-                            &alignments[index].warp,
-                            inputs[reference_index].width,
-                            inputs[reference_index].height,
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![None; alignments.len()]
-        };
+    let resolution_warps = if options
+        .synth
+        .resolution_reconstruction
+        .uses_resolution_warps()
+    {
+        progress(Progress {
+            stage: "align",
+            detail: "resolution-domain local refinement".to_owned(),
+            fraction: 0.50,
+        });
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                if index == reference_index {
+                    None
+                } else {
+                    Some(refine_resolution_warp(
+                        inputs[reference_index].luminance,
+                        input.luminance,
+                        &alignments[index].warp,
+                        inputs[reference_index].width,
+                        inputs[reference_index].height,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![None; alignments.len()]
+    };
     if options.synth.highlight_recovery.uses_multi_camera() {
         progress(Progress {
             stage: "highlight",
@@ -1412,8 +1480,28 @@ pub fn fuse(
     let stage_started = Instant::now();
     let reference = &modules[reference_index];
     let framed_focal_length_mm = image_focal_length_mm(&messages);
-    let crop = match framed_focal_length_mm {
-        Some(focal) if options.crop_to_framing && focal > 0 => {
+    let crop = match (options.crop, framed_focal_length_mm) {
+        (Some(crop), _) => {
+            if crop.x < 0.0
+                || crop.y < 0.0
+                || crop.width < 1.0
+                || crop.height < 1.0
+                || crop.x + crop.width > reference.raw.width as f32
+                || crop.y + crop.height > reference.raw.height as f32
+            {
+                bail!(
+                    "explicit crop [{:.1}, {:.1}, {:.1}, {:.1}] is outside the {}x{} reference raster",
+                    crop.x,
+                    crop.y,
+                    crop.width,
+                    crop.height,
+                    reference.raw.width,
+                    reference.raw.height
+                );
+            }
+            crop
+        }
+        (None, Some(focal)) if options.crop_to_framing && focal > 0 => {
             // Framing is relative to the native field of view of the capture's
             // reference group: 28 mm for A, 70 mm for B, and 150 mm for C.
             framing_crop(
@@ -1456,7 +1544,11 @@ pub fn fuse(
         .iter()
         .zip(&alignments)
         .filter(|(module, alignment)| {
-            alignment.report.accepted
+            !options
+                .cfa_held_out
+                .iter()
+                .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
+                && alignment.report.accepted
                 && (options.synth.include_mono || !module.mosaic.is_mono())
                 && intersects_crop(alignment, module, &crop)
         })
@@ -1484,8 +1576,13 @@ pub fn fuse(
         .zip(&alignments)
         .zip(module_colors.iter().zip(&gain_fields))
         .zip(&resolution_warps)
-        .filter(|(((_, alignment), _), resolution_warp)| {
-            alignment.report.accepted
+        .filter(|(((module, alignment), _), resolution_warp)| {
+            let held_out = options
+                .cfa_held_out
+                .iter()
+                .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name));
+            held_out
+                || alignment.report.accepted
                 || resolution_warp.as_ref().is_some_and(|refined| {
                     refined.report.supported_fraction >= 0.005
                         && refined.report.mean_confidence >= 0.5
@@ -1493,10 +1590,21 @@ pub fn fuse(
         })
         .map(
             |(((module, alignment), (color, gain_field)), resolution_warp)| SynthSource {
+                camera_id: module.raw.id,
                 mosaic: &module.mosaic,
+                highlight: &module.highlight,
+                noise_model: module.noise_model,
+                held_out: options
+                    .cfa_held_out
+                    .iter()
+                    .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name)),
                 alignment,
                 resolution_warp: resolution_warp.as_ref(),
-                fusion_enabled: alignment.report.accepted,
+                fusion_enabled: alignment.report.accepted
+                    && !options
+                        .cfa_held_out
+                        .iter()
+                        .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name)),
                 reference: alignment.name == reference_name,
                 magnification: magnification(module),
                 confidence: synthesis_confidence(alignment)
@@ -1528,6 +1636,14 @@ pub fn fuse(
     )?;
     timings.synthesize = stage_started.elapsed().as_secs_f32();
 
+    let output_megapixels = (synthesis.canvas_width * synthesis.canvas_height) as f32 / 1_000_000.0;
+    let total_seconds = timings.load + timings.hotpixel + timings.align + timings.synthesize;
+    let resources = FusionResources {
+        peak_resident_bytes: peak_resident_bytes(),
+        output_megapixels,
+        total_seconds_per_megapixel: total_seconds / output_megapixels.max(1.0e-6),
+        synthesis_seconds_per_megapixel: timings.synthesize / output_megapixels.max(1.0e-6),
+    };
     let report = FusionReport {
         reference: reference_name,
         calibration_modules: calibration.cameras.len(),
@@ -1550,6 +1666,7 @@ pub fn fuse(
             .collect(),
         synthesis,
         seconds: timings,
+        resources,
     };
     let report_path = output.with_extension("fusion.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
@@ -1560,6 +1677,13 @@ pub fn fuse(
         fraction: 1.0,
     });
     Ok(report)
+}
+
+fn peak_resident_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let kibibytes = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    kibibytes.checked_mul(1024)
 }
 
 #[cfg(test)]
