@@ -112,15 +112,19 @@ chiaro-fuse capture.lri -o held-out-B2.png \
   --cfa-held-out B2
 ```
 
-The neighbouring report contains noise-normalized robust prediction loss for
-the baseline and joint solver, split into R, Gr, Gb, B, luminance-like,
-chroma-like, smooth, and high-frequency samples. Positive relative improvement
-means the joint solver predicted measurements from a camera it never observed
-more accurately. Use multiple held-out cameras, captures, and camera subsets;
-contributor fit alone is not evidence of added resolution. Joint diagnostics
-also record attempted/support counts, observations and cameras per solve,
-sampling-phase spread, application confidence, solver iterations, contributor
-reprojection, peak resident memory, and total/synthesis time per megapixel.
+The neighbouring report contains noise-normalized robust prediction loss for a
+fixed, deduplicated list of physical sensor sites. Solver failures remain in
+the overall population as baseline fallbacks; `common_region` reports the
+supported subset separately. Results are split into literal R/Gr/Gb/B,
+green-phase, red/blue-phase, independently defined flat/structured, and
+inverse-projection-residual populations. Empty populations carry
+`measured: false`. Positive relative improvement means the emitted Joint-CFA
+or fallback value predicted a camera it never observed more accurately.
+Contributor losses are explicitly in-sample diagnostics, not evidence of added
+resolution. Joint diagnostics also record attempted/support counts, response
+and spatial conditioning, application confidence, peak resident memory, and
+total/synthesis time per megapixel. Held-out reports estimate uncertainty over
+64x64 sensor blocks instead of treating neighboring CFA sites as independent.
 
 Fusion builds a calibrated multi-camera inverse-depth cost field after global
 alignment. Eight-direction semi-global matching proposes coarse hypotheses;

@@ -288,6 +288,7 @@ pub fn fuse_night(
             samples: stack.mosaic16,
             black_q6: 0.0,
             white_q6: 65535.0,
+            physical_code_range: 65535.0,
             vignetting: None,
             crosstalk: None,
             demosaiced_rgb: None,

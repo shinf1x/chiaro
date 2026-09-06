@@ -388,7 +388,7 @@ fn main() -> Result<()> {
     );
     if let Some(joint) = &report.synthesis.joint_cfa {
         println!(
-            "joint CFA: {:.2}% of {} attempted points reconstructed (stride {}), {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; contributor improvement {:+.2}%",
+            "joint CFA: {:.2}% of {} attempted points reconstructed (stride {}), {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample affine fit {:+.2}% (diagnostic only)",
             joint.reconstructed_fraction * 100.0,
             joint.attempted_pixels,
             joint.sampling_stride,
@@ -398,17 +398,19 @@ fn main() -> Result<()> {
             joint.mean_application_weight * 100.0,
             joint.mean_solver_iterations,
             joint.mean_weighted_residual,
-            joint.contributor_relative_improvement * 100.0,
+            joint.in_sample_relative_fit * 100.0,
         );
     }
     for held_out in &report.synthesis.held_out_cfa {
         println!(
-            "held-out {}: baseline {:.4}, joint CFA {:.4}, improvement {:+.2}% over {} real CFA samples",
+            "held-out {}: baseline {:.4}, emitted Joint CFA/fallback {:.4}, improvement {:+.2}% over {} fixed physical CFA samples; solver supported {} ({:.1}%)",
             held_out.camera,
             held_out.overall.baseline,
             held_out.overall.joint_cfa,
             held_out.overall.relative_improvement * 100.0,
             held_out.overall.samples,
+            held_out.solver_supported_samples,
+            held_out.solver_supported_fraction * 100.0,
         );
     }
     for source in &report.synthesis.source_contributions {
@@ -462,6 +464,9 @@ fn parse_crop(value: &str) -> Result<CropWindow> {
     if values.len() != 4 {
         bail!("--crop expects four numbers x,y,width,height, not {value}");
     }
+    if values.iter().any(|component| !component.is_finite()) {
+        bail!("--crop components must all be finite, not {value}");
+    }
     Ok(CropWindow {
         x: values[0],
         y: values[1],
@@ -495,5 +500,7 @@ mod tests {
         assert_eq!(crop.height, 480.0);
         assert!(parse_crop("1,2,3").is_err());
         assert!(parse_crop("1,2,no,4").is_err());
+        assert!(parse_crop("NaN,2,3,4").is_err());
+        assert!(parse_crop("1,2,inf,4").is_err());
     }
 }

@@ -30,8 +30,9 @@ use std::path::Path;
 
 use crate::align::ModuleAlignment;
 use crate::cfa::{
-    CfaObservation, HighlightProvenance, JointCfaEstimate, Visibility, camera_response,
-    corrected_noise_variance, solve_joint_xyz,
+    CfaObservation, HighlightProvenance, JointCfaEstimate, NoiseDependency, Visibility,
+    account_shared_sample_dependence, camera_response, corrected_noise_variance, noise_variance,
+    solve_joint_xyz,
 };
 use crate::depth::DenseDepthMap;
 use crate::image::Mosaic;
@@ -438,8 +439,8 @@ struct JointCfaCounters {
     application_weight_micro: std::sync::atomic::AtomicUsize,
     iterations: std::sync::atomic::AtomicUsize,
     residual_micro: std::sync::atomic::AtomicUsize,
-    contributor_baseline_micro: std::sync::atomic::AtomicUsize,
-    contributor_joint_micro: std::sync::atomic::AtomicUsize,
+    in_sample_baseline_micro: std::sync::atomic::AtomicUsize,
+    in_sample_affine_micro: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -595,7 +596,7 @@ pub struct JointCfaReconstructionReport {
     pub attempted_pixels: usize,
     pub reconstructed_pixels: usize,
     /// Fraction of attempted validation/output locations with sufficient
-    /// multi-camera, multi-phase support for a joint solve.
+    /// robust multi-camera, independent-response, and 2D spatial support.
     pub reconstructed_fraction: f32,
     /// Output-pixel stride used for held-out validation (one in JointCfa mode).
     pub sampling_stride: usize,
@@ -607,14 +608,18 @@ pub struct JointCfaReconstructionReport {
     pub mean_application_weight: f32,
     pub mean_solver_iterations: f32,
     pub mean_weighted_residual: f32,
-    pub mean_contributor_baseline_loss: f32,
-    pub mean_contributor_joint_loss: f32,
-    pub contributor_relative_improvement: f32,
+    /// Training-observation fit diagnostic, not a held-out quality metric.
+    pub mean_in_sample_baseline_loss: f32,
+    pub mean_in_sample_affine_loss: f32,
+    pub in_sample_relative_fit: f32,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct CfaPredictionErrorReport {
     pub samples: usize,
+    /// False means the population was empty; numeric zeroes below are then
+    /// placeholders rather than measured zero error.
+    pub measured: bool,
     /// Mean robust loss of the noise-normalized residual.
     pub baseline: f32,
     pub joint_cfa: f32,
@@ -625,15 +630,37 @@ pub struct CfaPredictionErrorReport {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct HeldOutCfaReport {
     pub camera: String,
+    /// Stable physical sites scored, independent of solver success.
+    pub sample_ids: Vec<[u16; 2]>,
+    /// All independently eligible sites. Solver failures are scored as the
+    /// production fallback, matching what a Joint-CFA export actually emits.
     pub overall: CfaPredictionErrorReport,
+    /// Same-site comparison restricted to locations where the joint solver
+    /// had sufficient independent information.
+    pub common_region: CfaPredictionErrorReport,
+    pub solver_supported_samples: usize,
+    pub solver_supported_fraction: f32,
+    /// Uncertainty estimated across 64x64-sensor-site blocks rather than
+    /// treating neighboring CFA samples as independent replications.
+    pub spatial_blocks: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_relative_improvement_standard_error: Option<f32>,
     pub phases: Vec<(crate::image::CfaPhase, CfaPredictionErrorReport)>,
-    pub luminance_like: CfaPredictionErrorReport,
-    pub chroma_like: CfaPredictionErrorReport,
-    pub smooth: CfaPredictionErrorReport,
-    pub high_frequency: CfaPredictionErrorReport,
-    /// Sensitivity to nearest-output sampling: maximum held-out sensor-space
-    /// distance in pixels and the corresponding nested error population.
-    pub mapping_error_bins: Vec<(f32, CfaPredictionErrorReport)>,
+    pub green_phases: CfaPredictionErrorReport,
+    pub red_blue_phases: CfaPredictionErrorReport,
+    pub flat: CfaPredictionErrorReport,
+    pub structured: CfaPredictionErrorReport,
+    /// Numerical inverse-projection residual bins, kept separate from claims
+    /// about physical registration accuracy.
+    pub projection_error_bins: Vec<(f32, CfaPredictionErrorReport)>,
+    pub rejected: HeldOutRejectionReport,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct HeldOutRejectionReport {
+    pub outside_mapping: usize,
+    pub invalid_or_clipped_measurement: usize,
+    pub uncalibrated_response: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -655,6 +682,7 @@ impl ErrorAccumulator {
         let joint_cfa = (self.joint / self.samples.max(1) as f64) as f32;
         CfaPredictionErrorReport {
             samples: self.samples,
+            measured: self.samples != 0,
             baseline,
             joint_cfa,
             relative_improvement: (baseline - joint_cfa) / baseline.max(1.0e-8),
@@ -670,13 +698,19 @@ impl ErrorAccumulator {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct HeldOutAccumulator {
+    seen_sites: std::collections::BTreeSet<[u16; 2]>,
+    sample_ids: std::collections::BTreeSet<[u16; 2]>,
     overall: ErrorAccumulator,
+    common_region: ErrorAccumulator,
+    solver_supported: usize,
     phases: [ErrorAccumulator; 4],
-    smooth: ErrorAccumulator,
-    high_frequency: ErrorAccumulator,
-    mapping_error_bins: [ErrorAccumulator; 3],
+    flat: ErrorAccumulator,
+    structured: ErrorAccumulator,
+    projection_error_bins: [ErrorAccumulator; 3],
+    blocks: std::collections::BTreeMap<[u16; 2], ErrorAccumulator>,
+    rejected: HeldOutRejectionReport,
 }
 
 /// Canvas pixels per reference pixel for a crop and canvas mode.
@@ -723,7 +757,14 @@ pub fn synthesize(
     if usable.is_empty() {
         bail!("no modules to synthesise from");
     }
-    if scale.is_nan() || scale <= 0.0 || crop.width < 1.0 || crop.height < 1.0 {
+    if !scale.is_finite()
+        || scale <= 0.0
+        || ![crop.x, crop.y, crop.width, crop.height]
+            .into_iter()
+            .all(f32::is_finite)
+        || crop.width < 1.0
+        || crop.height < 1.0
+    {
         bail!("invalid canvas geometry");
     }
     let width = (crop.width * scale).round().max(1.0) as usize;
@@ -808,6 +849,7 @@ pub fn synthesize(
                     let mut reference_color_weight = 0.0f32;
                     let mut reference_luminance_sum = 0.0f32;
                     let mut reference_luminance_weight = 0.0f32;
+                    let mut baseline_only_luminance = false;
                     let mut resolution = ResolutionAccumulator::default();
                     let mut sharpest_agreeing_detail = 1.0f32;
                     let mut luminance_owner = None::<(usize, f32)>;
@@ -918,6 +960,13 @@ pub fn synthesize(
                                 continue;
                             }
                             let weight = base_weight * edge_weight;
+                            if weight > 0.0 {
+                                // Joint CFA currently has no monochrome
+                                // measurement equation. Remember that the
+                                // production baseline owns information the
+                                // Bayer-only solve cannot replace.
+                                baseline_only_luminance = true;
+                            }
                             luminance += weight * y;
                             luminance_weight += weight;
                             if luminance_owner.is_none_or(|(_, best)| weight > best) {
@@ -1123,6 +1172,15 @@ pub fn synthesize(
                                 // bounded coefficient still prevents overshoot.
                                 let blend = (reconstructed.confidence.sqrt() * 1.10).min(1.0);
                                 target_luminance = (target_luminance + blend * delta).max(0.0);
+                                if reconstructed.contributors != 0
+                                    && usable.iter().enumerate().any(|(index, (_, source))| {
+                                        index < u32::BITS as usize
+                                            && reconstructed.contributors & (1_u32 << index) != 0
+                                            && (source.mosaic.is_mono() || !source.fusion_enabled)
+                                    })
+                                {
+                                    baseline_only_luminance = true;
+                                }
                                 resolution_counters
                                     .reconstructed
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1182,6 +1240,10 @@ pub fn synthesize(
                                     scale,
                                     baseline_xyz,
                                     reference_structure,
+                                    reference_luminance,
+                                    reference_color,
+                                    scene_depth,
+                                    baseline_only_luminance,
                                     options,
                                 )
                             })
@@ -1215,13 +1277,13 @@ pub fn synthesize(
                                     as usize,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
-                            joint_cfa_counters.contributor_baseline_micro.fetch_add(
-                                (estimate.report.contributor_baseline_loss.min(1_000.0)
-                                    * 1_000_000.0) as usize,
+                            joint_cfa_counters.in_sample_baseline_micro.fetch_add(
+                                (estimate.report.in_sample_baseline_loss.min(1_000.0) * 1_000_000.0)
+                                    as usize,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
-                            joint_cfa_counters.contributor_joint_micro.fetch_add(
-                                (estimate.report.contributor_joint_loss.min(1_000.0) * 1_000_000.0)
+                            joint_cfa_counters.in_sample_affine_micro.fetch_add(
+                                (estimate.report.in_sample_affine_loss.min(1_000.0) * 1_000_000.0)
                                     as usize,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
@@ -1231,14 +1293,24 @@ pub fn synthesize(
                                 blended = estimate.xyz;
                             }
                         }
-                        if validation_sample && let Some(estimate) = joint_estimate {
+                        if validation_sample {
+                            let luminance_structure = reference_structure
+                                .map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
+                            let chroma_structure = sources
+                                .iter()
+                                .find(|source| source.reference)
+                                .and_then(|source| source_chroma_structure(source, rx, ry, options))
+                                .unwrap_or(0.0);
                             evaluate_held_out_cfa(
                                 sources,
                                 rx,
                                 ry,
+                                scale,
                                 baseline_xyz,
-                                estimate.xyz,
-                                estimate.application_weight,
+                                joint_estimate.as_ref(),
+                                luminance_structure.max(chroma_structure),
+                                scene_depth,
+                                options,
                                 &held_out_counters,
                             );
                         }
@@ -1372,13 +1444,13 @@ pub fn synthesize(
             let reconstructed = joint_cfa_counters
                 .reconstructed
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let contributor_baseline = joint_cfa_counters
-                .contributor_baseline_micro
+            let in_sample_baseline = joint_cfa_counters
+                .in_sample_baseline_micro
                 .load(std::sync::atomic::Ordering::Relaxed)
                 as f32
                 / (reconstructed.max(1) * 1_000_000) as f32;
-            let contributor_joint = joint_cfa_counters
-                .contributor_joint_micro
+            let in_sample_affine = joint_cfa_counters
+                .in_sample_affine_micro
                 .load(std::sync::atomic::Ordering::Relaxed)
                 as f32
                 / (reconstructed.max(1) * 1_000_000) as f32;
@@ -1423,10 +1495,10 @@ pub fn synthesize(
                     .load(std::sync::atomic::Ordering::Relaxed)
                     as f32
                     / (reconstructed.max(1) * 1_000_000) as f32,
-                mean_contributor_baseline_loss: contributor_baseline,
-                mean_contributor_joint_loss: contributor_joint,
-                contributor_relative_improvement: (contributor_baseline - contributor_joint)
-                    / contributor_baseline.max(1.0e-8),
+                mean_in_sample_baseline_loss: in_sample_baseline,
+                mean_in_sample_affine_loss: in_sample_affine,
+                in_sample_relative_fit: (in_sample_baseline - in_sample_affine)
+                    / in_sample_baseline.max(1.0e-8),
             }
         });
     let phases = [
@@ -1440,30 +1512,55 @@ pub fn synthesize(
         .zip(&held_out_counters)
         .filter(|(source, _)| source.held_out)
         .filter_map(|(source, accumulator)| {
-            let accumulator = *accumulator.lock().ok()?;
+            let accumulator = accumulator.lock().ok()?;
+            let supported = accumulator.solver_supported;
+            let eligible = accumulator.overall.samples;
+            let block_improvements = accumulator
+                .blocks
+                .values()
+                .map(|block| block.report().relative_improvement)
+                .collect::<Vec<_>>();
+            let block_standard_error = if block_improvements.len() >= 2 {
+                let mean = block_improvements.iter().sum::<f32>() / block_improvements.len() as f32;
+                let variance = block_improvements
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f32>()
+                    / (block_improvements.len() - 1) as f32;
+                Some((variance / block_improvements.len() as f32).sqrt())
+            } else {
+                None
+            };
             Some(HeldOutCfaReport {
                 camera: source.alignment.name.clone(),
+                sample_ids: accumulator.sample_ids.iter().copied().collect(),
                 overall: accumulator.overall.report(),
+                common_region: accumulator.common_region.report(),
+                solver_supported_samples: supported,
+                solver_supported_fraction: supported as f32 / eligible.max(1) as f32,
+                spatial_blocks: block_improvements.len(),
+                block_relative_improvement_standard_error: block_standard_error,
                 phases: phases
                     .into_iter()
                     .enumerate()
                     .map(|(index, phase)| (phase, accumulator.phases[index].report()))
                     .collect(),
-                luminance_like: accumulator.phases[1]
+                green_phases: accumulator.phases[1]
                     .combined(accumulator.phases[2])
                     .report(),
-                chroma_like: accumulator.phases[0]
+                red_blue_phases: accumulator.phases[0]
                     .combined(accumulator.phases[3])
                     .report(),
-                smooth: accumulator.smooth.report(),
-                high_frequency: accumulator.high_frequency.report(),
-                mapping_error_bins: [0.10_f32, 0.20, 0.40]
+                flat: accumulator.flat.report(),
+                structured: accumulator.structured.report(),
+                projection_error_bins: [0.10_f32, 0.20, 0.40]
                     .into_iter()
                     .enumerate()
                     .map(|(index, threshold)| {
-                        (threshold, accumulator.mapping_error_bins[index].report())
+                        (threshold, accumulator.projection_error_bins[index].report())
                     })
                     .collect(),
+                rejected: accumulator.rejected,
             })
         })
         .collect();
@@ -1699,11 +1796,16 @@ fn joint_cfa_at(
     scale: f32,
     prior_xyz: [f32; 3],
     reference_structure: Option<[f32; 3]>,
+    reference_luminance: Option<f32>,
+    reference_color: Option<[f32; 3]>,
+    scene_depth: Option<(f64, f32)>,
+    preserve_baseline_luminance: bool,
     options: &SynthOptions,
 ) -> Option<JointCfaEstimate> {
     const SUPPORT_RADIUS: f32 = 1.65;
     const PRIOR_WEIGHT: f32 = 0.025;
     let mut observations = Vec::with_capacity(sources.len() * 12);
+    let reference_source = sources.iter().find(|source| source.reference);
     for (camera_index, source) in sources.iter().enumerate() {
         if source.held_out
             || !source.fusion_enabled
@@ -1741,6 +1843,8 @@ fn joint_cfa_at(
                 }
                 let displacement = inverse.map(sx as f32 - q[0], sy as f32 - q[1]);
                 let output_offset = [displacement[0] * scale, displacement[1] * scale];
+                let sample_rx = rx + displacement[0];
+                let sample_ry = ry + displacement[1];
                 let spatial_weight = edge_aligned_hann_weight(
                     output_offset[0],
                     output_offset[1],
@@ -1748,6 +1852,62 @@ fn joint_cfa_at(
                     reference_structure,
                 );
                 if spatial_weight <= 0.0 {
+                    continue;
+                }
+                // Reuse the production path's local safeguards at the actual
+                // footprint site. Centre-warp confidence alone cannot detect a
+                // border, occlusion, focus mismatch, or incompatible edge a
+                // pixel away from the requested centre.
+                let border = (sx as f32)
+                    .min(sy as f32)
+                    .min((source.mosaic.width - 1) as f32 - sx as f32)
+                    .min((source.mosaic.height - 1) as f32 - sy as f32);
+                let feather = smoothstep(border / options.feather_px.max(1.0));
+                let footprint_confidence = warp.confidence(sample_rx, sample_ry);
+                let sample_luminance = source_luminance(source, sample_rx, sample_ry, options);
+                let sample_structure =
+                    source_log_luminance_structure(source, sample_rx, sample_ry, options);
+                let local_reference_luminance = reference_source
+                    .and_then(|reference| {
+                        source_luminance(reference, sample_rx, sample_ry, options)
+                    })
+                    .or(reference_luminance);
+                let local_reference_structure = reference_source
+                    .and_then(|reference| {
+                        source_log_luminance_structure(reference, sample_rx, sample_ry, options)
+                    })
+                    .or(reference_structure);
+                let local_reference_color = reference_source
+                    .and_then(|reference| source_xyz(reference, sample_rx, sample_ry, options))
+                    .or(reference_color);
+                let edge_weight = edge_consistency_weight(
+                    local_reference_luminance,
+                    sample_luminance.unwrap_or_default(),
+                    source.reference,
+                );
+                let detail_weight = detail_consistency_weight(
+                    local_reference_structure,
+                    sample_structure,
+                    source.reference,
+                );
+                let chroma_weight = chroma_consistency_weight(
+                    local_reference_color,
+                    source_xyz(source, sample_rx, sample_ry, options),
+                    source.reference,
+                );
+                let focus_weight = focus_consistency_weight(
+                    scene_depth,
+                    source.focus_distance,
+                    source.magnification,
+                    source.reference,
+                );
+                let local_admission = feather
+                    * footprint_confidence
+                    * edge_weight
+                    * detail_weight
+                    * chroma_weight
+                    * focus_weight;
+                if local_admission < 0.05 {
                     continue;
                 }
                 let Some(sample) =
@@ -1771,9 +1931,20 @@ fn joint_cfa_at(
                 };
                 let gain = source.alignment.gain;
                 let value = (gain * (sample.value - source.alignment.offset)).max(0.0);
-                let code_range = (source.mosaic.white_q6 - source.mosaic.black_q6) / 64.0;
+                let code_range = source.mosaic.physical_code_range;
                 let variance = corrected_noise_variance(&sample, source.noise_model, code_range)
                     * gain.powi(2);
+                let target_rx = rx + output_offset[0] / scale;
+                let target_ry = ry + output_offset[1] / scale;
+                let baseline_prediction = production_baseline_xyz_at(
+                    sources,
+                    target_rx,
+                    target_ry,
+                    scale,
+                    scene_depth,
+                    options,
+                )
+                .map(|baseline| dot3(response, baseline));
                 observations.push(CfaObservation {
                     camera_index,
                     camera_id: source.camera_id,
@@ -1786,16 +1957,39 @@ fn joint_cfa_at(
                         sample.highlight_confidence,
                     ),
                     highlight_confidence: sample.highlight_confidence,
-                    geometry_confidence,
+                    geometry_confidence: geometry_confidence * local_admission,
                     visibility: Visibility::Visible,
                     response,
                     spatial_weight,
+                    baseline_prediction,
+                    noise_dependencies: {
+                        let mut dependencies = [NoiseDependency::default(); 16];
+                        for (target, component) in dependencies
+                            .iter_mut()
+                            .zip(sample.noise_components[..sample.noise_component_count].iter())
+                        {
+                            *target = NoiseDependency {
+                                key: ((source.camera_id as u64) << 32)
+                                    | component.sensor_index as u64,
+                                coefficient: component.coefficient * sample.flat_field * gain,
+                                physical_variance: noise_variance(
+                                    component.signal,
+                                    component.phase,
+                                    source.noise_model,
+                                    code_range,
+                                ),
+                            };
+                        }
+                        dependencies
+                    },
+                    noise_dependency_count: sample.noise_component_count,
                 });
             }
         }
     }
+    account_shared_sample_dependence(&mut observations);
     let mut estimate = solve_joint_xyz(&observations, prior_xyz, PRIOR_WEIGHT)?;
-    if estimate.report.cameras < 2 || estimate.report.phase_mask.count_ones() < 3 {
+    if estimate.report.cameras < 2 || estimate.report.data_rank < 3 {
         return None;
     }
     // Joint CFA exists to recover supported spatial detail, not to replace the
@@ -1810,10 +2004,11 @@ fn joint_cfa_at(
         .unwrap_or(0.0);
     let luminance_weight = smoothstep((luminance_structure - 0.012) / (0.045 - 0.012));
     let chroma_weight = smoothstep((chroma_structure - 0.010) / (0.045 - 0.010));
-    estimate.application_weight = luminance_weight.max(chroma_weight);
-    for (value, prior) in estimate.xyz.iter_mut().zip(prior_xyz) {
-        *value = prior + estimate.application_weight * (*value - prior);
-    }
+    estimate.apply_over_baseline(
+        prior_xyz,
+        luminance_weight.max(chroma_weight),
+        preserve_baseline_luminance,
+    );
     Some(estimate)
 }
 
@@ -1855,9 +2050,12 @@ fn evaluate_held_out_cfa(
     sources: &[SynthSource<'_>],
     rx: f32,
     ry: f32,
+    scale: f32,
     baseline_xyz: [f32; 3],
-    joint_xyz: [f32; 3],
-    detail_weight: f32,
+    joint_estimate: Option<&JointCfaEstimate>,
+    structure: f32,
+    scene_depth: Option<(f64, f32)>,
+    options: &SynthOptions,
     accumulators: &[std::sync::Mutex<HeldOutAccumulator>],
 ) {
     for (index, source) in sources.iter().enumerate() {
@@ -1869,12 +2067,33 @@ fn evaluate_held_out_cfa(
             continue;
         }
         let Some(q) = source.alignment.warp.map(rx, ry) else {
+            if let Ok(mut accumulator) = accumulators[index].lock() {
+                accumulator.rejected.outside_mapping += 1;
+            }
             continue;
         };
-        let sx = q[0].round();
-        let sy = q[1].round();
-        let mapping_error = (q[0] - sx).abs().max((q[1] - sy).abs());
-        if mapping_error > 0.40 {
+        let sx = q[0].round().clamp(0.0, (source.mosaic.width - 1) as f32);
+        let sy = q[1].round().clamp(0.0, (source.mosaic.height - 1) as f32);
+        let Some((target_reference, projection_error)) = invert_warp_near(
+            &source.alignment.warp,
+            [sx, sy],
+            [rx, ry],
+            source.mosaic.width,
+            source.mosaic.height,
+        ) else {
+            if let Ok(mut accumulator) = accumulators[index].lock() {
+                accumulator.rejected.outside_mapping += 1;
+            }
+            continue;
+        };
+        let sample_id = [sx as u16, sy as u16];
+        let Ok(mut accumulator) = accumulators[index].lock() else {
+            continue;
+        };
+        // Multiple output validation points can project to the same physical
+        // sensor site. Score each measurement once so changing solve coverage
+        // cannot change the evaluation population through duplicates.
+        if !accumulator.seen_sites.insert(sample_id) {
             continue;
         }
         let Some(sample) =
@@ -1882,48 +2101,269 @@ fn evaluate_held_out_cfa(
                 .mosaic
                 .corrected_cfa_site(sx as usize, sy as usize, source.highlight)
         else {
+            accumulator.rejected.invalid_or_clipped_measurement += 1;
             continue;
         };
         if sample.highlight_confidence != 255
             || sample.white <= 0.0
             || sample.value >= sample.white * 0.98
         {
+            accumulator.rejected.invalid_or_clipped_measurement += 1;
             continue;
         }
         let field = source
             .gain_field
             .at(sx, sy, source.mosaic.width, source.mosaic.height);
         let Some(response) = camera_response(&source.color, field, sample.phase) else {
+            accumulator.rejected.uncalibrated_response += 1;
             continue;
         };
         let gain = source.alignment.gain;
         let measured = (gain * (sample.value - source.alignment.offset)).max(0.0);
-        let code_range = (source.mosaic.white_q6 - source.mosaic.black_q6) / 64.0;
+        let code_range = source.mosaic.physical_code_range;
         let variance =
             corrected_noise_variance(&sample, source.noise_model, code_range) * gain.powi(2);
         let sigma = variance.max(1.0e-10).sqrt();
-        let baseline_error = robust_noise_loss((measured - dot3(response, baseline_xyz)) / sigma);
+        let target_baseline = production_baseline_xyz_at(
+            sources,
+            target_reference[0],
+            target_reference[1],
+            scale,
+            scene_depth,
+            options,
+        )
+        .unwrap_or(baseline_xyz);
+        let output_offset = [
+            (target_reference[0] - rx) * scale,
+            (target_reference[1] - ry) * scale,
+        ];
+        let (joint_xyz, solver_supported) = joint_estimate
+            .map_or((target_baseline, false), |joint| {
+                (joint.applied_xyz_at(output_offset, target_baseline), true)
+            });
+        let baseline_error =
+            robust_noise_loss((measured - dot3(response, target_baseline)) / sigma);
         let joint_error = robust_noise_loss((measured - dot3(response, joint_xyz)) / sigma);
-        let Ok(mut accumulator) = accumulators[index].lock() else {
-            continue;
-        };
+        accumulator.sample_ids.insert(sample_id);
         accumulator.overall.add(baseline_error, joint_error);
+        accumulator
+            .blocks
+            .entry([sample_id[0] / 64, sample_id[1] / 64])
+            .or_default()
+            .add(baseline_error, joint_error);
+        if solver_supported {
+            accumulator.solver_supported += 1;
+            accumulator.common_region.add(baseline_error, joint_error);
+        }
         for (bin, threshold) in accumulator
-            .mapping_error_bins
+            .projection_error_bins
             .iter_mut()
             .zip([0.10_f32, 0.20, 0.40])
         {
-            if mapping_error <= threshold {
+            if projection_error <= threshold {
                 bin.add(baseline_error, joint_error);
             }
         }
         accumulator.phases[sample.phase.index()].add(baseline_error, joint_error);
-        if detail_weight <= 1.0e-6 {
-            accumulator.smooth.add(baseline_error, joint_error);
-        } else if detail_weight >= 1.0 - 1.0e-6 {
-            accumulator.high_frequency.add(baseline_error, joint_error);
+        // The bins are defined from the reference signal itself, independently
+        // of whether Joint CFA was admitted or how strongly it was blended.
+        if structure < 0.010 {
+            accumulator.flat.add(baseline_error, joint_error);
+        } else if structure >= 0.012 {
+            accumulator.structured.add(baseline_error, joint_error);
         }
     }
+}
+
+/// Evaluate the production baseline at an arbitrary reference coordinate for
+/// like-for-like contributor and held-out diagnostics. This mirrors the
+/// low-frequency colour/luminance admission and optional resolution-detail
+/// path used by the streaming renderer, but deliberately never invokes Joint
+/// CFA itself.
+fn production_baseline_xyz_at(
+    sources: &[SynthSource<'_>],
+    rx: f32,
+    ry: f32,
+    scale: f32,
+    scene_depth: Option<(f64, f32)>,
+    options: &SynthOptions,
+) -> Option<[f32; 3]> {
+    let reference = sources.iter().find(|source| source.reference)?;
+    let reference_luminance = source_luminance(reference, rx, ry, options);
+    let reference_structure = source_log_luminance_structure(reference, rx, ry, options);
+    let reference_color = source_xyz(reference, rx, ry, options);
+    let mut xyz = [0.0_f32; 3];
+    let mut color_weight = 0.0_f32;
+    let mut luminance = 0.0_f32;
+    let mut luminance_weight = 0.0_f32;
+    let mut reference_xyz = [0.0_f32; 3];
+    let mut reference_color_weight = 0.0_f32;
+    let mut reference_luminance_sum = 0.0_f32;
+    let mut reference_luminance_weight = 0.0_f32;
+    let mut sharpest_agreeing_detail = 1.0_f32;
+    let mut resolution = ResolutionAccumulator::default();
+    for (source_index, source) in sources.iter().enumerate() {
+        if source.held_out || (!options.include_mono && source.mosaic.is_mono()) {
+            continue;
+        }
+        let Some(q) = source.alignment.warp.map(rx, ry) else {
+            continue;
+        };
+        let border = q[0]
+            .min(q[1])
+            .min((source.mosaic.width - 1) as f32 - q[0])
+            .min((source.mosaic.height - 1) as f32 - q[1]);
+        let feather = smoothstep(border / options.feather_px.max(1.0));
+        let local_confidence = source.alignment.warp.confidence(rx, ry);
+        let base_weight =
+            feather * local_confidence * source.magnification.powi(2) * source.confidence;
+        if base_weight <= 0.0 {
+            continue;
+        }
+        let focus_weight = focus_consistency_weight(
+            scene_depth,
+            source.focus_distance,
+            source.magnification,
+            source.reference,
+        );
+        let Some(sample_luminance) = source_luminance(source, rx, ry, options) else {
+            continue;
+        };
+        let sample_structure = (!source.reference)
+            .then(|| source_log_luminance_structure(source, rx, ry, options))
+            .flatten();
+        let mut edge_weight =
+            edge_consistency_weight(reference_luminance, sample_luminance, source.reference)
+                * detail_consistency_weight(
+                    reference_structure,
+                    sample_structure,
+                    source.reference,
+                );
+        if edge_weight < 0.1 {
+            edge_weight = 0.0;
+        }
+        edge_weight *= focus_weight;
+        if source.fusion_enabled {
+            sharpest_agreeing_detail = sharpest_agreeing_detail
+                .max(agreeing_detail_gain(reference_structure, sample_structure) * focus_weight);
+        }
+        if options.resolution_reconstruction.uses_resolution_warps()
+            && let Some(projected) =
+                projected_camera_luminance(source, rx, ry, scale, reference_structure, options)
+        {
+            resolution.add(
+                source_index,
+                projected,
+                feather
+                    * local_confidence
+                    * source.confidence
+                    * source.magnification.powi(2)
+                    * edge_weight,
+                source.magnification,
+            );
+        }
+        if !source.fusion_enabled {
+            continue;
+        }
+        let luminance_source_weight = base_weight * edge_weight;
+        luminance += luminance_source_weight * sample_luminance;
+        luminance_weight += luminance_source_weight;
+        if source.reference {
+            reference_luminance_sum += luminance_source_weight * sample_luminance;
+            reference_luminance_weight += luminance_source_weight;
+        }
+        if let Some(matched) = source_xyz(source, rx, ry, options) {
+            let chroma_weight =
+                chroma_consistency_weight(reference_color, Some(matched), source.reference);
+            let color_source_weight = luminance_source_weight * chroma_weight;
+            for channel in 0..3 {
+                xyz[channel] += color_source_weight * matched[channel];
+            }
+            color_weight += color_source_weight;
+            if source.reference {
+                for channel in 0..3 {
+                    reference_xyz[channel] += color_source_weight * matched[channel];
+                }
+                reference_color_weight += color_source_weight;
+            }
+        }
+    }
+    if luminance_weight <= 0.0 {
+        return None;
+    }
+    let other_scale = reference_detail_protection_scale(
+        reference_structure,
+        reference_luminance_weight,
+        luminance_weight,
+        sharpest_agreeing_detail,
+    );
+    if other_scale < 1.0 {
+        luminance = reference_luminance_sum + (luminance - reference_luminance_sum) * other_scale;
+        luminance_weight = reference_luminance_weight
+            + (luminance_weight - reference_luminance_weight) * other_scale;
+        if reference_color_weight > 0.0 {
+            for channel in 0..3 {
+                xyz[channel] =
+                    reference_xyz[channel] + (xyz[channel] - reference_xyz[channel]) * other_scale;
+            }
+            color_weight =
+                reference_color_weight + (color_weight - reference_color_weight) * other_scale;
+        }
+    }
+    let mut target_luminance = luminance / luminance_weight;
+    if let Some(reconstructed) = resolution.finish()
+        && reconstructed.confidence > 0.0
+    {
+        let maximum_delta = 0.004 + 0.12 * target_luminance.max(0.0);
+        let delta = reconstructed.detail.clamp(-maximum_delta, maximum_delta);
+        let blend = (reconstructed.confidence.sqrt() * 1.10).min(1.0);
+        target_luminance = (target_luminance + blend * delta).max(0.0);
+    }
+    if color_weight > 0.0 {
+        let mean = xyz.map(|value| value / color_weight);
+        if mean[1] > 1.0e-6 {
+            Some(mean.map(|value| value * target_luminance / mean[1]))
+        } else {
+            Some(D50_WHITE.map(|value| value * target_luminance))
+        }
+    } else {
+        Some(D50_WHITE.map(|value| value * target_luminance))
+    }
+}
+
+fn invert_warp_near(
+    warp: &crate::align::Warp,
+    target: [f32; 2],
+    initial: [f32; 2],
+    reference_width: usize,
+    reference_height: usize,
+) -> Option<([f32; 2], f32)> {
+    let mut point = initial;
+    for _ in 0..8 {
+        let mapped = warp.map(point[0], point[1])?;
+        let error = [mapped[0] - target[0], mapped[1] - target[1]];
+        if error[0].abs().max(error[1].abs()) < 1.0e-3 {
+            return Some((point, error[0].hypot(error[1])));
+        }
+        let dx = warp.map((point[0] + 1.0).min((reference_width - 1) as f32), point[1])?;
+        let dy = warp.map(
+            point[0],
+            (point[1] + 1.0).min((reference_height - 1) as f32),
+        )?;
+        let (j00, j10) = (dx[0] - mapped[0], dx[1] - mapped[1]);
+        let (j01, j11) = (dy[0] - mapped[0], dy[1] - mapped[1]);
+        let determinant = j00 * j11 - j01 * j10;
+        if determinant.abs() < 1.0e-5 {
+            return None;
+        }
+        let update_x = (error[0] * j11 - error[1] * j01) / determinant;
+        let update_y = (j00 * error[1] - j10 * error[0]) / determinant;
+        point[0] = (point[0] - update_x.clamp(-8.0, 8.0)).clamp(0.0, (reference_width - 1) as f32);
+        point[1] = (point[1] - update_y.clamp(-8.0, 8.0)).clamp(0.0, (reference_height - 1) as f32);
+    }
+    let mapped = warp.map(point[0], point[1])?;
+    let residual = (mapped[0] - target[0]).hypot(mapped[1] - target[1]);
+    (residual <= 0.05).then_some((point, residual))
 }
 
 fn robust_noise_loss(residual: f32) -> f32 {

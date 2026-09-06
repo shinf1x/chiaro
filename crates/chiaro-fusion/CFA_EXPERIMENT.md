@@ -1,6 +1,13 @@
 # Real-capture cross-camera CFA experiment
 
-Status: experimental, 2026-09-04. `MultiCamera` remains the production default.
+Status: experimental, updated 2026-09-06. `MultiCamera` remains the production
+default.
+
+> The numeric tables below are historical pre-correction results. Their
+> populations changed with solver coverage and some predictions were evaluated
+> at different spatial locations, so they must not be used as quality or
+> camera-count evidence. Re-run the commands with the corrected protocol
+> described below before drawing conclusions.
 
 ## Question
 
@@ -31,11 +38,32 @@ the reference contains supported luminance or chromatic structure. Flat regions
 therefore remain bit-equivalent to the production estimate. Chromaticity edge
 confidence fades out in dark regions where colour ratios are noise-sensitive.
 
-Factory noise is propagated through the squared coefficients of the actual
-local 4x4 crosstalk row and the flat-field gain. The solver is tile-local and
-does not retain a frame-sized coefficient or normal-equation buffer.
+Factory noise is propagated through the physical bilinear interpolation
+footprint, local 4x4 crosstalk row, and flat-field gain. Reused physical sites
+inflate neighboring observation variance conservatively. Highlight provenance
+uses the same full nonzero footprint. The sensor's physical code range is kept
+separate from working headroom, making the quantization floor representation
+invariant.
 
-## Primary held-out results
+Held-out cameras are excluded before cross-camera highlight recovery, common
+profile selection, adaptive crosstalk, and scene photometric fitting. Camera
+ablation runs load the same geometry population and freeze crop, scale, and
+contributor-side radiometry. Validation deduplicates a fixed list of physical
+held-out sites, inverse-projects each site to its continuous reference
+coordinate, and scores baseline fallback at solver failures. Reports separate
+overall and solver-supported common-region loss and include the sample IDs and
+rejection counts.
+
+Solver admission requires independently conditioned XYZ responses, 2D spatial
+support, and robust support from multiple cameras before regularization can
+stabilize remaining affine directions. Production border, warp, focus,
+edge/detail, and chroma safeguards apply to every gathered footprint. If the
+baseline contains monochrome or resolution-only information unavailable to the
+Bayer equations, Joint CFA preserves its luminance. Contributor loss compares
+the affine fit with the actual production baseline field at each observation
+location and is labeled as an in-sample diagnostic.
+
+## Historical primary held-out results (invalidated; rerun required)
 
 The baseline and experiment use the same cameras, preprocessing, calibration,
 geometry, crop, and output size. The named Bayer module participates in
@@ -51,12 +79,11 @@ loss.
 | `L16_01732` | A3 | 10,523 | +21.47% | +18.25% | +24.35% | +22.57% | 0.00% (51) |
 | `L16_04364` | B2 | 53,980 | +7.16% | +6.53% | +7.94% | +10.68% | 0.00% (1,412) |
 
-Every capture improves overall and in the high-frequency population. The
-weakest case is `L16_00054`; its Gb phase still regresses by 0.51% even though
-the other phases and aggregate score improve. This prevents a claim that every
-phase is universally better.
+These figures describe the old evaluator only. The corrected report uses
+literal phase groups, independently selected flat/structured bins, and an
+explicit `measured` flag for empty bins.
 
-## Camera-count and focal-tier ablation
+## Historical camera-count and focal-tier ablation (invalidated)
 
 `L16_04364`, reference B4, held-out B2:
 
@@ -67,12 +94,10 @@ phase is universally better.
 | B4 + B1 + B3 + B5 | 4, same B tier | +6.74% |
 | B4 + B1 + B3 + B5 + C5 + C6 | 6, mixed B/C tiers | +6.82% |
 
-Results are positive at every subset size but are not monotonic: the two-camera
-pair is best, and both baseline and Joint CFA worsen as less compatible cameras
-enter. This is evidence that contributor admission and residual
-geometry/photometry need more work; camera count is not a quality proxy. The
-mixed C-tier observations recover a small amount relative to four B cameras,
-but do not recover the two-camera result.
+The old runs changed both the scored population and preprocessing geometry.
+They do not establish a camera-count trend. Corrected runs must compare the
+identical `sample_ids` list and report overall fallback-inclusive loss beside
+`common_region` coverage.
 
 For the two-camera case, tightening the maximum held-out mapping error preserves
 the result:
@@ -83,9 +108,11 @@ the result:
 | 0.20 px | 10,905 | +13.16% |
 | 0.40 px | 43,829 | +13.40% |
 
-The gain therefore does not depend on the loosest nearest-output matches.
+These were nearest-coordinate distances, not registration errors. The corrected
+field is named `projection_error_bins` and measures only numerical inverse-warp
+residual.
 
-## Natural crop
+## Historical natural crop (invalidated)
 
 The reproducible wire/railing crop from `L16_04364` is:
 
@@ -95,13 +122,10 @@ contributors: B4, B1
 canvas scale: 1
 ```
 
-On 8,792 held-out B2 samples in this crop, Joint CFA improves prediction by
-11.84%. The full Joint-CFA render solves 59.82% of output locations and applies
-an average 81.0% structure confidence. Side-by-side inspection shows changes
-concentrated on railings and other edges rather than the flat sky. No broad tone
-shift or obvious block boundary is visible; amplified differences do reveal
-small colour-edge changes, so a larger artifact corpus is still required before
-production use.
+The old evaluator reported an 11.84% improvement on 8,792 samples. Re-run this
+crop with the corrected fixed-site protocol before interpreting that number.
+The visual observations remain useful as historical artifact inspection, but
+they do not validate the old loss calculation.
 
 ## Resources
 
@@ -142,10 +166,7 @@ with an explicit error.
 
 ## Current decision
 
-The stop condition has not been met: Joint CFA repeatedly predicts unseen real
-high-frequency CFA measurements better than the matched production baseline,
-and the gain is larger than a tiny inconsistent fluctuation. However, it is not
-ready to replace MultiCamera. Contributor count is non-monotonic, one phase in
-the weakest capture regresses slightly, more held-out cameras remain to be
-checked, and natural false-colour/moire inspection is still too small. Keep
-`joint-cfa` explicitly experimental.
+The historical quality conclusion is withdrawn pending corrected full-capture
+reruns. Keep `joint-cfa` explicitly experimental and keep `MultiCamera` as the
+default. Use fallback-inclusive `overall`, identical `sample_ids`, and
+same-population `common_region` results for any new decision.

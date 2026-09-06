@@ -58,6 +58,32 @@ pub struct CorrectedCfaSample {
     pub source_values: [f32; 4],
     pub crosstalk_row: [f32; 4],
     pub flat_field: f32,
+    /// Coefficients of the actual physical CFA sites in the corrected value.
+    /// Keeping this footprint avoids pretending that an interpolated plane is
+    /// one independent sensor measurement when propagating noise.
+    pub noise_components: [CfaNoiseComponent; 16],
+    pub noise_component_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CfaNoiseComponent {
+    pub phase: CfaPhase,
+    pub sensor_index: usize,
+    /// Black-subtracted signal normalized by the working white range.
+    pub signal: f32,
+    /// Bilinear interpolation weight multiplied by the crosstalk coefficient.
+    pub coefficient: f32,
+}
+
+impl Default for CfaNoiseComponent {
+    fn default() -> Self {
+        Self {
+            phase: CfaPhase::R,
+            sensor_index: 0,
+            signal: 0.0,
+            coefficient: 0.0,
+        }
+    }
 }
 
 /// Q6 samples of one module in calibration raster order.
@@ -71,6 +97,11 @@ pub struct Mosaic {
     pub black_q6: f32,
     /// White level in Q6 units.
     pub white_q6: f32,
+    /// Number of physical sensor codes between black and white. Unlike the
+    /// working Q scale, this remains unchanged when highlight headroom is
+    /// reserved and therefore gives a representation-invariant quantization
+    /// floor.
+    pub physical_code_range: f32,
     /// Flat-field mesh in calibration-raster orientation, if calibrated.
     pub vignetting: Option<VignettingMesh>,
     /// Colour-crosstalk mesh, if calibrated (colour modules only).
@@ -101,6 +132,7 @@ impl Mosaic {
             samples,
             black_q6: black_level * 64.0,
             white_q6: white_level * 64.0,
+            physical_code_range: (white_level - black_level).max(1.0),
             vignetting: None,
             crosstalk: None,
             demosaiced_rgb: None,
@@ -113,7 +145,7 @@ impl Mosaic {
     /// than saturating immediately at `u16::MAX`.
     pub fn reserve_highlight_headroom(&mut self) {
         for sample in &mut self.samples {
-            *sample = (*sample + 1) / 2;
+            *sample = ((u32::from(*sample) + 1) / 2) as u16;
         }
         self.black_q6 *= 0.5;
         self.white_q6 *= 0.5;
@@ -218,9 +250,16 @@ impl Mosaic {
             (1 - red_col, 1 - red_row),
         ];
         let range = (self.white_q6 - self.black_q6).max(1.0);
-        let values = std::array::from_fn::<_, 4, _>(|plane| {
+        let footprints = std::array::from_fn::<_, 4, _>(|plane| {
             let (column, row) = offsets[plane];
-            self.bilinear_plane(x as f32, y as f32, column, row, 2) - self.black_q6
+            self.bilinear_plane_footprint(x as f32, y as f32, column, row, 2)
+        });
+        let values = std::array::from_fn(|plane| {
+            let footprint = &footprints[plane];
+            footprint
+                .iter()
+                .map(|&(index, weight)| weight * (self.at_index(index) - self.black_q6))
+                .sum::<f32>()
         });
         let phase_index = phase.index();
         let (value, white, crosstalk_row) = if let Some(crosstalk) = &self.crosstalk {
@@ -236,19 +275,38 @@ impl Mosaic {
             row[phase_index] = 1.0;
             (values[phase_index], range, row)
         };
+        let mut noise_components = [CfaNoiseComponent::default(); 16];
+        let mut noise_component_count = 0;
+        let mut highlight_confidence = 255;
+        let phases = [CfaPhase::R, CfaPhase::Gr, CfaPhase::Gb, CfaPhase::B];
+        for plane in 0..4 {
+            for &(index, interpolation_weight) in &footprints[plane] {
+                let coefficient = crosstalk_row[plane] * interpolation_weight;
+                if coefficient.abs() <= 1.0e-8 {
+                    continue;
+                }
+                highlight_confidence = highlight_confidence
+                    .min(highlight.confidence.get(index).copied().unwrap_or(255));
+                noise_components[noise_component_count] = CfaNoiseComponent {
+                    phase: phases[plane],
+                    sensor_index: index,
+                    signal: ((self.at_index(index) - self.black_q6) / range).max(0.0),
+                    coefficient,
+                };
+                noise_component_count += 1;
+            }
+        }
         let flat = self.flat_field(x as f32, y as f32);
         Some(CorrectedCfaSample {
             phase,
             value: (value / range).max(0.0) * flat,
             white: (white / range).max(0.0) * flat,
-            highlight_confidence: highlight
-                .confidence
-                .get(y * self.width + x)
-                .copied()
-                .unwrap_or(255),
+            highlight_confidence,
             source_values: values.map(|value| (value / range).max(0.0)),
             crosstalk_row,
             flat_field: flat,
+            noise_components,
+            noise_component_count,
         })
     }
 
@@ -265,8 +323,8 @@ impl Mosaic {
     }
 
     #[inline]
-    fn at(&self, x: usize, y: usize) -> f32 {
-        f32::from(self.samples[y * self.width + x])
+    fn at_index(&self, index: usize) -> f32 {
+        f32::from(self.samples[index])
     }
 
     /// Linear RGB and the corresponding per-channel sensor-white response at
@@ -445,6 +503,24 @@ impl Mosaic {
 
     /// Bilinear interpolation on the lattice `(ox + i*step, oy + j*step)`.
     fn bilinear_plane(&self, x: f32, y: f32, ox: usize, oy: usize, step: usize) -> f32 {
+        self.bilinear_plane_footprint(x, y, ox, oy, step)
+            .iter()
+            .map(|&(index, weight)| self.at_index(index) * weight)
+            .sum()
+    }
+
+    /// Unique physical sites and their combined bilinear coefficients. At an
+    /// image edge two or four interpolation corners can clamp to the same
+    /// sensor site; combining them is required before squaring coefficients
+    /// for a variance calculation.
+    fn bilinear_plane_footprint(
+        &self,
+        x: f32,
+        y: f32,
+        ox: usize,
+        oy: usize,
+        step: usize,
+    ) -> Vec<(usize, f32)> {
         let step_f = step as f32;
         let lx = (x - ox as f32) / step_f;
         let ly = (y - oy as f32) / step_f;
@@ -456,10 +532,25 @@ impl Mosaic {
         let j1 = (j0 + 1).min(max_j);
         let tx = (lx - i0 as f32).clamp(0.0, 1.0);
         let ty = (ly - j0 as f32).clamp(0.0, 1.0);
-        let px = |i: usize, j: usize| self.at(ox + i * step, oy + j * step);
-        let top = px(i0, j0) * (1.0 - tx) + px(i1, j0) * tx;
-        let bottom = px(i0, j1) * (1.0 - tx) + px(i1, j1) * tx;
-        top * (1.0 - ty) + bottom * ty
+        let corners = [
+            (i0, j0, (1.0 - tx) * (1.0 - ty)),
+            (i1, j0, tx * (1.0 - ty)),
+            (i0, j1, (1.0 - tx) * ty),
+            (i1, j1, tx * ty),
+        ];
+        let mut footprint = Vec::<(usize, f32)>::with_capacity(4);
+        for (i, j, weight) in corners {
+            if weight <= 0.0 {
+                continue;
+            }
+            let index = (oy + j * step) * self.width + ox + i * step;
+            if let Some((_, combined)) = footprint.iter_mut().find(|(seen, _)| *seen == index) {
+                *combined += weight;
+            } else {
+                footprint.push((index, weight));
+            }
+        }
+        footprint
     }
 
     fn bilinear_plane_confidence(
@@ -754,6 +845,8 @@ pub fn match_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{calibration::CrosstalkMesh, cfa::corrected_noise_variance};
+    use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryReport};
 
     fn textured(width: usize, height: usize, shift: (f32, f32)) -> Plane {
         let mut plane = Plane::new(width, height);
@@ -808,5 +901,87 @@ mod tests {
         let luma = mosaic.luminance_half();
         assert_eq!((luma.width, luma.height), (2, 2));
         assert!(!luma.pyramid(1).is_empty());
+    }
+
+    fn cfa_test_mosaic(crosstalk_row: [f32; 4]) -> (Mosaic, HighlightRecoveryState) {
+        let (width, height) = (6, 6);
+        let mut matrix = vec![0.0_f32; 16];
+        matrix[..4].copy_from_slice(&crosstalk_row);
+        for diagonal in 1..4 {
+            matrix[diagonal * 4 + diagonal] = 1.0;
+        }
+        let mosaic = Mosaic {
+            width,
+            height,
+            pattern: SensorPattern::Rggb,
+            samples: vec![500 << 6; width * height],
+            black_q6: 0.0,
+            white_q6: 1000.0 * 64.0,
+            physical_code_range: 1000.0,
+            vignetting: None,
+            crosstalk: Some(CrosstalkMesh {
+                columns: 2,
+                rows: 2,
+                matrices: matrix.repeat(4),
+            }),
+            demosaiced_rgb: None,
+        };
+        let mut confidence = vec![255; width * height];
+        confidence[2 * width + 1] = 0;
+        let highlight = HighlightRecoveryState {
+            confidence,
+            report: HighlightRecoveryReport {
+                mode: HighlightRecovery::None,
+                ..Default::default()
+            },
+        };
+        (mosaic, highlight)
+    }
+
+    #[test]
+    fn crosstalk_provenance_and_noise_follow_the_interpolation_footprint() {
+        // At red site (2,2), the Gr plane is the average of measured sites
+        // (1,2) and (3,2). R + 0.5*Gr therefore has variance
+        // 1 + 2*(0.5*0.5)^2 = 1.125 quantization variances.
+        let (mosaic, highlight) = cfa_test_mosaic([1.0, 0.5, 0.0, 0.0]);
+        let sample = mosaic.corrected_cfa_site(2, 2, &highlight).unwrap();
+        assert_eq!(sample.highlight_confidence, 0);
+        let variance = corrected_noise_variance(&sample, None, 1000.0);
+        assert!((variance - 1.125e-6).abs() < 1.0e-10, "{variance}");
+
+        let (mosaic, highlight) = cfa_test_mosaic([1.0, 0.0, 0.0, 0.0]);
+        let sample = mosaic.corrected_cfa_site(2, 2, &highlight).unwrap();
+        assert_eq!(sample.highlight_confidence, 255);
+    }
+
+    #[test]
+    fn physical_quantization_range_survives_working_headroom_conversion() {
+        let (mut mosaic, highlight) = cfa_test_mosaic([1.0, 0.0, 0.0, 0.0]);
+        let before = mosaic.corrected_cfa_site(2, 2, &highlight).unwrap();
+        let before_variance = corrected_noise_variance(&before, None, mosaic.physical_code_range);
+        mosaic.reserve_highlight_headroom();
+        let after = mosaic.corrected_cfa_site(2, 2, &highlight).unwrap();
+        let after_variance = corrected_noise_variance(&after, None, mosaic.physical_code_range);
+        assert_eq!(mosaic.physical_code_range, 1000.0);
+        assert!((before.value - after.value).abs() < 1.0e-6);
+        assert!((before_variance - after_variance).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn headroom_conversion_is_monotonic_at_u16_white() {
+        let mut mosaic = Mosaic {
+            width: 4,
+            height: 1,
+            pattern: SensorPattern::Mono,
+            samples: vec![0, 1, 65_534, 65_535],
+            black_q6: 0.0,
+            white_q6: 65_535.0,
+            physical_code_range: 65_535.0,
+            vignetting: None,
+            crosstalk: None,
+            demosaiced_rgb: None,
+        };
+        mosaic.reserve_highlight_headroom();
+        assert_eq!(mosaic.samples, [0, 1, 32_767, 32_768]);
     }
 }

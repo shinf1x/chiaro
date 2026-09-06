@@ -765,31 +765,46 @@ fn smoothstep(value: f32) -> f32 {
 fn recover_cross_camera_highlights(
     modules: &mut [LoadedModule],
     alignments: &[ModuleAlignment],
+    eligible: &[bool],
     reference_width: usize,
     reference_height: usize,
 ) {
-    if modules.len() < 3 || modules.len() != alignments.len() {
+    if modules.len() != alignments.len() || modules.len() != eligible.len() {
         return;
     }
     let updates = {
-        let sources = modules
+        let selected = eligible
             .iter()
-            .zip(alignments)
-            .map(|(module, alignment)| RawHighlightSource {
-                mosaic: &module.mosaic,
-                highlight: &module.highlight,
-                alignment,
+            .enumerate()
+            .filter_map(|(index, &enabled)| enabled.then_some(index))
+            .collect::<Vec<_>>();
+        let sources = selected
+            .iter()
+            .map(|&index| RawHighlightSource {
+                mosaic: &modules[index].mosaic,
+                highlight: &modules[index].highlight,
+                alignment: &alignments[index],
             })
             .collect::<Vec<_>>();
-        (0..modules.len())
-            .map(|target| {
-                cross_camera_highlight_updates(&sources, target, reference_width, reference_height)
+        selected
+            .iter()
+            .enumerate()
+            .map(|(target, &module_index)| {
+                (
+                    module_index,
+                    cross_camera_highlight_updates(
+                        &sources,
+                        target,
+                        reference_width,
+                        reference_height,
+                    ),
+                )
             })
             .collect::<Vec<_>>()
     };
-    for target_index in 0..modules.len() {
+    for (target_index, updates) in updates {
         let target = &mut modules[target_index];
-        for update in &updates[target_index] {
+        for update in &updates {
             target.mosaic.samples[update.index] = update.value;
             target
                 .highlight
@@ -966,11 +981,16 @@ pub fn fuse(
     let layout = parse_raw_layout(lri, &HashMap::new()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let frame_layout = parse_frame_layout(lri, &HashMap::new())
         .map_err(|e| anyhow::anyhow!("noise metadata: {e}"))?;
+    // A held-out experiment loads every camera so geometry, crop, and scale
+    // stay fixed across contributor ablations. `options.cameras` is applied
+    // later as an admission mask; held-out and unselected radiance never enter
+    // reconstruction or scene-fitted colour operations.
     let selected = layout
         .cameras
         .iter()
         .filter(|camera| {
-            options.cameras.is_empty()
+            !options.cfa_held_out.is_empty()
+                || options.cameras.is_empty()
                 || options
                     .cameras
                     .iter()
@@ -1263,6 +1283,38 @@ pub fn fuse(
     } else {
         vec![None; alignments.len()]
     };
+    let contributor_enabled = modules
+        .iter()
+        .map(|module| {
+            !options
+                .cfa_held_out
+                .iter()
+                .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
+                && (options.cameras.is_empty()
+                    || options
+                        .cameras
+                        .iter()
+                        .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name)))
+        })
+        .collect::<Vec<_>>();
+    // In a held-out admission ablation, keep the fitted contributor-side
+    // radiometry fixed across camera subsets while still excluding the target
+    // camera completely. Outside that protocol this is identical to ordinary
+    // contributor admission.
+    let radiometry_enabled = modules
+        .iter()
+        .enumerate()
+        .map(|(index, module)| {
+            if options.cfa_held_out.is_empty() {
+                contributor_enabled[index]
+            } else {
+                !options
+                    .cfa_held_out
+                    .iter()
+                    .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
+            }
+        })
+        .collect::<Vec<_>>();
     if options.synth.highlight_recovery.uses_multi_camera() {
         progress(Progress {
             stage: "highlight",
@@ -1276,6 +1328,7 @@ pub fn fuse(
         recover_cross_camera_highlights(
             &mut modules,
             &alignments,
+            &contributor_enabled,
             reference_dimensions.0,
             reference_dimensions.1,
         );
@@ -1344,20 +1397,28 @@ pub fn fuse(
         detail: "scoring sparse aligned factory-profile blends".to_owned(),
         fraction: 0.53,
     });
-    let array_sources = modules
+    let array_indices = radiometry_enabled
         .iter()
-        .zip(&alignments)
-        .map(|(module, alignment)| ArrayColorSource {
-            name: &module.raw.name,
-            mosaic: &module.mosaic,
-            highlight: &module.highlight,
-            alignment,
-            calibration: calibration.cameras.get(&module.raw.name),
+        .enumerate()
+        .filter_map(|(index, &enabled)| enabled.then_some(index))
+        .collect::<Vec<_>>();
+    let array_sources = array_indices
+        .iter()
+        .map(|&index| ArrayColorSource {
+            name: &modules[index].raw.name,
+            mosaic: &modules[index].mosaic,
+            highlight: &modules[index].highlight,
+            alignment: &alignments[index],
+            calibration: calibration.cameras.get(&modules[index].raw.name),
         })
         .collect::<Vec<_>>();
+    let array_reference_index = array_indices
+        .iter()
+        .position(|&index| index == reference_index)
+        .expect("reference contributor selected");
     let array_selection = select_array_profile(
         &array_sources,
-        reference_index,
+        array_reference_index,
         modules[reference_index].raw.width,
         modules[reference_index].raw.height,
         depth_map.as_ref(),
@@ -1388,30 +1449,65 @@ pub fn fuse(
         fraction: 0.54,
     });
     let crosstalk_fits = {
-        let sources = modules
+        let active_indices = radiometry_enabled
             .iter()
-            .zip(&alignments)
-            .zip(&module_colors)
-            .map(|((module, alignment), &color)| CrosstalkFitSource {
-                mosaic: &module.mosaic,
-                highlight: &module.highlight,
-                alignment,
-                color,
-                capture_gain: module.capture_gain,
-                exposure_ns: module.exposure_ns,
+            .enumerate()
+            .filter_map(|(index, &enabled)| enabled.then_some(index))
+            .collect::<Vec<_>>();
+        let sources = active_indices
+            .iter()
+            .map(|&index| CrosstalkFitSource {
+                mosaic: &modules[index].mosaic,
+                highlight: &modules[index].highlight,
+                alignment: &alignments[index],
+                color: module_colors[index],
+                capture_gain: modules[index].capture_gain,
+                exposure_ns: modules[index].exposure_ns,
             })
             .collect::<Vec<_>>();
         let dimensions = (
             modules[reference_index].mosaic.width,
             modules[reference_index].mosaic.height,
         );
-        fit_adaptive_crosstalk(
+        let active_reference = active_indices
+            .iter()
+            .position(|&index| index == reference_index)
+            .expect("reference contributor selected");
+        let active_fits = fit_adaptive_crosstalk(
             &sources,
-            reference_index,
+            active_reference,
             options.crosstalk,
             dimensions.0,
             dimensions.1,
-        )
+        );
+        let mut active_fits = active_indices.into_iter().zip(active_fits);
+        (0..modules.len())
+            .map(|index| {
+                if radiometry_enabled[index] {
+                    let (fit_index, fit) = active_fits.next().expect("one fit per contributor");
+                    debug_assert_eq!(fit_index, index);
+                    fit
+                } else {
+                    let source = CrosstalkFitSource {
+                        mosaic: &modules[index].mosaic,
+                        highlight: &modules[index].highlight,
+                        alignment: &alignments[index],
+                        color: module_colors[index],
+                        capture_gain: modules[index].capture_gain,
+                        exposure_ns: modules[index].exposure_ns,
+                    };
+                    fit_adaptive_crosstalk(
+                        std::slice::from_ref(&source),
+                        0,
+                        CrosstalkMode::Factory,
+                        dimensions.0,
+                        dimensions.1,
+                    )
+                    .pop()
+                    .expect("one factory fit")
+                }
+            })
+            .collect::<Vec<_>>()
     };
     let crosstalk_reports = modules
         .iter_mut()
@@ -1424,8 +1520,8 @@ pub fn fuse(
 
     // Advanced demosaicing is prepared only for geometrically accepted colour
     // modules. This avoids allocating an RGB cache for rejected cameras.
-    for (module, alignment) in modules.iter_mut().zip(&alignments) {
-        if alignment.report.accepted && !module.mosaic.is_mono() {
+    for (index, (module, alignment)) in modules.iter_mut().zip(&alignments).enumerate() {
+        if contributor_enabled[index] && alignment.report.accepted && !module.mosaic.is_mono() {
             module
                 .mosaic
                 .prepare_demosaic(options.synth.demosaic, options.threads)
@@ -1438,7 +1534,10 @@ pub fn fuse(
     // (mirror-path glare, colour shading).
     let mut gain_fields = vec![GainField::identity(); modules.len()];
     for index in 0..modules.len() {
-        if modules[index].raw.name != reference_name && alignments[index].report.accepted {
+        if contributor_enabled[index]
+            && modules[index].raw.name != reference_name
+            && alignments[index].report.accepted
+        {
             let (gain, offset) = photometric_match(
                 &modules[reference_index].mosaic,
                 &module_colors[reference_index],
@@ -1482,7 +1581,10 @@ pub fn fuse(
     let framed_focal_length_mm = image_focal_length_mm(&messages);
     let crop = match (options.crop, framed_focal_length_mm) {
         (Some(crop), _) => {
-            if crop.x < 0.0
+            if ![crop.x, crop.y, crop.width, crop.height]
+                .into_iter()
+                .all(f32::is_finite)
+                || crop.x < 0.0
                 || crop.y < 0.0
                 || crop.width < 1.0
                 || crop.height < 1.0
@@ -1543,16 +1645,17 @@ pub fn fuse(
     let finest = modules
         .iter()
         .zip(&alignments)
-        .filter(|(module, alignment)| {
-            !options
-                .cfa_held_out
-                .iter()
-                .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
-                && alignment.report.accepted
+        .enumerate()
+        .filter(|(index, (module, alignment))| {
+            (if options.cfa_held_out.is_empty() {
+                contributor_enabled[*index]
+            } else {
+                radiometry_enabled[*index]
+            }) && alignment.report.accepted
                 && (options.synth.include_mono || !module.mosaic.is_mono())
                 && intersects_crop(alignment, module, &crop)
         })
-        .map(|(module, _)| magnification(module))
+        .map(|(_, (module, _))| magnification(module))
         .fold(1.0f32, f32::max);
     let scale = canvas_scale(&crop, reference.raw.width, options.synth.canvas, finest);
     progress(Progress {
@@ -1576,20 +1679,22 @@ pub fn fuse(
         .zip(&alignments)
         .zip(module_colors.iter().zip(&gain_fields))
         .zip(&resolution_warps)
-        .filter(|(((module, alignment), _), resolution_warp)| {
+        .enumerate()
+        .filter(|(index, (((module, alignment), _), resolution_warp))| {
             let held_out = options
                 .cfa_held_out
                 .iter()
                 .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name));
-            held_out
-                || alignment.report.accepted
-                || resolution_warp.as_ref().is_some_and(|refined| {
-                    refined.report.supported_fraction >= 0.005
-                        && refined.report.mean_confidence >= 0.5
-                })
+            (contributor_enabled[*index] || held_out)
+                && (held_out
+                    || alignment.report.accepted
+                    || resolution_warp.as_ref().is_some_and(|refined| {
+                        refined.report.supported_fraction >= 0.005
+                            && refined.report.mean_confidence >= 0.5
+                    }))
         })
         .map(
-            |(((module, alignment), (color, gain_field)), resolution_warp)| SynthSource {
+            |(index, (((module, alignment), (color, gain_field)), resolution_warp))| SynthSource {
                 camera_id: module.raw.id,
                 mosaic: &module.mosaic,
                 highlight: &module.highlight,
@@ -1600,7 +1705,8 @@ pub fn fuse(
                     .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name)),
                 alignment,
                 resolution_warp: resolution_warp.as_ref(),
-                fusion_enabled: alignment.report.accepted
+                fusion_enabled: contributor_enabled[index]
+                    && alignment.report.accepted
                     && !options
                         .cfa_held_out
                         .iter()
@@ -1826,6 +1932,7 @@ mod tests {
                 samples,
                 black_q6: 0.0,
                 white_q6: 65_535.0,
+                physical_code_range: 65_535.0,
                 vignetting: None,
                 crosstalk: None,
                 demosaiced_rgb: None,
