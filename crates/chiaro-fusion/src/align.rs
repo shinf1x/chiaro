@@ -148,12 +148,32 @@ impl Warp {
 pub struct ModuleAlignment {
     pub name: String,
     pub warp: Warp,
+    /// Finest-level image observations retained in physical raster
+    /// coordinates for capture-specific rig refinement. These are not a warp:
+    /// each entry is one independently matched patch centre.
+    pub correspondences: Vec<AlignmentCorrespondence>,
     /// Luminance match to the reference, applied as `gain * (sample - offset)`
     /// to every channel (filled in by the pipeline's photometric step; a rough
     /// estimate from the alignment planes until then).
     pub gain: f32,
     pub offset: f32,
     pub report: AlignmentReport,
+}
+
+/// One cross-camera patch observation exposed to the physical rig optimizer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignmentCorrespondence {
+    pub reference_pixel: Vec2,
+    pub target_pixel: Vec2,
+    /// Normalized cross-correlation peak.
+    pub confidence: f32,
+    /// Target pixels per reference pixel at this location.
+    pub local_scale: f32,
+    /// Standard deviation of the reference log-luminance match window.
+    pub structure: f32,
+    /// Filled by later depth-aware matchers when available. The initial
+    /// physical solve deliberately works without requiring dense depth.
+    pub depth_reliability: Option<f32>,
 }
 
 /// Diagnostics written next to the fused output.
@@ -299,6 +319,7 @@ pub fn align_module_seeded(
         return Ok(ModuleAlignment {
             name: target.name.to_owned(),
             warp,
+            correspondences: Vec::new(),
             gain: 1.0,
             offset: 0.0,
             report,
@@ -347,6 +368,7 @@ pub fn align_module_seeded(
     // Step 2: coarse-to-fine refinement of a reference-space homography C.
     let mut correction: Mat3 = crate::math::IDENTITY;
     let mut finest_residuals: Vec<f32> = Vec::new();
+    let mut correspondences = Vec::new();
     if options.refine {
         let reference_pyramid = reference.luminance.pyramid(96);
         let target_pyramid = target.luminance.pyramid(48);
@@ -393,6 +415,7 @@ pub fn align_module_seeded(
             };
             let patch = options.patch.min(reference_plane.width / 4).max(8);
             let mut pairs = Vec::new();
+            let mut pair_structure = Vec::new();
             let stride = patch / 2;
             let mut y = radius;
             while y + patch + radius <= reference_plane.height {
@@ -422,6 +445,7 @@ pub fn align_module_seeded(
                         // reference shows at `centre`: C maps centre -> shifted
                         // (in the current corrected frame).
                         pairs.push((centre, shifted, found.score));
+                        pair_structure.push(reference_plane.window_std(x, y, patch));
                     }
                     x += stride;
                 }
@@ -429,6 +453,24 @@ pub fn align_module_seeded(
             }
             let threshold = (options.inlier_px * scale as f32 * 2.0).max(options.inlier_px);
             if let Some((update, inliers, residuals)) = fit_homography_ransac(&pairs, threshold) {
+                if level == 0 {
+                    correspondences = inliers
+                        .iter()
+                        .filter_map(|&index| {
+                            let (reference_pixel, shifted, confidence) = pairs[index];
+                            let corrected = apply_homography(&correction, shifted)?;
+                            let target_pixel = initial(corrected)?;
+                            Some(AlignmentCorrespondence {
+                                reference_pixel,
+                                target_pixel,
+                                confidence,
+                                local_scale: magnification as f32,
+                                structure: pair_structure[index],
+                                depth_reliability: None,
+                            })
+                        })
+                        .collect();
+                }
                 correction = crate::math::mul(&correction, &update);
                 report.levels.push(LevelReport {
                     scale: scale * 2,
@@ -512,6 +554,7 @@ pub fn align_module_seeded(
     Ok(ModuleAlignment {
         name: target.name.to_owned(),
         warp,
+        correspondences,
         gain,
         offset: 0.0,
         report,
@@ -635,8 +678,8 @@ fn coarse_global_shift(
     ])
 }
 
-/// `(C, inliers, sorted inlier residuals)` of a robust homography fit.
-type HomographyFit = (Mat3, Vec<(Vec2, Vec2, f32)>, Vec<f32>);
+/// `(C, inlier indices, sorted inlier residuals)` of a robust homography fit.
+type HomographyFit = (Mat3, Vec<usize>, Vec<f32>);
 
 /// Fit `C` with `b ~= C a` for weighted pairs `(a, b, score)` by RANSAC over
 /// four-point DLT samples followed by a least-squares refit on the inliers.
@@ -692,11 +735,11 @@ fn fit_homography_ransac(pairs: &[(Vec2, Vec2, f32)], threshold: f32) -> Option<
     // Re-select inliers under the refit and compute residuals.
     let mut final_inliers = Vec::new();
     let mut residuals = Vec::new();
-    for pair in pairs {
+    for (index, pair) in pairs.iter().enumerate() {
         if let Some(p) = apply_homography(&h, pair.0) {
             let r = ((p[0] - pair.1[0]).powi(2) + (p[1] - pair.1[1]).powi(2)).sqrt() as f32;
             if r <= threshold {
-                final_inliers.push(*pair);
+                final_inliers.push(index);
                 residuals.push(r);
             }
         }

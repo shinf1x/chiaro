@@ -14,8 +14,12 @@ command-line application.
    measurements, reconstruct small edges locally, and use a clipping-aware RGB
    pyramid for larger low-confidence regions. One bit of fractional RAW
    precision is reserved as radiometric headroom above sensor white.
-2. Resolve the factory camera model, project each module into a reference view,
-   refine the global alignment with image correlation, build a dense calibrated
+2. Resolve the factory camera model and obtain robust image correspondences.
+   A bounded capture-specific physical solve may refine observable camera
+   orientation and movable-mirror state, but is accepted only after independent
+   geometric validation, positive-depth checks, and a downstream residual-
+   correction gate. Project each accepted module into a reference view, refine
+   the remaining global alignment with image correlation, build a dense calibrated
    inverse-depth cost field, and regularise coarse search hypotheses with
    edge-aware eight-direction semi-global matching. A finer 4-pixel grid then
    independently remeasures every accepted node with small or adaptive
@@ -74,7 +78,8 @@ command-line application.
    sensor-white shoulder neutralises false colour from unequally clipped raw
    channels without introducing a hard highlight boundary.
 
-Every run also writes a `.fusion.json` report with alignment, RAW highlight
+Every run also writes a `.fusion.json` report with physical-rig fit/validation,
+triangulation, correction and fallback diagnostics, alignment, RAW highlight
 confidence/counts, cleanup availability and correction statistics, per-module
 crosstalk fit/validation measurements, the CCT prior and selected colour-profile
 weights, best/runner-up array scores, evidence coverage and confidence,
@@ -216,6 +221,8 @@ and unsupported nodes black. With default settings, finite final nodes are
 green: SGM proposes where to search but cannot create final depth by itself.
 
 See [Chiaro Fuse](../../apps/fuse/README.md) for command-line usage.
+See [capture-specific physical rig refinement](RIG_REFINEMENT.md) for the
+parameterization, acceptance gates, and initial real-capture validation.
 See [the real-capture CFA experiment](CFA_EXPERIMENT.md) for the current
 held-out measurements, ablations, resource costs, and production decision.
 

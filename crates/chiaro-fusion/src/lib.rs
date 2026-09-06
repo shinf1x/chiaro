@@ -4,18 +4,22 @@
 //! Stages (see [`pipeline`]):
 //!
 //! 1. hot-pixel removal per module (`chiaro-hotpixel-core`);
-//! 2. alignment: the factory camera model ([`calibration`], [`geometry`])
+//! 2. physical rig refinement: existing robust correspondences fit bounded
+//!    orientation/mirror corrections on top of the factory model and are
+//!    accepted only on held-out geometry and downstream residual alignment
+//!    ([`rig`]);
+//! 3. alignment: the accepted physical model ([`calibration`], [`geometry`])
 //!    predicts where every module lands in the reference frame, then a
-//!    coarse-to-fine correlation search refines a global homography and a
+//!    coarse-to-fine correlation search refines the residual homography and a
 //!    dense calibrated inverse-depth reconstruction corrects parallax
 //!    ([`align`], [`depth`]);
-//! 3. factory colour selection: the original D65 profile remains the default;
+//! 4. factory colour selection: the original D65 profile remains the default;
 //!    experimental modes use capture CCT or sparse, reliable aligned overlap
 //!    to choose an A/F11/D65 blend ([`array_color`]);
-//! 4. capture-adaptive crosstalk: a constrained residual over the factory
+//! 5. capture-adaptive crosstalk: a constrained residual over the factory
 //!    four-phase mesh is fitted from smooth aligned overlap and accepted only
 //!    after held-out validation ([`crosstalk`]);
-//! 5. synthesis: every module is resampled onto a common high-resolution
+//! 6. synthesis: every module is resampled onto a common high-resolution
 //!    canvas with resolution-aware, feathered weights and written as a linear
 //!    or display-referred 16-bit PNG ([`synth`]).
 //!
@@ -35,4 +39,5 @@ pub mod image;
 pub mod math;
 pub mod pipeline;
 pub mod resolution;
+pub mod rig;
 pub mod synth;

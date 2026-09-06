@@ -25,7 +25,10 @@ diagnostic report. Its `color` section records the available factory
 illuminants, selected weights, confidence, and whether a held-out-validated
 Macbeth refit was used. `array_color` records the CCT prior, selected simplex
 blend, best and runner-up scores, reliable sample/module/spatial coverage, and
-fallback reason when the array evidence is weak.
+fallback reason when the array evidence is weak. `rig_refinement` records the
+bounded physical fit, fixed validation population, positive-depth and
+conditioning diagnostics, residual-vector field, downstream alignment gate,
+and exact factory-fallback reason.
 
 Supply `calibration.lri` and `zoom_calib_v0.lri` whenever possible. Capture
 headers contain only part of the camera model; without device mirror-aiming and
@@ -74,6 +77,8 @@ Common options include:
   capture-specific residual does not improve held-out overlap measurements;
 - `--exclude-mono` omits monochrome luminance;
 - `--no-depth` keeps the global homography for depth-refinement comparisons;
+- `--no-rig-refine` disables the bounded capture-specific physical camera and
+  mirror refinement while retaining the existing residual image alignment;
 - `--depth-near` and `--depth-far` set the calibrated local search interval
   (0.5 m to 10 km by default);
 - `--no-highlight-correction` disables only the final display-oriented smooth

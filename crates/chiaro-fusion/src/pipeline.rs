@@ -33,7 +33,7 @@ use crate::array_color::{
 };
 use crate::calibration::{
     CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, ModuleFocusState,
-    awb_gains, image_focal_length_mm, module_states,
+    ModuleState, awb_gains, image_focal_length_mm, module_states,
 };
 use crate::crosstalk::{
     AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
@@ -42,6 +42,10 @@ use crate::depth::refine_multiview_depth;
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
 use crate::resolution::refine_resolution_warp;
+use crate::rig::{
+    RigCameraInput, RigRefinementOptions, RigRefinementReport, gate_on_image_space_alignment,
+    refine_capture_rig,
+};
 use crate::synth::{
     ColorPipeline, CropWindow, GainField, ModuleColor, SynthOptions, SynthReport, SynthSource,
     auto_exposure, canvas_scale, photometric_field, photometric_match, synthesize,
@@ -72,6 +76,9 @@ pub struct FusionOptions {
     /// excluded completely from reconstruction.
     pub cfa_held_out: Vec<String>,
     pub align: AlignOptions,
+    /// Capture-specific bounded physical rig refinement, accepted only on an
+    /// independently held-out correspondence subset.
+    pub rig_refinement: RigRefinementOptions,
     pub synth: SynthOptions,
     /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
     pub crosstalk: CrosstalkMode,
@@ -105,6 +112,7 @@ impl Default for FusionOptions {
             cameras: Vec::new(),
             cfa_held_out: Vec::new(),
             align: AlignOptions::default(),
+            rig_refinement: RigRefinementOptions::default(),
             synth: SynthOptions::default(),
             crosstalk: CrosstalkMode::default(),
             color_profile: ColorProfileMode::default(),
@@ -135,6 +143,9 @@ pub struct FusionReport {
     /// 35 mm-equivalent focal length recorded for the framing, if any.
     pub framed_focal_length_mm: Option<i32>,
     pub modules: Vec<AlignmentReport>,
+    /// Capture-specific physical orientation/mirror refinement performed
+    /// before the downstream residual image-space warp.
+    pub rig_refinement: RigRefinementReport,
     /// RAW-domain clipped-sample reconstruction performed per module.
     pub highlights: Vec<(String, HighlightRecoveryReport)>,
     /// Camera-specific learned cleanup availability and correction results.
@@ -537,6 +548,7 @@ struct LoadedModule {
     raw: RawCamera,
     mosaic: Mosaic,
     camera: Option<ResolvedCamera>,
+    state: Option<ModuleState>,
     focus: ModuleFocusState,
     highlight: HighlightRecoveryState,
     cleanup: CleanupDiagnostics,
@@ -551,6 +563,46 @@ struct LoadedHotpixelModels {
     thermal: Option<ThermalProfile>,
     cleanup_requested: bool,
     cleanup_cameras: HashMap<usize, CleanupCameraProfile>,
+}
+
+fn alignment_inputs<'a>(
+    modules: &'a [LoadedModule],
+    luminance: &'a [Plane],
+) -> Vec<AlignInput<'a>> {
+    modules
+        .iter()
+        .zip(luminance)
+        .map(|(module, luminance)| AlignInput {
+            name: &module.raw.name,
+            luminance,
+            width: module.raw.width,
+            height: module.raw.height,
+            camera: module.camera.as_ref(),
+            nominal_focal_px: module
+                .camera
+                .as_ref()
+                .map(|camera| camera.focal_px)
+                .unwrap_or_else(|| nominal_focal_px(&module.raw.name)),
+        })
+        .collect()
+}
+
+fn align_all_modules(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    options: &AlignOptions,
+) -> Result<Vec<ModuleAlignment>> {
+    let reference = &inputs[reference_index];
+    std::thread::scope(|scope| {
+        let handles = inputs
+            .iter()
+            .map(|input| scope.spawn(move || align_module(reference, input, options)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("alignment worker panicked"))
+            .collect::<Result<Vec<_>>>()
+    })
 }
 
 fn correct_fusion_raw(
@@ -1157,6 +1209,7 @@ pub fn fuse(
             raw: raw.clone(),
             mosaic,
             camera,
+            state,
             focus,
             highlight,
             cleanup,
@@ -1196,36 +1249,75 @@ pub fn fuse(
         .iter()
         .position(|module| module.raw.name == reference_name)
         .expect("reference selected");
-    let inputs = modules
+    let inputs = alignment_inputs(&modules, &luminance);
+    let factory_alignments = align_all_modules(&inputs, reference_index, &options.align)?;
+    drop(inputs);
+
+    progress(Progress {
+        stage: "align",
+        detail: "validating capture-specific physical rig".to_owned(),
+        fraction: 0.42,
+    });
+    let rig_inputs = modules
         .iter()
-        .zip(&luminance)
-        .map(|(module, luminance)| AlignInput {
+        .map(|module| RigCameraInput {
             name: &module.raw.name,
-            luminance,
-            width: module.raw.width,
-            height: module.raw.height,
-            camera: module.camera.as_ref(),
-            nominal_focal_px: module
-                .camera
-                .as_ref()
-                .map(|c| c.focal_px)
-                .unwrap_or_else(|| nominal_focal_px(&module.raw.name)),
+            calibration: calibration.cameras.get(&module.raw.name),
+            state: module.state.as_ref(),
         })
         .collect::<Vec<_>>();
-    let reference_input = &inputs[reference_index];
-    let mut alignments = std::thread::scope(|scope| {
-        let handles = inputs
-            .iter()
-            .map(|input| {
-                let options = &options.align;
-                scope.spawn(move || align_module(reference_input, input, options))
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("alignment worker panicked"))
-            .collect::<Result<Vec<ModuleAlignment>>>()
-    })?;
+    let mut rig_outcome = refine_capture_rig(
+        &rig_inputs,
+        reference_index,
+        &factory_alignments,
+        options.intrinsics_mode,
+        &options.rig_refinement,
+    );
+    drop(rig_inputs);
+    let factory_cameras = modules
+        .iter()
+        .map(|module| module.camera.clone())
+        .collect::<Vec<_>>();
+    let mut alignments = if rig_outcome.report.accepted {
+        for (module, refinement) in modules.iter_mut().zip(&rig_outcome.refinements) {
+            module.camera = match (
+                calibration.cameras.get(&module.raw.name),
+                module.state.as_ref(),
+            ) {
+                (Some(calibration), Some(state)) => {
+                    ResolvedCamera::new(calibration, state, options.intrinsics_mode, refinement)
+                        .ok()
+                }
+                _ => None,
+            };
+        }
+        progress(Progress {
+            stage: "align",
+            detail: "refining residual warp from accepted physical rig".to_owned(),
+            fraction: 0.44,
+        });
+        let refined_inputs = alignment_inputs(&modules, &luminance);
+        let refined_alignments =
+            align_all_modules(&refined_inputs, reference_index, &options.align)?;
+        if gate_on_image_space_alignment(
+            &mut rig_outcome.report,
+            &factory_alignments,
+            &refined_alignments,
+            options
+                .rig_refinement
+                .min_image_space_correction_improvement,
+        ) {
+            refined_alignments
+        } else {
+            for (module, factory_camera) in modules.iter_mut().zip(factory_cameras) {
+                module.camera = factory_camera;
+            }
+            factory_alignments
+        }
+    } else {
+        factory_alignments
+    };
+    let inputs = alignment_inputs(&modules, &luminance);
     for (module, alignment) in modules.iter().zip(&mut alignments) {
         alignment.report.focus_achieved = module.focus.achieved;
         alignment.report.calibrated_focus_distance = module
@@ -1755,6 +1847,7 @@ pub fn fuse(
         calibration_modules: calibration.cameras.len(),
         framed_focal_length_mm,
         modules: alignments.iter().map(|a| a.report.clone()).collect(),
+        rig_refinement: rig_outcome.report,
         highlights: modules
             .iter()
             .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
@@ -1969,6 +2062,7 @@ mod tests {
             .map(|index| ModuleAlignment {
                 name: format!("B{index}"),
                 warp: crate::align::Warp::from_fn(width, height, 32, Some),
+                correspondences: Vec::new(),
                 gain: 1.0,
                 offset: 0.0,
                 report: AlignmentReport {

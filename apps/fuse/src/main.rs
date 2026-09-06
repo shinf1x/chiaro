@@ -186,6 +186,11 @@ struct Cli {
     #[arg(long)]
     no_refine: bool,
 
+    /// Disable capture-specific physical rig refinement while retaining the
+    /// existing residual image-space alignment.
+    #[arg(long)]
+    no_rig_refine: bool,
+
     /// Disable calibrated local inverse-depth refinement and keep one global
     /// homography per module.
     #[arg(long)]
@@ -253,6 +258,7 @@ fn main() -> Result<()> {
         ..FusionOptions::default()
     };
     options.align.refine = !cli.no_refine;
+    options.rig_refinement.enabled = !cli.no_refine && !cli.no_rig_refine;
     options.align.depth.enabled = !cli.no_depth;
     options.align.depth.near_depth = cli.depth_near;
     options.align.depth.far_depth = cli.depth_far;
@@ -307,6 +313,65 @@ fn main() -> Result<()> {
         report.synthesis.canvas_height,
         report.synthesis.covered * 100.0,
     );
+    let rig = &report.rig_refinement;
+    println!(
+        "physical rig: {} - {} tracks ({} with 3+ cameras; {} fit/{} held out), RMS {:.3}->{:.3} px, held-out {:.3}->{:.3} px ({:+.2}%){}",
+        if rig.accepted {
+            "accepted"
+        } else {
+            "factory retained"
+        },
+        rig.tracks,
+        rig.tracks_three_plus,
+        rig.fit_tracks,
+        rig.validation_tracks,
+        rig.reprojection_rms_before,
+        rig.reprojection_rms_after,
+        rig.held_out_rms_before,
+        rig.held_out_rms_after,
+        rig.held_out_relative_improvement * 100.0,
+        rig.fallback_reason
+            .as_ref()
+            .map_or(String::new(), |reason| format!("; {reason}")),
+    );
+    if rig.image_space_evaluated_cameras > 0 {
+        println!(
+            "  downstream residual correction: median {:.2}->{:.2} px across {} fitted cameras ({:+.2}%)",
+            rig.image_space_median_correction_before_px,
+            rig.image_space_median_correction_after_px,
+            rig.image_space_evaluated_cameras,
+            rig.image_space_relative_improvement * 100.0,
+        );
+    }
+    if rig.fit_tracks > 0 {
+        println!(
+            "  positive-depth tracks: fit {:.1}->{:.1}%, held-out {:.1}->{:.1}%",
+            rig.fit_positive_depth_fraction_before * 100.0,
+            rig.fit_positive_depth_fraction_after * 100.0,
+            rig.held_out_positive_depth_fraction_before * 100.0,
+            rig.held_out_positive_depth_fraction_after * 100.0,
+        );
+    }
+    if rig.accepted {
+        for correction in rig.corrections.iter().filter(|correction| {
+            correction.orientation_offset_degrees != [0.0; 3]
+                || correction.mirror_angle_offset_degrees != 0.0
+        }) {
+            println!(
+                "  {} physical correction: orientation {:+.4},{:+.4},{:+.4} deg, mirror {:+.4} deg{}",
+                correction.camera,
+                correction.orientation_offset_degrees[0],
+                correction.orientation_offset_degrees[1],
+                correction.orientation_offset_degrees[2],
+                correction.mirror_angle_offset_degrees,
+                if correction.reached_bound {
+                    " (at bound)"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
     for module in &report.modules {
         println!(
             "  {:<3} {:<14} coverage {:>5.1}%  inliers {:>4}/{:<4} residual median {:>5.2} px p90 {:>5.2} px  correction {:+.1},{:+.1} px  {}",
@@ -496,6 +561,7 @@ mod tests {
             ResolutionReconstruction::JointCfa
         );
         assert!(!cli.joint_cfa_solve_flat);
+        assert!(!cli.no_rig_refine);
     }
 
     #[test]
