@@ -72,11 +72,13 @@ recovery before demosaic.
 `--crosstalk` accepts `none`, `factory`, or `adaptive`. Adaptive is the
 all-module default; it applies a held-out-validated residual over the factory
 17x13 four-phase mesh and otherwise retains that factory mesh unchanged.
-`--resolution-reconstruction` accepts `resample` or `multi-camera`. The default
-multi-camera mode uses locally verified, noise-weighted physical samples. It
-selects the finest available optical tier; a denser module can transfer real
-detail directly, while equal-resolution reconstruction requires coherent
-subpixel phases from multiple modules.
+`--resolution-reconstruction` accepts `resample`, `multi-camera`, or
+`joint-cfa`. Night retains `multi-camera` as its default because merged temporal
+variance/provenance is not yet supplied to the Joint-CFA observation model.
+MultiCamera uses locally verified, noise-weighted physical samples and selects
+the finest available optical tier; a denser module can transfer real detail
+directly, while equal-resolution reconstruction requires coherent subpixel
+phases from multiple modules.
 
 Temporal rejection is per pixel. Dense depth reconstruction is classical and
 confidence-gated; it does not yet estimate non-rigid subject motion between

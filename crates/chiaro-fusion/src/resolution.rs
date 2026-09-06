@@ -27,14 +27,15 @@ pub enum ResolutionReconstruction {
     /// Existing per-camera bilinear pull resampling and robust blending.
     Resample,
     /// Project physical samples from multiple cameras onto the output lattice.
-    #[default]
     MultiCamera,
-    /// Experimental joint solve from projected physical Bayer measurements.
+    /// Joint solve from projected physical Bayer measurements, with production
+    /// fallback wherever the local solve lacks independent support.
+    #[default]
     JointCfa,
 }
 
 impl ResolutionReconstruction {
-    pub const ALL: [Self; 3] = [Self::Resample, Self::MultiCamera, Self::JointCfa];
+    pub const ALL: [Self; 3] = [Self::JointCfa, Self::MultiCamera, Self::Resample];
 
     pub fn uses_resolution_warps(self) -> bool {
         matches!(self, Self::MultiCamera | Self::JointCfa)
@@ -44,7 +45,7 @@ impl ResolutionReconstruction {
         match self {
             Self::Resample => "Resample",
             Self::MultiCamera => "Multi-camera",
-            Self::JointCfa => "Joint CFA (experimental)",
+            Self::JointCfa => "Joint CFA",
         }
     }
 }
@@ -500,6 +501,14 @@ fn smoothstep(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joint_cfa_is_the_resolution_default() {
+        assert_eq!(
+            ResolutionReconstruction::default(),
+            ResolutionReconstruction::JointCfa
+        );
+    }
 
     #[test]
     fn hann_is_compact_smooth_and_positive() {

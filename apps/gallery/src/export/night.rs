@@ -89,7 +89,9 @@ impl Default for NightStackExport {
             demosaic: DemosaicMethod::Lmmse,
             highlight_recovery: HighlightRecovery::MultiCamera,
             crosstalk: CrosstalkMode::default(),
-            resolution_reconstruction: ResolutionReconstruction::default(),
+            // Keep Night on the temporally validated path until merged-sample
+            // variance/provenance is available to Joint CFA (CFA-13).
+            resolution_reconstruction: ResolutionReconstruction::MultiCamera,
             include_mono: true,
             highlight_correction: true,
             fast_compression: false,
@@ -631,6 +633,14 @@ fn stack_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn night_keeps_multi_camera_resolution_default() {
+        assert_eq!(
+            NightStackExport::default().resolution_reconstruction,
+            ResolutionReconstruction::MultiCamera
+        );
+    }
 
     fn target(night_mode: bool) -> ExportTarget {
         ExportTarget::new(

@@ -598,6 +598,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standard_fusion_defaults_to_joint_cfa() {
+        assert_eq!(
+            FusionExport::default().resolution_reconstruction,
+            ResolutionReconstruction::JointCfa
+        );
+    }
+
+    #[test]
     fn estimate_scales_with_canvas_size() {
         let export = FusionExport::default();
         let target = ExportTarget {

@@ -43,12 +43,15 @@ Common options include:
 - `--cleanup-profile` applies an optional `.chiaro-cleanup` calibration and
   records per-module availability and correction statistics in the report;
 - `--resolution-reconstruction resample|multi-camera|joint-cfa` selects ordinary
-  pull resampling, the production locally aligned multiscale reconstruction,
-  or the experimental pre-demosaic joint-CFA solver.
-  MultiCamera gives high-frequency ownership to the finest verified optical
-  tier while retaining the reference camera's tone and colour. Locally sound
-  detail may be recovered even from a module rejected for ordinary fusion.
-  `joint-cfa` is an evaluation path, not a production recommendation yet;
+  pull resampling, the legacy locally aligned multiscale reconstruction, or
+  the default pre-demosaic Joint-CFA solver. Joint CFA solves calibrated
+  physical samples jointly and falls back to the production MultiCamera result
+  wherever independent local support is insufficient. MultiCamera remains
+  explicitly selectable for comparison and rollback;
+- `--joint-cfa-solve-flat` is a diagnostic-only switch that restores solver
+  attempts where the reference structure gate guarantees a zero-weight update;
+  ordinary Joint-CFA rendering skips those attempts and reports the saved
+  fraction;
 - `--cfa-held-out CAMERA` excludes a physical Bayer module from both baseline
   and joint reconstruction, then reports how well each predicts that camera's
   unseen real CFA measurements. Repeat it for camera-wise cross-validation;
@@ -94,7 +97,7 @@ leave-one-patch-out CIEDE2000 statistics. `--raw-only` skips the fitting pass.
 
 Run `chiaro-fuse --help` for all options.
 
-## Experimental cross-camera CFA validation
+## Joint CFA reconstruction and cross-camera validation
 
 Joint CFA reconstruction operates on corrected physical R/Gr/Gb/B sites before
 demosaicing. It robustly fits a compact local XYZ field from calibrated camera
@@ -103,7 +106,7 @@ confidence, and an edge-aligned Hann window. A local affine field is used so
 the test does not obtain lower error merely by averaging away edges. The
 implementation is deterministic, CPU-only, and independently tileable.
 
-The primary real-capture experiment keeps the normal MultiCamera render as the
+The real-capture validation keeps a MultiCamera render as the comparison
 baseline and withholds one non-reference module:
 
 ```bash
@@ -125,6 +128,9 @@ resolution. Joint diagnostics also record attempted/support counts, response
 and spatial conditioning, application confidence, peak resident memory, and
 total/synthesis time per megapixel. Held-out reports estimate uncertainty over
 64x64 sensor blocks instead of treating neighboring CFA sites as independent.
+They also retain deterministic per-site phase, reference-only structure,
+held-out SNR, prediction/loss, and solver-support diagnostics for paired subset
+analysis without using in-sample contributor residuals as quality evidence.
 
 Fusion builds a calibrated multi-camera inverse-depth cost field after global
 alignment. Eight-direction semi-global matching proposes coarse hypotheses;

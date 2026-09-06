@@ -79,6 +79,10 @@ pub struct SynthOptions {
     pub highlight_recovery: HighlightRecovery,
     /// Pull resampling or physical-sample multi-camera reconstruction.
     pub resolution_reconstruction: ResolutionReconstruction,
+    /// Run Joint-CFA gathering and solving even when the reference-only
+    /// structure gate guarantees a zero update. This is intentionally a
+    /// diagnostics-only escape hatch for measuring flat-region solver support.
+    pub joint_cfa_solve_flat: bool,
     /// Include monochrome modules (as luminance).
     pub include_mono: bool,
     /// Smoothly reconstruct false colour caused by unequal raw-channel clipping
@@ -100,6 +104,7 @@ impl Default for SynthOptions {
             demosaic: DemosaicMethod::default(),
             highlight_recovery: HighlightRecovery::default(),
             resolution_reconstruction: ResolutionReconstruction::default(),
+            joint_cfa_solve_flat: false,
             include_mono: true,
             highlight_correction: true,
             threads: 0,
@@ -432,6 +437,8 @@ struct ResolutionCounters {
 #[derive(Default)]
 struct JointCfaCounters {
     attempted: std::sync::atomic::AtomicUsize,
+    solver_attempted: std::sync::atomic::AtomicUsize,
+    structure_skipped: std::sync::atomic::AtomicUsize,
     reconstructed: std::sync::atomic::AtomicUsize,
     observations: std::sync::atomic::AtomicUsize,
     cameras: std::sync::atomic::AtomicUsize,
@@ -593,10 +600,20 @@ pub struct SynthReport {
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct JointCfaReconstructionReport {
+    /// Candidate output/validation locations before the early structure gate.
     pub attempted_pixels: usize,
+    /// Locations where observation gathering and the local solver actually ran.
+    pub solver_attempted_pixels: usize,
+    /// Candidate locations rejected by the guaranteed-zero structure gate.
+    pub structure_skipped_pixels: usize,
+    /// Fraction of candidate locations where the expensive solver actually ran.
+    pub solver_attempted_fraction: f32,
+    /// Fraction of candidate locations skipped before gathering observations.
+    pub structure_skipped_fraction: f32,
     pub reconstructed_pixels: usize,
-    /// Fraction of attempted validation/output locations with sufficient
-    /// robust multi-camera, independent-response, and 2D spatial support.
+    /// Fraction of candidate validation/output locations that returned a
+    /// solver estimate. In ordinary rendering this excludes early-gated flat
+    /// locations; diagnostic mode includes them when the solver has support.
     pub reconstructed_fraction: f32,
     /// Output-pixel stride used for held-out validation (one in JointCfa mode).
     pub sampling_stride: usize,
@@ -632,6 +649,10 @@ pub struct HeldOutCfaReport {
     pub camera: String,
     /// Stable physical sites scored, independent of solver success.
     pub sample_ids: Vec<[u16; 2]>,
+    /// Per-site values needed for independent phase/structure/SNR analysis and
+    /// paired comparisons between contributor subsets. These diagnostics are
+    /// evaluated against measurements that never enter the Joint-CFA solve.
+    pub sample_diagnostics: Vec<HeldOutCfaSampleDiagnostic>,
     /// All independently eligible sites. Solver failures are scored as the
     /// production fallback, matching what a Joint-CFA export actually emits.
     pub overall: CfaPredictionErrorReport,
@@ -654,6 +675,24 @@ pub struct HeldOutCfaReport {
     /// about physical registration accuracy.
     pub projection_error_bins: Vec<(f32, CfaPredictionErrorReport)>,
     pub rejected: HeldOutRejectionReport,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct HeldOutCfaSampleDiagnostic {
+    pub sensor_xy: [u16; 2],
+    pub phase: crate::image::CfaPhase,
+    /// Reference-only luminance/chroma structure measure. It is computed
+    /// independently of solver success, application weight, and confidence.
+    pub reference_structure: f32,
+    /// Held-out black-subtracted measurement divided by its propagated sigma.
+    pub signal_to_noise: f32,
+    pub measured: f32,
+    pub sigma: f32,
+    pub baseline_prediction: f32,
+    pub joint_cfa_prediction: f32,
+    pub baseline_loss: f32,
+    pub joint_cfa_loss: f32,
+    pub solver_supported: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -702,6 +741,7 @@ impl ErrorAccumulator {
 struct HeldOutAccumulator {
     seen_sites: std::collections::BTreeSet<[u16; 2]>,
     sample_ids: std::collections::BTreeSet<[u16; 2]>,
+    sample_diagnostics: std::collections::BTreeMap<[u16; 2], HeldOutCfaSampleDiagnostic>,
     overall: ErrorAccumulator,
     common_region: ErrorAccumulator,
     solver_supported: usize,
@@ -1223,15 +1263,36 @@ pub fn synthesize(
                         let validation_sample = has_held_out
                             && u % held_out_stride == held_out_stride / 2
                             && v % held_out_stride == held_out_stride / 2;
-                        let attempt_joint = validation_sample
+                        let joint_candidate = validation_sample
                             || options.resolution_reconstruction
                                 == ResolutionReconstruction::JointCfa;
-                        if attempt_joint {
+                        if joint_candidate {
                             joint_cfa_counters
                                 .attempted
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let joint_estimate = attempt_joint
+                        let structure_gate = joint_candidate.then(|| {
+                            joint_cfa_structure_gate(sources, rx, ry, reference_structure, options)
+                        });
+                        // Validation and the explicit diagnostic mode retain
+                        // flat-field solver statistics. Ordinary rendering can
+                        // skip work whose eventual application weight is known
+                        // to be exactly zero.
+                        let attempt_solver = structure_gate.is_some_and(|gate| {
+                            gate.application_weight > 0.0
+                                || validation_sample
+                                || options.joint_cfa_solve_flat
+                        });
+                        if attempt_solver {
+                            joint_cfa_counters
+                                .solver_attempted
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else if joint_candidate {
+                            joint_cfa_counters
+                                .structure_skipped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let joint_estimate = attempt_solver
                             .then(|| {
                                 joint_cfa_at(
                                     sources,
@@ -1244,6 +1305,9 @@ pub fn synthesize(
                                     reference_color,
                                     scene_depth,
                                     baseline_only_luminance,
+                                    structure_gate
+                                        .expect("solver attempt has a structure gate")
+                                        .application_weight,
                                     options,
                                 )
                             })
@@ -1294,13 +1358,6 @@ pub fn synthesize(
                             }
                         }
                         if validation_sample {
-                            let luminance_structure = reference_structure
-                                .map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
-                            let chroma_structure = sources
-                                .iter()
-                                .find(|source| source.reference)
-                                .and_then(|source| source_chroma_structure(source, rx, ry, options))
-                                .unwrap_or(0.0);
                             evaluate_held_out_cfa(
                                 sources,
                                 rx,
@@ -1308,7 +1365,9 @@ pub fn synthesize(
                                 scale,
                                 baseline_xyz,
                                 joint_estimate.as_ref(),
-                                luminance_structure.max(chroma_structure),
+                                structure_gate
+                                    .expect("validation sample has a structure gate")
+                                    .magnitude,
                                 scene_depth,
                                 options,
                                 &held_out_counters,
@@ -1441,6 +1500,12 @@ pub fn synthesize(
             let attempted = joint_cfa_counters
                 .attempted
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let solver_attempted = joint_cfa_counters
+                .solver_attempted
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let structure_skipped = joint_cfa_counters
+                .structure_skipped
+                .load(std::sync::atomic::Ordering::Relaxed);
             let reconstructed = joint_cfa_counters
                 .reconstructed
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1456,6 +1521,10 @@ pub fn synthesize(
                 / (reconstructed.max(1) * 1_000_000) as f32;
             JointCfaReconstructionReport {
                 attempted_pixels: attempted,
+                solver_attempted_pixels: solver_attempted,
+                structure_skipped_pixels: structure_skipped,
+                solver_attempted_fraction: fraction(solver_attempted, attempted),
+                structure_skipped_fraction: fraction(structure_skipped, attempted),
                 reconstructed_pixels: reconstructed,
                 reconstructed_fraction: fraction(reconstructed, attempted),
                 sampling_stride: if options.resolution_reconstruction
@@ -1534,6 +1603,7 @@ pub fn synthesize(
             Some(HeldOutCfaReport {
                 camera: source.alignment.name.clone(),
                 sample_ids: accumulator.sample_ids.iter().copied().collect(),
+                sample_diagnostics: accumulator.sample_diagnostics.values().copied().collect(),
                 overall: accumulator.overall.report(),
                 common_region: accumulator.common_region.report(),
                 solver_supported_samples: supported,
@@ -1786,6 +1856,40 @@ fn projected_camera_luminance(
     })
 }
 
+/// Reference-only values that decide whether Joint CFA could alter the
+/// production baseline, computed before gathering any contributor samples.
+#[derive(Clone, Copy, Debug)]
+struct JointCfaStructureGate {
+    magnitude: f32,
+    application_weight: f32,
+}
+
+fn joint_cfa_structure_gate(
+    sources: &[SynthSource<'_>],
+    rx: f32,
+    ry: f32,
+    reference_structure: Option<[f32; 3]>,
+    options: &SynthOptions,
+) -> JointCfaStructureGate {
+    let luminance_structure =
+        reference_structure.map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
+    let chroma_structure = sources
+        .iter()
+        .find(|source| source.reference)
+        .and_then(|source| source_chroma_structure(source, rx, ry, options))
+        .unwrap_or(0.0);
+    JointCfaStructureGate {
+        magnitude: luminance_structure.max(chroma_structure),
+        application_weight: joint_cfa_structure_weight(luminance_structure, chroma_structure),
+    }
+}
+
+fn joint_cfa_structure_weight(luminance_structure: f32, chroma_structure: f32) -> f32 {
+    let luminance_weight = smoothstep((luminance_structure - 0.012) / (0.045 - 0.012));
+    let chroma_weight = smoothstep((chroma_structure - 0.010) / (0.045 - 0.010));
+    luminance_weight.max(chroma_weight)
+}
+
 /// Gather actual Bayer sites from every accepted colour camera around one
 /// output point and solve their calibrated measurement equations jointly.
 /// The compact support keeps this independently tileable.
@@ -1800,6 +1904,7 @@ fn joint_cfa_at(
     reference_color: Option<[f32; 3]>,
     scene_depth: Option<(f64, f32)>,
     preserve_baseline_luminance: bool,
+    structure_weight: f32,
     options: &SynthOptions,
 ) -> Option<JointCfaEstimate> {
     const SUPPORT_RADIUS: f32 = 1.65;
@@ -1992,23 +2097,7 @@ fn joint_cfa_at(
     if estimate.report.cameras < 2 || estimate.report.data_rank < 3 {
         return None;
     }
-    // Joint CFA exists to recover supported spatial detail, not to replace the
-    // production fusion path with a noisier fit in flat fields. Luminance alone
-    // is insufficient: an isoluminant coloured edge must also open the gate.
-    let luminance_structure =
-        reference_structure.map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
-    let chroma_structure = sources
-        .iter()
-        .find(|source| source.reference)
-        .and_then(|source| source_chroma_structure(source, rx, ry, options))
-        .unwrap_or(0.0);
-    let luminance_weight = smoothstep((luminance_structure - 0.012) / (0.045 - 0.012));
-    let chroma_weight = smoothstep((chroma_structure - 0.010) / (0.045 - 0.010));
-    estimate.apply_over_baseline(
-        prior_xyz,
-        luminance_weight.max(chroma_weight),
-        preserve_baseline_luminance,
-    );
+    estimate.apply_over_baseline(prior_xyz, structure_weight, preserve_baseline_luminance);
     Some(estimate)
 }
 
@@ -2141,10 +2230,27 @@ fn evaluate_held_out_cfa(
             .map_or((target_baseline, false), |joint| {
                 (joint.applied_xyz_at(output_offset, target_baseline), true)
             });
-        let baseline_error =
-            robust_noise_loss((measured - dot3(response, target_baseline)) / sigma);
-        let joint_error = robust_noise_loss((measured - dot3(response, joint_xyz)) / sigma);
+        let baseline_prediction = dot3(response, target_baseline);
+        let joint_cfa_prediction = dot3(response, joint_xyz);
+        let baseline_error = robust_noise_loss((measured - baseline_prediction) / sigma);
+        let joint_error = robust_noise_loss((measured - joint_cfa_prediction) / sigma);
         accumulator.sample_ids.insert(sample_id);
+        accumulator.sample_diagnostics.insert(
+            sample_id,
+            HeldOutCfaSampleDiagnostic {
+                sensor_xy: sample_id,
+                phase: sample.phase,
+                reference_structure: structure,
+                signal_to_noise: measured / sigma,
+                measured,
+                sigma,
+                baseline_prediction,
+                joint_cfa_prediction,
+                baseline_loss: baseline_error,
+                joint_cfa_loss: joint_error,
+                solver_supported,
+            },
+        );
         accumulator.overall.add(baseline_error, joint_error);
         accumulator
             .blocks
@@ -2990,6 +3096,16 @@ mod tests {
         let mut reconstruction = ResolutionAccumulator::default();
         reconstruction.add(0, projected_detail(0.04, [0.0, 0.0]), 1.0, 1.0);
         assert!(reconstruction.finish().is_none());
+    }
+
+    #[test]
+    fn joint_cfa_structure_gate_skips_only_guaranteed_zero_updates() {
+        assert_eq!(joint_cfa_structure_weight(0.0, 0.0), 0.0);
+        assert_eq!(joint_cfa_structure_weight(0.012, 0.010), 0.0);
+        assert!(joint_cfa_structure_weight(0.0121, 0.0) > 0.0);
+        assert!(joint_cfa_structure_weight(0.0, 0.0101) > 0.0);
+        assert_eq!(joint_cfa_structure_weight(0.045, 0.0), 1.0);
+        assert_eq!(joint_cfa_structure_weight(0.0, 0.045), 1.0);
     }
 
     #[test]

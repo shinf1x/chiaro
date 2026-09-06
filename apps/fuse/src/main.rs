@@ -166,8 +166,13 @@ struct Cli {
     crosstalk: CrosstalkMode,
 
     /// Resample cameras independently or reconstruct from their physical samples.
-    #[arg(long, default_value = "multi-camera")]
+    #[arg(long, default_value = "joint-cfa")]
     resolution_reconstruction: ResolutionReconstruction,
+
+    /// Diagnose flat-region Joint-CFA support by running solves whose output
+    /// is guaranteed to retain the baseline.
+    #[arg(long)]
+    joint_cfa_solve_flat: bool,
 
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
@@ -269,6 +274,7 @@ fn main() -> Result<()> {
     options.crosstalk = cli.crosstalk;
     options.color_profile = cli.factory_profile.into();
     options.synth.resolution_reconstruction = cli.resolution_reconstruction;
+    options.synth.joint_cfa_solve_flat = cli.joint_cfa_solve_flat;
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;
@@ -388,10 +394,12 @@ fn main() -> Result<()> {
     );
     if let Some(joint) = &report.synthesis.joint_cfa {
         println!(
-            "joint CFA: {:.2}% of {} attempted points reconstructed (stride {}), {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample affine fit {:+.2}% (diagnostic only)",
+            "joint CFA: {:.2}% of {} candidate points reconstructed (stride {}), solver ran at {:.2}% and skipped {:.2}% by structure gate, {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample affine fit {:+.2}% (diagnostic only)",
             joint.reconstructed_fraction * 100.0,
             joint.attempted_pixels,
             joint.sampling_stride,
+            joint.solver_attempted_fraction * 100.0,
+            joint.structure_skipped_fraction * 100.0,
             joint.mean_observations_per_pixel,
             joint.mean_cameras_per_pixel,
             joint.mean_phase_spread,
@@ -478,6 +486,30 @@ fn parse_crop(value: &str) -> Result<CropWindow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joint_cfa_is_the_cli_default() {
+        let cli =
+            Cli::try_parse_from(["chiaro-fuse", "capture.lri", "--output", "output.png"]).unwrap();
+        assert_eq!(
+            cli.resolution_reconstruction,
+            ResolutionReconstruction::JointCfa
+        );
+        assert!(!cli.joint_cfa_solve_flat);
+    }
+
+    #[test]
+    fn flat_joint_cfa_solves_are_an_explicit_diagnostic_mode() {
+        let cli = Cli::try_parse_from([
+            "chiaro-fuse",
+            "capture.lri",
+            "--output",
+            "output.png",
+            "--joint-cfa-solve-flat",
+        ])
+        .unwrap();
+        assert!(cli.joint_cfa_solve_flat);
+    }
 
     #[test]
     fn cleanup_profile_requires_hotpixel_rec() {

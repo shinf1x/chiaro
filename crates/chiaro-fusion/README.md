@@ -65,11 +65,14 @@ command-line application.
    bands; agreeing sources bias toward the strongest reliable coefficient.
    A denser tele module may transfer detail directly, while same-resolution
    reconstruction requires distinct subpixel phases. Colour and low-frequency
-   tone remain on the robust fusion path. A module rejected from ordinary
-   fusion may still contribute resolution-only islands when this independent
-   local registration is strong. For display-ready output, a smooth sensor-white
-   shoulder neutralises false colour from unequally clipped raw channels without
-   introducing a hard highlight boundary.
+   tone remain on the robust fusion path. A reference-only luminance/chroma
+   structure gate rejects guaranteed-zero Joint-CFA updates before gathering
+   contributor observations; held-out validation and an explicit diagnostic
+   option can still request flat-region solver statistics. A module rejected
+   from ordinary fusion may still contribute resolution-only islands when this
+   independent local registration is strong. For display-ready output, a smooth
+   sensor-white shoulder neutralises false colour from unequally clipped raw
+   channels without introducing a hard highlight boundary.
 
 Every run also writes a `.fusion.json` report with alignment, RAW highlight
 confidence/counts, cleanup availability and correction statistics, per-module
@@ -127,25 +130,24 @@ model or GPU. Local registration renders one half-resolution matching buffer
 at a time, and synthesis streams narrow output bands, so an 82 MP canvas does
 not require an 82 MP floating-point output allocation.
 
-`ResolutionReconstruction::JointCfa` is a real-capture experiment. It retains
+`ResolutionReconstruction::JointCfa` is the standard-fusion default. It retains
 physical CFA phase, sensor position, calibrated noise, highlight provenance,
 geometry confidence, and camera identity, then solves a robust local-affine
 D50 XYZ field directly from corrected mosaic observations. The affine terms
 are important: a constant-colour neighbourhood would reduce error by blurring
 fine detail. The solver is tileable and does not retain a frame-sized normal
-system.
+system. Unsupported locations retain the production MultiCamera fallback;
+`ResolutionReconstruction::MultiCamera` remains explicitly selectable.
 
 `FusionOptions::cfa_held_out` provides the primary validation path. Named
 non-reference cameras remain available for geometry but are excluded from all
 reconstruction. Sparse output locations are projected into each held-out
 sensor and compared with its real, measured, unclipped CFA sites in units of
-calibrated noise. Reports separate R, Gr, Gb, B, smooth, high-frequency,
-luminance-like, and chroma-like errors for the current MultiCamera baseline and
-the joint solver. Production work should proceed only if this advantage repeats
-across captures, camera subsets, and held-out modules without a smooth-region
-or artifact regression. Resource diagnostics include peak resident memory,
-runtime per output megapixel, observations/cameras per solve, iterations, and
-physical sampling-phase spread.
+calibrated noise. Reports retain fixed physical sample IDs and deterministic
+site-level phase, reference-structure, SNR, prediction/loss, and solver-support
+diagnostics for the MultiCamera baseline and joint solver. Resource diagnostics
+include peak resident memory, runtime per output megapixel, observations/cameras
+per solve, iterations, and physical sampling-phase spread.
 
 ## Important limitations
 

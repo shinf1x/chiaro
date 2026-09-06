@@ -25,7 +25,7 @@ use chiaro_fusion::{
         RawHighlightSource, cross_camera_highlight_updates, group_equivalent_focal_mm,
         nominal_focal_px,
     },
-    resolution::refine_resolution_warp,
+    resolution::{ResolutionReconstruction, refine_resolution_warp},
     synth::{
         CanvasMode, ColorPipeline, CropWindow, GainField, ModuleColor, OutputColor, SynthOptions,
         SynthReport, SynthSource, auto_exposure, canvas_scale, photometric_field,
@@ -85,6 +85,9 @@ impl Default for NightFusionOptions {
             crop_to_framing: true,
             synth: SynthOptions {
                 demosaic: DemosaicMethod::Lmmse,
+                // Joint CFA still lacks propagated temporal variance and
+                // provenance for merged Night mosaics (CFA-13).
+                resolution_reconstruction: ResolutionReconstruction::MultiCamera,
                 ..SynthOptions::default()
             },
             crosstalk: CrosstalkMode::default(),
@@ -759,10 +762,12 @@ mod tests {
     use chiaro::lri::SensorPattern;
 
     #[test]
-    fn night_fusion_defaults_to_lmmse() {
+    fn night_fusion_keeps_temporally_validated_defaults() {
+        let options = NightFusionOptions::default();
+        assert_eq!(options.synth.demosaic, DemosaicMethod::Lmmse);
         assert_eq!(
-            NightFusionOptions::default().synth.demosaic,
-            DemosaicMethod::Lmmse
+            options.synth.resolution_reconstruction,
+            ResolutionReconstruction::MultiCamera
         );
     }
 
