@@ -266,6 +266,10 @@ pub fn refine_resolution_warp(
         for x in 0..rendered.width {
             let rx = x as f32 * 2.0 + 0.5;
             let ry = y as f32 * 2.0 + 0.5;
+            if base.visibility(rx, ry).blocks_sampling() {
+                rendered.data[y * rendered.width + x] = f32::NAN;
+                continue;
+            }
             rendered.data[y * rendered.width + x] = base
                 .map(rx, ry)
                 .and_then(|q| {
@@ -283,11 +287,23 @@ pub fn refine_resolution_warp(
     let columns = width.div_ceil(LOCAL_WARP_STEP) + 1;
     let rows = height.div_ceil(LOCAL_WARP_STEP) + 1;
     let mut measured = vec![None::<([f32; 2], f32)>; columns * rows];
+    let mut visibility = Vec::with_capacity(columns * rows);
+    for row in 0..rows {
+        for column in 0..columns {
+            visibility.push(base.visibility(
+                (column * LOCAL_WARP_STEP) as f32,
+                (row * LOCAL_WARP_STEP) as f32,
+            ));
+        }
+    }
     for row in 0..rows {
         for column in 0..columns {
             let rx = (column * LOCAL_WARP_STEP) as f32;
             let ry = (row * LOCAL_WARP_STEP) as f32;
             if rx >= width as f32 || ry >= height as f32 {
+                continue;
+            }
+            if visibility[row * columns + column].blocks_sampling() {
                 continue;
             }
             let plane_x = ((rx - 0.5) * 0.5).round() as isize;
@@ -383,6 +399,13 @@ pub fn refine_resolution_warp(
                 if correction_snapshot[index].is_some() {
                     continue;
                 }
+                // Never heal across an explicit depth/occlusion boundary.
+                // A local texture matcher cannot prove that a sample belongs
+                // to the same physical surface once depth reconstruction said
+                // otherwise.
+                if visibility[index].blocks_sampling() {
+                    continue;
+                }
                 let mut xs = Vec::with_capacity(8);
                 let mut ys = Vec::with_capacity(8);
                 let mut confidence_sum = 0.0f32;
@@ -432,6 +455,7 @@ pub fn refine_resolution_warp(
             rows,
             points,
             confidence,
+            visibility,
         },
         report: ResolutionAlignmentReport {
             verified_fraction: verified as f32 / (columns * rows).max(1) as f32,
@@ -576,5 +600,28 @@ mod tests {
         assert!(refined.warp.confidence(p[0], p[1]) > 0.5);
         assert!(refined.report.verified_fraction > 0.5);
         assert!(refined.report.supported_fraction >= refined.report.verified_fraction);
+    }
+
+    #[test]
+    fn resolution_refinement_does_not_reenable_occluded_regions() {
+        let (plane_width, plane_height) = (64, 64);
+        let mut reference = Plane::new(plane_width, plane_height);
+        let mut target = Plane::new(plane_width, plane_height);
+        for y in 0..plane_height {
+            for x in 0..plane_width {
+                let value = (x as f32 * 0.2).sin() + (y as f32 * 0.17).cos();
+                reference.data[y * plane_width + x] = value;
+                target.data[y * plane_width + x] = value;
+            }
+        }
+        let (width, height) = (plane_width * 2, plane_height * 2);
+        let mut base = Warp::from_fn(width, height, 32, Some);
+        base.visibility.fill(crate::align::WarpVisibility::Occluded);
+        let refined = refine_resolution_warp(&reference, &target, &base, width, height);
+        assert!(refined.warp.confidence.iter().all(|&value| value == 0.0));
+        assert_eq!(
+            refined.warp.visibility(64.0, 64.0),
+            crate::align::WarpVisibility::Occluded
+        );
     }
 }

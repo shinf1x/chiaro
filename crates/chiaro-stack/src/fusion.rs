@@ -18,7 +18,7 @@ use chiaro_fusion::{
     crosstalk::{
         AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
     },
-    depth::{DenseDepthMap, refine_multiview_depth},
+    depth::{DenseDepthMap, DepthGeometryMode, refine_multiview_depth},
     geometry::{CameraRefinement, ResolvedCamera},
     image::{Mosaic, Plane},
     pipeline::{
@@ -345,6 +345,7 @@ pub fn fuse_night(
             width: module.raw.width,
             height: module.raw.height,
             camera: module.camera.as_ref(),
+            depth_evidence_enabled: true,
             nominal_focal_px: module
                 .camera
                 .as_ref()
@@ -371,6 +372,10 @@ pub fn fuse_night(
             reference_index,
             &mut alignments,
             &options.module_align.depth,
+            // Night/stack currently has no capture-rig refinement stage, so
+            // preserve its established image-warp-seeded geometry until the
+            // temporal rig/noise model is upgraded explicitly.
+            DepthGeometryMode::WarpSeeded,
         )
     } else {
         None

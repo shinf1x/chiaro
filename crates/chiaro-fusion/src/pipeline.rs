@@ -38,7 +38,7 @@ use crate::calibration::{
 use crate::crosstalk::{
     AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
 };
-use crate::depth::refine_multiview_depth;
+use crate::depth::{DepthGeometryMode, refine_multiview_depth};
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
 use crate::resolution::refine_resolution_warp;
@@ -578,6 +578,7 @@ fn alignment_inputs<'a>(
             width: module.raw.width,
             height: module.raw.height,
             camera: module.camera.as_ref(),
+            depth_evidence_enabled: true,
             nominal_focal_px: module
                 .camera
                 .as_ref()
@@ -667,7 +668,7 @@ pub fn cross_camera_highlight_updates(
         return Vec::new();
     }
     let target = &sources[target_index];
-    if !target.alignment.report.accepted
+    if !target.alignment.geometry_accepted()
         || target.mosaic.is_mono()
         || target.highlight.confidence.is_empty()
     {
@@ -677,7 +678,7 @@ pub fn cross_camera_highlight_updates(
         .iter()
         .enumerate()
         .map(|(donor_index, donor)| {
-            if target_index == donor_index || !donor.alignment.report.accepted {
+            if target_index == donor_index || !donor.alignment.geometry_accepted() {
                 [None; 3]
             } else {
                 raw_channel_ratios(target, donor, reference_width, reference_height)
@@ -702,7 +703,13 @@ pub fn cross_camera_highlight_updates(
             ) else {
                 continue;
             };
-            if target.alignment.warp.confidence(reference[0], reference[1]) < 0.7 {
+            if target
+                .alignment
+                .warp
+                .visibility(reference[0], reference[1])
+                .blocks_sampling()
+                || target.alignment.warp.confidence(reference[0], reference[1]) < 0.7
+            {
                 continue;
             }
             let channel = target.mosaic.pattern.color_at(y, x);
@@ -711,7 +718,13 @@ pub fn cross_camera_highlight_updates(
                 let Some(ratio) = ratios[donor_index][channel] else {
                     continue;
                 };
-                if donor.alignment.warp.confidence(reference[0], reference[1]) < 0.7 {
+                if donor
+                    .alignment
+                    .warp
+                    .visibility(reference[0], reference[1])
+                    .blocks_sampling()
+                    || donor.alignment.warp.confidence(reference[0], reference[1]) < 0.7
+                {
                     continue;
                 }
                 let Some(q) = donor.alignment.warp.map(reference[0], reference[1]) else {
@@ -877,7 +890,9 @@ fn raw_channel_ratios(
     for y in (24..reference_height.saturating_sub(24)).step_by(48) {
         for x in (24..reference_width.saturating_sub(24)).step_by(48) {
             let (x, y) = (x as f32, y as f32);
-            if target.alignment.warp.confidence(x, y) < 0.75
+            if target.alignment.warp.visibility(x, y).blocks_sampling()
+                || donor.alignment.warp.visibility(x, y).blocks_sampling()
+                || target.alignment.warp.confidence(x, y) < 0.75
                 || donor.alignment.warp.confidence(x, y) < 0.75
             {
                 continue;
@@ -1249,6 +1264,16 @@ pub fn fuse(
         .iter()
         .position(|module| module.raw.name == reference_name)
         .expect("reference selected");
+    if options
+        .cfa_held_out
+        .iter()
+        .any(|camera| camera.eq_ignore_ascii_case(&modules[reference_index].raw.name))
+    {
+        bail!(
+            "reference module {} cannot be held out: its image defines the reconstruction coordinate/evidence frame",
+            modules[reference_index].raw.name
+        );
+    }
     let inputs = alignment_inputs(&modules, &luminance);
     let factory_alignments = align_all_modules(&inputs, reference_index, &options.align)?;
     drop(inputs);
@@ -1317,7 +1342,16 @@ pub fn fuse(
     } else {
         factory_alignments
     };
-    let inputs = alignment_inputs(&modules, &luminance);
+    let mut inputs = alignment_inputs(&modules, &luminance);
+    for (index, module) in modules.iter().enumerate() {
+        if options
+            .cfa_held_out
+            .iter()
+            .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
+        {
+            inputs[index].depth_evidence_enabled = false;
+        }
+    }
     for (module, alignment) in modules.iter().zip(&mut alignments) {
         alignment.report.focus_achieved = module.focus.achieved;
         alignment.report.calibrated_focus_distance = module
@@ -1330,18 +1364,75 @@ pub fn fuse(
         alignment.report.lens_timeout = module.focus.lens_timeout;
         alignment.report.mirror_timeout = module.focus.mirror_timeout;
     }
+    // Dense correspondence is a property of the calibrated physical rig, not
+    // of whether a capture-specific correction happened to improve that rig.
+    // If refinement is rejected the module cameras above have already fallen
+    // back to factory calibration, which remains the correct physical model.
+    // Use the legacy warp-seeded path only when there are not enough calibrated
+    // cameras to form a physical multi-view depth hypothesis at all.
+    let calibrated_depth_views = inputs
+        .iter()
+        .enumerate()
+        .filter(|(index, input)| {
+            *index != reference_index && input.camera.is_some() && input.depth_evidence_enabled
+        })
+        .count();
+    let depth_geometry_mode = if inputs[reference_index].camera.is_some()
+        && calibrated_depth_views >= options.align.depth.minimum_support
+    {
+        DepthGeometryMode::PhysicalRig
+    } else {
+        DepthGeometryMode::WarpSeeded
+    };
     let depth_map = if options.align.refine && options.align.depth.enabled {
         progress(Progress {
             stage: "align",
-            detail: "multi-view local depth refinement".to_owned(),
+            detail: "joint physical multi-view depth/correspondence".to_owned(),
             fraction: 0.45,
         });
-        refine_multiview_depth(
-            &inputs,
-            reference_index,
-            &mut alignments,
-            &options.align.depth,
-        )
+        if matches!(depth_geometry_mode, DepthGeometryMode::PhysicalRig) {
+            // Keep a deterministic compatibility fallback for captures where
+            // factory/refined physical geometry cannot produce enough usable
+            // target views.  Physical geometry remains the primary path; the
+            // old warp is restored only when the physical solve itself fails.
+            let warp_seeded_alignments = alignments.clone();
+            let physical = refine_multiview_depth(
+                &inputs,
+                reference_index,
+                &mut alignments,
+                &options.align.depth,
+                DepthGeometryMode::PhysicalRig,
+            );
+            let physical_views = inputs
+                .iter()
+                .enumerate()
+                .filter(|(index, input)| {
+                    *index != reference_index
+                        && input.depth_evidence_enabled
+                        && alignments[*index].geometry_accepted()
+                })
+                .count();
+            if physical.is_some() && physical_views >= options.align.depth.minimum_support {
+                physical
+            } else {
+                alignments = warp_seeded_alignments;
+                refine_multiview_depth(
+                    &inputs,
+                    reference_index,
+                    &mut alignments,
+                    &options.align.depth,
+                    DepthGeometryMode::WarpSeeded,
+                )
+            }
+        } else {
+            refine_multiview_depth(
+                &inputs,
+                reference_index,
+                &mut alignments,
+                &options.align.depth,
+                DepthGeometryMode::WarpSeeded,
+            )
+        }
     } else {
         None
     };
@@ -1613,7 +1704,7 @@ pub fn fuse(
     // Advanced demosaicing is prepared only for geometrically accepted colour
     // modules. This avoids allocating an RGB cache for rejected cameras.
     for (index, (module, alignment)) in modules.iter_mut().zip(&alignments).enumerate() {
-        if contributor_enabled[index] && alignment.report.accepted && !module.mosaic.is_mono() {
+        if contributor_enabled[index] && alignment.geometry_accepted() && !module.mosaic.is_mono() {
             module
                 .mosaic
                 .prepare_demosaic(options.synth.demosaic, options.threads)
@@ -1628,7 +1719,7 @@ pub fn fuse(
     for index in 0..modules.len() {
         if contributor_enabled[index]
             && modules[index].raw.name != reference_name
-            && alignments[index].report.accepted
+            && alignments[index].geometry_accepted()
         {
             let (gain, offset) = photometric_match(
                 &modules[reference_index].mosaic,
@@ -1724,9 +1815,18 @@ pub fn fuse(
         if !options.align.refine || alignment.name == reference_name {
             return 1.0;
         }
-        // Smoothly suppress barely accepted modules. A small floor lets them
-        // fill otherwise uncovered areas without allowing a high-resolution
-        // but low-consensus tele frame to dominate the reference.
+        if alignment
+            .report
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.physical_geometry)
+        {
+            // Physical depth carries its confidence per warp node. Do not
+            // re-apply the old homography inlier ratio as a global veto after
+            // that 2-D model has ceased to define correspondence.
+            return 1.0;
+        }
+        // Compatibility path: retain the legacy global correspondence gate.
         correspondence_confidence(
             alignment.report.inlier_ratio,
             options.align.min_inlier_ratio,
@@ -1743,7 +1843,7 @@ pub fn fuse(
                 contributor_enabled[*index]
             } else {
                 radiometry_enabled[*index]
-            }) && alignment.report.accepted
+            }) && alignment.geometry_accepted()
                 && (options.synth.include_mono || !module.mosaic.is_mono())
                 && intersects_crop(alignment, module, &crop)
         })
@@ -1779,7 +1879,7 @@ pub fn fuse(
                 .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name));
             (contributor_enabled[*index] || held_out)
                 && (held_out
-                    || alignment.report.accepted
+                    || alignment.geometry_accepted()
                     || resolution_warp.as_ref().is_some_and(|refined| {
                         refined.report.supported_fraction >= 0.005
                             && refined.report.mean_confidence >= 0.5
@@ -1798,7 +1898,7 @@ pub fn fuse(
                 alignment,
                 resolution_warp: resolution_warp.as_ref(),
                 fusion_enabled: contributor_enabled[index]
-                    && alignment.report.accepted
+                    && alignment.geometry_accepted()
                     && !options
                         .cfa_held_out
                         .iter()

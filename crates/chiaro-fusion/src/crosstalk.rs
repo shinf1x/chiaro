@@ -202,8 +202,8 @@ pub fn fit_adaptive_crosstalk(
                 };
             }
             if reference_index >= sources.len()
-                || !source.alignment.report.accepted
-                || !sources[reference_index].alignment.report.accepted
+                || !source.alignment.geometry_accepted()
+                || !sources[reference_index].alignment.geometry_accepted()
                 || !source.color.calibrated
                 || !sources[reference_index].color.calibrated
             {
@@ -292,7 +292,9 @@ fn collect_observations(
     for y in (margin..height.saturating_sub(margin)).step_by(step) {
         for x in (margin..width.saturating_sub(margin)).step_by(step) {
             let (x, y) = (x as f32, y as f32);
-            if reference.alignment.warp.confidence(x, y) < 0.75
+            if reference.alignment.warp.visibility(x, y).blocks_sampling()
+                || target.alignment.warp.visibility(x, y).blocks_sampling()
+                || reference.alignment.warp.confidence(x, y) < 0.75
                 || target.alignment.warp.confidence(x, y) < 0.75
             {
                 continue;

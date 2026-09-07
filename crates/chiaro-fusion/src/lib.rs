@@ -23,9 +23,11 @@
 //!    canvas with resolution-aware, feathered weights and written as a linear
 //!    or display-referred 16-bit PNG ([`synth`]).
 //!
-//! Ambiguous depth and occlusion estimates reduce the affected module's local
-//! synthesis confidence, allowing the reference image to remain authoritative
-//! instead of averaging incompatible surfaces.
+//! Dense depth also carries view-dependent visibility separately from scalar
+//! confidence. A surface may be supported by only a subset of cameras; views
+//! classified as occluded or crossing a depth boundary are excluded from
+//! photometric fitting, highlight donation, resolution recovery, and final
+//! synthesis instead of being treated as ordinary robust-loss outliers.
 
 pub mod align;
 pub mod array_color;

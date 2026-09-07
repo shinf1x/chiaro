@@ -514,14 +514,23 @@ fn solve_linear<const N: usize>(mut matrix: [[f64; N]; N], mut rhs: [f64; N]) ->
 }
 
 fn observation_weight(observation: &CfaObservation) -> f32 {
-    if observation.visibility != Visibility::Visible
+    let visibility_weight = match observation.visibility {
+        Visibility::Visible => 1.0,
+        // A globally aligned location without independent depth support is
+        // still useful evidence, but it must not carry the same authority as
+        // a view whose selected scene surface was explicitly verified.
+        Visibility::Unknown => 0.35,
+        Visibility::Occluded => 0.0,
+    };
+    if visibility_weight <= 0.0
         || !observation.value.is_finite()
         || !observation.noise_variance.is_finite()
         || observation.noise_variance <= 0.0
     {
         return 0.0;
     }
-    observation.spatial_weight.max(0.0)
+    visibility_weight
+        * observation.spatial_weight.max(0.0)
         * observation.geometry_confidence.clamp(0.0, 1.0)
         * observation
             .highlight_provenance
@@ -651,6 +660,18 @@ mod tests {
             noise_dependencies: [NoiseDependency::default(); 16],
             noise_dependency_count: 0,
         }
+    }
+
+    #[test]
+    fn visibility_controls_measurement_authority() {
+        let visible = observation([1.0, 0.0, 0.0], 0.2, CfaPhase::R);
+        let mut unknown = visible.clone();
+        unknown.visibility = Visibility::Unknown;
+        let mut occluded = visible.clone();
+        occluded.visibility = Visibility::Occluded;
+        assert!(observation_weight(&visible) > observation_weight(&unknown));
+        assert!(observation_weight(&unknown) > 0.0);
+        assert_eq!(observation_weight(&occluded), 0.0);
     }
 
     #[test]

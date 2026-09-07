@@ -956,7 +956,12 @@ fn collect_observations(
                 if target == reference_index
                     || source.mosaic.is_mono()
                     || source.calibration.is_none()
-                    || !source.alignment.report.accepted
+                    || !source.alignment.geometry_accepted()
+                    || source
+                        .alignment
+                        .warp
+                        .visibility(point[0], point[1])
+                        .blocks_sampling()
                     || source.alignment.warp.confidence(point[0], point[1]) < 0.78
                     || !locally_confident(&source.alignment.warp, point, 8.0)
                 {
@@ -998,7 +1003,11 @@ fn depth_is_reliable(depth: Option<&DenseDepthMap>, point: [f32; 2]) -> bool {
 fn locally_confident(warp: &crate::align::Warp, point: [f32; 2], radius: f32) -> bool {
     [[-radius, 0.0], [radius, 0.0], [0.0, -radius], [0.0, radius]]
         .into_iter()
-        .all(|offset| warp.confidence(point[0] + offset[0], point[1] + offset[1]) >= 0.70)
+        .all(|offset| {
+            let x = point[0] + offset[0];
+            let y = point[1] + offset[1];
+            !warp.visibility(x, y).blocks_sampling() && warp.confidence(x, y) >= 0.70
+        })
 }
 
 fn reliable_sample(

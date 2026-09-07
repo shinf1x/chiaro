@@ -133,6 +133,11 @@ pub struct RigRefinementReport {
     pub per_camera: Vec<RigCameraResidualReport>,
     pub residual_field: Vec<RigResidualFieldReport>,
     pub corrections: Vec<RigCameraCorrectionReport>,
+    /// Finite-difference identifiability of each candidate physical parameter.
+    /// Parameters with negligible sensitivity or near-collinearity are kept on
+    /// the factory model instead of being released merely because the camera
+    /// has many observations.
+    pub parameter_observability: Vec<RigParameterObservabilityReport>,
     /// Filled by the pipeline after the accepted physical model is used as the
     /// seed for the ordinary residual image-space alignment.
     pub image_space_corrections: Vec<RigImageCorrectionReport>,
@@ -167,6 +172,19 @@ pub struct RigResidualFieldReport {
     pub mean_after: [f64; 2],
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RigParameterObservabilityReport {
+    pub camera: String,
+    pub parameter: String,
+    /// RMS change in normalized reprojection residual for a one-prior-sigma
+    /// perturbation of this parameter.
+    pub sensitivity_rms: f64,
+    /// Largest absolute Jacobian correlation with another candidate parameter.
+    pub max_correlation: f64,
+    pub optimized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RigCameraCorrectionReport {
     pub camera: String,
@@ -212,17 +230,31 @@ pub fn gate_on_image_space_alignment(
         .collect::<Vec<_>>();
     let mut before = Vec::new();
     let mut after = Vec::new();
-    let mut lost_alignment = None;
+    let mut lost_measurement = None;
     for (factory, refined) in factory.iter().zip(refined) {
         if !active.contains(&factory.name.as_str()) {
             continue;
         }
-        if factory.report.accepted && !refined.report.accepted {
-            lost_alignment = Some(factory.name.clone());
+        // This gate validates how much *measured residual correction* the
+        // downstream matcher needs.  The legacy homography acceptance bit is
+        // deliberately not a veto, but a zero/identity correction with no
+        // patch support is not evidence of improvement either.
+        let factory_measured =
+            factory.report.inliers >= 4 && factory.report.residual_median_px.is_finite();
+        let refined_measured =
+            refined.report.inliers >= 4 && refined.report.residual_median_px.is_finite();
+        if factory_measured && !refined_measured {
+            lost_measurement = Some(factory.name.clone());
+            continue;
         }
-        if factory.report.accepted && refined.report.accepted {
-            before.push(correction_magnitude(factory.report.correction_median_px));
-            after.push(correction_magnitude(refined.report.correction_median_px));
+        if !factory_measured || !refined_measured {
+            continue;
+        }
+        let factory_correction = correction_magnitude(factory.report.correction_median_px);
+        let refined_correction = correction_magnitude(refined.report.correction_median_px);
+        if factory_correction.is_finite() && refined_correction.is_finite() {
+            before.push(factory_correction);
+            after.push(refined_correction);
         }
     }
     before.sort_by(f64::total_cmp);
@@ -234,15 +266,17 @@ pub fn gate_on_image_space_alignment(
         - report.image_space_median_correction_after_px)
         / report.image_space_median_correction_before_px.max(1.0e-12);
 
-    let accepted = lost_alignment.is_none()
+    let accepted = lost_measurement.is_none()
         && !before.is_empty()
         && report.image_space_relative_improvement >= minimum_improvement;
     if !accepted {
         report.accepted = false;
-        report.fallback_reason = Some(if let Some(camera) = lost_alignment {
-            format!("residual alignment for {camera} failed from the refined physical seed")
+        report.fallback_reason = Some(if let Some(camera) = lost_measurement {
+            format!(
+                "residual correction for {camera} became unmeasurable from the refined physical seed"
+            )
         } else if before.is_empty() {
-            "no accepted residual alignments available for downstream validation".to_owned()
+            "no finite measured residual corrections available for downstream validation".to_owned()
         } else {
             format!(
                 "later image-space correction improved by only {:+.2}% (need at least {:+.2}%)",
@@ -457,7 +491,15 @@ pub fn refine_capture_rig(
         };
     }
 
-    let specs = parameter_specs(cameras, reference_index, &preliminary_fit, options);
+    let candidate_specs = parameter_specs(cameras, reference_index, &preliminary_fit, options);
+    let (specs, parameter_observability) = filter_observable_parameter_specs(
+        &candidate_specs,
+        cameras,
+        &preliminary_fit,
+        intrinsics_mode,
+        options,
+    );
+    report.parameter_observability = parameter_observability;
     if specs.is_empty() {
         report.fallback_reason = Some("no observable non-reference physical parameters".to_owned());
         return RigRefinementOutcome {
@@ -714,10 +756,7 @@ fn build_tracks(
     let mut tracks = BTreeMap::<[i32; 2], Vec<TrackObservation>>::new();
     let mut pairwise_matches = 0;
     for (camera, alignment) in alignments.iter().enumerate() {
-        if camera == reference_index
-            || cameras[camera].calibration.is_none()
-            || !alignment.report.accepted
-        {
+        if camera == reference_index || cameras[camera].calibration.is_none() {
             continue;
         }
         for correspondence in &alignment.correspondences {
@@ -819,6 +858,206 @@ fn parameter_specs(
         }
     }
     specs
+}
+
+fn parameter_name(kind: ParameterKind) -> String {
+    match kind {
+        ParameterKind::Orientation(0) => "orientation_x".to_owned(),
+        ParameterKind::Orientation(1) => "orientation_y".to_owned(),
+        ParameterKind::Orientation(2) => "orientation_z".to_owned(),
+        ParameterKind::Orientation(axis) => format!("orientation_{axis}"),
+        ParameterKind::Mirror => "mirror_angle".to_owned(),
+    }
+}
+
+/// Normalized reprojection residuals used only to determine whether each
+/// candidate physical parameter is independently observable. Track points are
+/// re-triangulated for every perturbation, so the finite-difference Jacobian
+/// measures parameter information left after the nuisance 3-D points adapt.
+/// The vector has fixed topology for a fixed valid track set and does not
+/// include the factory prior.
+fn observability_jacobian_column(
+    minus_parameters: &[f64],
+    plus_parameters: &[f64],
+    specs: &[ParameterSpec],
+    parameter: &ParameterSpec,
+    difference_step: f64,
+    inputs: &[RigCameraInput<'_>],
+    tracks: &[&Track],
+    intrinsics_mode: IntrinsicsMode,
+    options: &RigRefinementOptions,
+) -> Option<Vec<f64>> {
+    let minus_refinements = refinements_from_parameters(inputs.len(), minus_parameters, specs);
+    let plus_refinements = refinements_from_parameters(inputs.len(), plus_parameters, specs);
+    let minus_cameras = resolve_cameras(inputs, &minus_refinements, intrinsics_mode)?;
+    let plus_cameras = resolve_cameras(inputs, &plus_refinements, intrinsics_mode)?;
+    let mut column = Vec::new();
+    for track in tracks {
+        let (Some(minus_point), Some(plus_point)) = (
+            triangulate(&track.observations, &minus_cameras, options),
+            triangulate(&track.observations, &plus_cameras, options),
+        ) else {
+            // A track on a triangulation gate is not stable evidence for local
+            // parameter observability. Give it a zero derivative for both
+            // image coordinates of every observation. This avoids turning a
+            // discrete gate transition into a fictitious derivative while
+            // preserving row correspondence between parameter columns.
+            column.extend(std::iter::repeat_n(0.0, track.observations.len() * 2));
+            continue;
+        };
+        for observation in &track.observations {
+            let sigma = observation_sigma(observation).max(1.0e-6);
+            let (Some(minus), Some(plus)) = (
+                project_observation(
+                    &minus_cameras[observation.camera],
+                    observation,
+                    minus_point.point,
+                ),
+                project_observation(
+                    &plus_cameras[observation.camera],
+                    observation,
+                    plus_point.point,
+                ),
+            ) else {
+                column.extend([0.0, 0.0]);
+                continue;
+            };
+            let scale = parameter.prior_sigma / (2.0 * difference_step * sigma);
+            column.push((plus[0] - minus[0]) * scale);
+            column.push((plus[1] - minus[1]) * scale);
+        }
+    }
+    (!column.is_empty()).then_some(column)
+}
+
+fn column_correlation(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let dot_product = left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if left_norm <= 1.0e-12 || right_norm <= 1.0e-12 {
+        0.0
+    } else {
+        (dot_product / (left_norm * right_norm))
+            .abs()
+            .clamp(0.0, 1.0)
+    }
+}
+
+/// Release physical parameters only when the data can actually see them.
+/// Observation count is still used as the cheap first gate; this second gate
+/// measures finite-difference sensitivity and removes same-camera parameter
+/// directions that are numerically indistinguishable.  When a mirror angle
+/// and generic orientation explain the same bearing change, prefer the
+/// physical mirror DOF unless its sensitivity is itself negligible.
+fn filter_observable_parameter_specs(
+    candidates: &[ParameterSpec],
+    inputs: &[RigCameraInput<'_>],
+    tracks: &[&Track],
+    intrinsics_mode: IntrinsicsMode,
+    options: &RigRefinementOptions,
+) -> (Vec<ParameterSpec>, Vec<RigParameterObservabilityReport>) {
+    const MIN_SENSITIVITY_RMS: f64 = 0.02;
+    const MAX_DEGENERATE_CORRELATION: f64 = 0.995;
+
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let zero = vec![0.0; candidates.len()];
+    let mut columns = Vec::with_capacity(candidates.len());
+    let mut sensitivities = Vec::with_capacity(candidates.len());
+    for (index, spec) in candidates.iter().enumerate() {
+        let step = spec.difference_step.max(1.0e-6);
+        let mut minus = zero.clone();
+        let mut plus = zero.clone();
+        minus[index] = -step;
+        plus[index] = step;
+        let column = observability_jacobian_column(
+            &minus,
+            &plus,
+            candidates,
+            spec,
+            step,
+            inputs,
+            tracks,
+            intrinsics_mode,
+            options,
+        )
+        .unwrap_or_default();
+        let sensitivity = if column.is_empty() {
+            0.0
+        } else {
+            (column.iter().map(|value| value * value).sum::<f64>() / column.len() as f64).sqrt()
+        };
+        columns.push(column);
+        sensitivities.push(sensitivity);
+    }
+
+    let mut max_correlations = vec![0.0f64; candidates.len()];
+    let mut keep = sensitivities
+        .iter()
+        .map(|sensitivity| sensitivity.is_finite() && *sensitivity >= MIN_SENSITIVITY_RMS)
+        .collect::<Vec<_>>();
+    let mut reasons = vec![None::<String>; candidates.len()];
+    for index in 0..candidates.len() {
+        if !keep[index] {
+            reasons[index] = Some("insufficient independent reprojection sensitivity".to_owned());
+        }
+    }
+
+    for first in 0..candidates.len() {
+        for second in first + 1..candidates.len() {
+            if columns[first].is_empty() || columns[second].is_empty() {
+                continue;
+            }
+            let correlation = column_correlation(&columns[first], &columns[second]);
+            max_correlations[first] = max_correlations[first].max(correlation);
+            max_correlations[second] = max_correlations[second].max(correlation);
+            if correlation < MAX_DEGENERATE_CORRELATION
+                || candidates[first].camera != candidates[second].camera
+                || !keep[first]
+                || !keep[second]
+            {
+                continue;
+            }
+
+            let first_is_mirror = matches!(candidates[first].kind, ParameterKind::Mirror);
+            let second_is_mirror = matches!(candidates[second].kind, ParameterKind::Mirror);
+            let loser = match (first_is_mirror, second_is_mirror) {
+                (true, false) if sensitivities[first] >= sensitivities[second] * 0.25 => second,
+                (false, true) if sensitivities[second] >= sensitivities[first] * 0.25 => first,
+                _ if sensitivities[first] <= sensitivities[second] => first,
+                _ => second,
+            };
+            keep[loser] = false;
+            reasons[loser] = Some(format!(
+                "degenerate with {} (|corr|={correlation:.5})",
+                parameter_name(candidates[if loser == first { second } else { first }].kind)
+            ));
+        }
+    }
+
+    let reports = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| RigParameterObservabilityReport {
+            camera: inputs[spec.camera].name.to_owned(),
+            parameter: parameter_name(spec.kind),
+            sensitivity_rms: sensitivities[index],
+            max_correlation: max_correlations[index],
+            optimized: keep[index],
+            rejection_reason: reasons[index].clone(),
+        })
+        .collect::<Vec<_>>();
+    let specs = candidates
+        .iter()
+        .copied()
+        .zip(keep)
+        .filter_map(|(spec, keep)| keep.then_some(spec))
+        .collect::<Vec<_>>();
+    (specs, reports)
 }
 
 fn refinements_from_parameters(
@@ -1543,6 +1782,8 @@ mod tests {
             report: AlignmentReport {
                 camera: name.to_owned(),
                 correction_median_px: correction,
+                inliers: 20,
+                residual_median_px: 0.5,
                 accepted: true,
                 ..Default::default()
             },

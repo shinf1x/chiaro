@@ -31,6 +31,32 @@ use crate::geometry::ResolvedCamera;
 use crate::image::{Plane, match_patch};
 use crate::math::{Mat3, Vec2, apply_homography};
 
+/// View-dependent visibility of one reference-space warp location.
+///
+/// Alignment-only warps cannot infer visibility and therefore remain
+/// [`Unknown`](Self::Unknown). Dense calibrated depth refinement upgrades
+/// locations to [`Visible`](Self::Visible), [`Occluded`](Self::Occluded), or
+/// [`Boundary`](Self::Boundary). Downstream reconstruction must never bridge
+/// `Occluded`/`Boundary` regions merely because a later image-space matcher
+/// finds a plausible texture there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WarpVisibility {
+    #[default]
+    Unknown,
+    Visible,
+    Occluded,
+    Boundary,
+}
+
+impl WarpVisibility {
+    /// Whether this state is explicit geometric evidence that the source must
+    /// not contribute the requested surface sample.
+    #[inline]
+    pub fn blocks_sampling(self) -> bool {
+        matches!(self, Self::Occluded | Self::Boundary)
+    }
+}
+
 /// Reference-raster pixel -> module-raster pixel, sampled on a regular grid.
 #[derive(Clone, Debug)]
 pub struct Warp {
@@ -42,6 +68,11 @@ pub struct Warp {
     /// Local synthesis confidence at every grid node. Alignment-only warps use
     /// one; depth ambiguity and occlusion may lower it towards zero.
     pub confidence: Vec<f32>,
+    /// Categorical visibility carried separately from scalar confidence.
+    /// Keeping the two distinct prevents a later local-registration stage
+    /// from accidentally turning an explicitly occluded surface back into a
+    /// usable source merely by raising confidence.
+    pub visibility: Vec<WarpVisibility>,
 }
 
 impl Warp {
@@ -57,6 +88,7 @@ impl Warp {
         let rows = height.div_ceil(step) + 1;
         let mut points = Vec::with_capacity(columns * rows);
         let mut confidence = Vec::with_capacity(columns * rows);
+        let mut visibility = Vec::with_capacity(columns * rows);
         for row in 0..rows {
             for column in 0..columns {
                 let p = [(column * step) as f64, (row * step) as f64];
@@ -64,10 +96,15 @@ impl Warp {
                     Some(q) => {
                         points.push([q[0] as f32, q[1] as f32]);
                         confidence.push(1.0);
+                        // A generic image-space/calibration warp says where a
+                        // point maps, but not whether that scene surface is
+                        // visible from the target optical centre.
+                        visibility.push(WarpVisibility::Unknown);
                     }
                     None => {
                         points.push([f32::NAN, f32::NAN]);
                         confidence.push(0.0);
+                        visibility.push(WarpVisibility::Unknown);
                     }
                 }
             }
@@ -78,6 +115,7 @@ impl Warp {
             rows,
             points,
             confidence,
+            visibility,
         }
     }
 
@@ -130,6 +168,57 @@ impl Warp {
         (top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0)
     }
 
+    /// Conservative categorical visibility at a reference-space position.
+    ///
+    /// Visibility is intentionally *not* bilinearly interpolated. If a grid
+    /// cell straddles an occlusion transition, treating its labels as numeric
+    /// values would manufacture a fractional state and could blend two scene
+    /// surfaces. Instead a mixed cell becomes `Boundary` and is suppressed by
+    /// physical-sample reconstruction until a future two-layer model can
+    /// represent both surfaces explicitly.
+    #[inline]
+    pub fn visibility(&self, x: f32, y: f32) -> WarpVisibility {
+        if self.step == 0
+            || self.columns == 0
+            || self.rows == 0
+            || self.visibility.len() != self.points.len()
+        {
+            return WarpVisibility::Unknown;
+        }
+        let fx = x / self.step as f32;
+        let fy = y / self.step as f32;
+        if fx < 0.0 || fy < 0.0 {
+            return WarpVisibility::Unknown;
+        }
+        let c0 = (fx.floor() as usize).min(self.columns - 1);
+        let r0 = (fy.floor() as usize).min(self.rows - 1);
+        let c1 = (c0 + 1).min(self.columns - 1);
+        let r1 = (r0 + 1).min(self.rows - 1);
+        let values = [
+            self.visibility[r0 * self.columns + c0],
+            self.visibility[r0 * self.columns + c1],
+            self.visibility[r1 * self.columns + c0],
+            self.visibility[r1 * self.columns + c1],
+        ];
+        if values.contains(&WarpVisibility::Boundary) {
+            return WarpVisibility::Boundary;
+        }
+        let occluded = values.contains(&WarpVisibility::Occluded);
+        let visible = values.contains(&WarpVisibility::Visible);
+        let unknown = values.contains(&WarpVisibility::Unknown);
+        if occluded {
+            if visible || unknown {
+                WarpVisibility::Boundary
+            } else {
+                WarpVisibility::Occluded
+            }
+        } else if unknown {
+            WarpVisibility::Unknown
+        } else {
+            WarpVisibility::Visible
+        }
+    }
+
     /// Local magnification (target pixels per reference pixel) at a point,
     /// from finite differences of the grid.
     pub fn magnification(&self, x: f32, y: f32) -> Option<f32> {
@@ -158,6 +247,19 @@ pub struct ModuleAlignment {
     pub gain: f32,
     pub offset: f32,
     pub report: AlignmentReport,
+}
+
+impl ModuleAlignment {
+    /// Downstream geometric admission. Once a physical depth warp exists, the
+    /// old single-homography acceptance bit is no longer authoritative: a
+    /// camera may be globally non-homographic yet contain a coherent visible
+    /// subset under the calibrated 3-D rig. The 24-node floor matches the
+    /// minimum coherent direct-depth component used by the depth stage.
+    pub fn geometry_accepted(&self) -> bool {
+        self.report
+            .geometry_accepted
+            .unwrap_or(self.report.accepted)
+    }
 }
 
 /// One cross-camera patch observation exposed to the physical rig optimizer.
@@ -214,8 +316,14 @@ pub struct AlignmentReport {
     /// available and depth-aware alignment was enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth: Option<DepthAlignmentReport>,
-    /// Whether synthesis may use this module.
+    /// Whether the legacy global image-space alignment passed its own
+    /// homography-consensus gate. Once physical depth is available this is a
+    /// diagnostic, not the downstream source-admission authority.
     pub accepted: bool,
+    /// Physical downstream admission after joint depth/visibility, when that
+    /// path ran. `None` means the compatibility path still uses `accepted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry_accepted: Option<bool>,
     pub status: String,
 }
 
@@ -272,6 +380,10 @@ pub struct AlignInput<'a> {
     pub height: usize,
     /// Resolved camera model, if calibration is available.
     pub camera: Option<&'a ResolvedCamera>,
+    /// Whether this image may contribute photometric evidence to dense depth.
+    /// Held-out CFA validation disables this while still retaining the camera
+    /// model for projection/evaluation, preventing target-radiance leakage.
+    pub depth_evidence_enabled: bool,
     /// Nominal focal length in pixels (used when `camera` is `None`).
     pub nominal_focal_px: f64,
 }
@@ -451,26 +563,30 @@ pub fn align_module_seeded(
                 }
                 y += stride;
             }
+            // Physical rig refinement must not inherit a single-homography
+            // visibility/model assumption. Retain every reliable finest-level
+            // patch match for the 3-D optimizer; RANSAC inliers below remain
+            // the population used to update and diagnose the legacy 2-D warp.
+            if level == 0 {
+                correspondences = pairs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &(reference_pixel, shifted, confidence))| {
+                        let corrected = apply_homography(&correction, shifted)?;
+                        let target_pixel = initial(corrected)?;
+                        Some(AlignmentCorrespondence {
+                            reference_pixel,
+                            target_pixel,
+                            confidence,
+                            local_scale: magnification as f32,
+                            structure: pair_structure[index],
+                            depth_reliability: None,
+                        })
+                    })
+                    .collect();
+            }
             let threshold = (options.inlier_px * scale as f32 * 2.0).max(options.inlier_px);
             if let Some((update, inliers, residuals)) = fit_homography_ransac(&pairs, threshold) {
-                if level == 0 {
-                    correspondences = inliers
-                        .iter()
-                        .filter_map(|&index| {
-                            let (reference_pixel, shifted, confidence) = pairs[index];
-                            let corrected = apply_homography(&correction, shifted)?;
-                            let target_pixel = initial(corrected)?;
-                            Some(AlignmentCorrespondence {
-                                reference_pixel,
-                                target_pixel,
-                                confidence,
-                                local_scale: magnification as f32,
-                                structure: pair_structure[index],
-                                depth_reliability: None,
-                            })
-                        })
-                        .collect();
-                }
                 correction = crate::math::mul(&correction, &update);
                 report.levels.push(LevelReport {
                     scale: scale * 2,
@@ -908,6 +1024,23 @@ pub fn debug_checkerboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_is_conservative_across_occlusion_cells() {
+        let mut warp = Warp::from_fn(16, 16, 8, Some);
+        assert_eq!(warp.visibility(4.0, 4.0), WarpVisibility::Unknown);
+
+        warp.visibility.fill(WarpVisibility::Visible);
+        assert_eq!(warp.visibility(4.0, 4.0), WarpVisibility::Visible);
+
+        // One occluded corner means this interpolation cell straddles a
+        // foreground/background transition and must not be blended.
+        warp.visibility[0] = WarpVisibility::Occluded;
+        assert_eq!(warp.visibility(4.0, 4.0), WarpVisibility::Boundary);
+
+        warp.visibility.fill(WarpVisibility::Occluded);
+        assert_eq!(warp.visibility(4.0, 4.0), WarpVisibility::Occluded);
+    }
 
     #[test]
     fn homography_fit_recovers_a_known_transform() {

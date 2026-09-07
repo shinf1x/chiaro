@@ -28,7 +28,7 @@ use chiaro_hotpixel_core::png16::{
 };
 use std::path::Path;
 
-use crate::align::ModuleAlignment;
+use crate::align::{ModuleAlignment, Warp, WarpVisibility};
 use crate::cfa::{
     CfaObservation, HighlightProvenance, JointCfaEstimate, NoiseDependency, Visibility,
     account_shared_sample_dependence, camera_response, corrected_noise_variance, noise_variance,
@@ -384,6 +384,29 @@ pub struct SynthSource<'a> {
     pub gain_field: GainField,
 }
 
+/// Prefer a locally verified resolution warp where it actually has support.
+/// Sparse refinement grids intentionally leave unsupported cells at zero
+/// confidence; those cells must retain the physical base projection instead
+/// of making an otherwise usable camera disappear. Explicit visibility blocks
+/// remain authoritative and are never bypassed by this fallback.
+fn reconstruction_warp<'a>(
+    base: &'a Warp,
+    refined: Option<&'a ResolutionWarp>,
+    x: f32,
+    y: f32,
+) -> &'a Warp {
+    let Some(refined) = refined else {
+        return base;
+    };
+    if refined.warp.visibility(x, y).blocks_sampling()
+        || (refined.warp.confidence(x, y) > 0.0 && refined.warp.map(x, y).is_some())
+    {
+        &refined.warp
+    } else {
+        base
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SourceContributionReport {
     pub camera: String,
@@ -400,6 +423,11 @@ pub struct SourceContributionReport {
     /// Fraction of sampled pixels where known scene depth strongly disagreed
     /// with this magnified source's focus plane.
     pub focus_suppressed_fraction: f32,
+    /// Fraction of mapped output locations rejected because calibrated depth
+    /// marked this source as occluded or on a foreground/background boundary.
+    /// This is view-dependent: another camera may remain fully visible at the
+    /// same output location.
+    pub visibility_suppressed_fraction: f32,
     /// Fraction of colour samples suppressed by reference chromaticity.
     pub chroma_suppressed_fraction: f32,
     /// Fraction of covered output pixels where this module supplied a locally
@@ -414,6 +442,8 @@ pub struct SourceContributionReport {
 
 #[derive(Default)]
 struct SourceCounters {
+    visibility_checked: std::sync::atomic::AtomicUsize,
+    visibility_suppressed: std::sync::atomic::AtomicUsize,
     sampled: std::sync::atomic::AtomicUsize,
     luminance_owner: std::sync::atomic::AtomicUsize,
     color_owner: std::sync::atomic::AtomicUsize,
@@ -698,6 +728,7 @@ pub struct HeldOutCfaSampleDiagnostic {
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct HeldOutRejectionReport {
     pub outside_mapping: usize,
+    pub occluded_or_boundary: usize,
     pub invalid_or_clipped_measurement: usize,
     pub uncalibrated_response: usize,
 }
@@ -899,9 +930,21 @@ pub fn synthesize(
                         if source.held_out {
                             continue;
                         }
+                        let source_index = *source_index;
                         let Some(q) = source.alignment.warp.map(rx, ry) else {
                             continue;
                         };
+                        source_counters[source_index]
+                            .visibility_checked
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !source.reference
+                            && source.alignment.warp.visibility(rx, ry).blocks_sampling()
+                        {
+                            source_counters[source_index]
+                                .visibility_suppressed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                         let mosaic = source.mosaic;
                         let Some((rgb, sensor_white)) = mosaic.sample_rgb_with_white(q[0], q[1])
                         else {
@@ -916,7 +959,6 @@ pub fn synthesize(
                         if feather <= 0.0 || local_confidence <= 0.0 {
                             continue;
                         }
-                        let source_index = *source_index;
                         if source.reference {
                             reference_source_index = Some(source_index);
                         }
@@ -1446,6 +1488,9 @@ pub fn synthesize(
         .enumerate()
         .map(|(source_index, ((_, source), counters))| {
             let sampled = counters.sampled.load(std::sync::atomic::Ordering::Relaxed);
+            let visibility_checked = counters
+                .visibility_checked
+                .load(std::sync::atomic::Ordering::Relaxed);
             let color_sampled = counters
                 .color_sampled
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1471,6 +1516,12 @@ pub fn synthesize(
                         .focus_suppressed
                         .load(std::sync::atomic::Ordering::Relaxed),
                     sampled,
+                ),
+                visibility_suppressed_fraction: fraction(
+                    counters
+                        .visibility_suppressed
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    visibility_checked,
                 ),
                 chroma_suppressed_fraction: fraction(
                     counters
@@ -1756,9 +1807,10 @@ fn projected_camera_luminance(
     reference_structure: Option<[f32; 3]>,
     options: &SynthOptions,
 ) -> Option<ProjectedCameraSample> {
-    let warp = source
-        .resolution_warp
-        .map_or(&source.alignment.warp, |refined| &refined.warp);
+    let warp = reconstruction_warp(&source.alignment.warp, source.resolution_warp, rx, ry);
+    if !source.reference && warp.visibility(rx, ry).blocks_sampling() {
+        return None;
+    }
     let local_confidence = warp.confidence(rx, ry);
     if local_confidence <= 0.0 {
         return None;
@@ -1919,11 +1971,23 @@ fn joint_cfa_at(
         {
             continue;
         }
-        let warp = source
-            .resolution_warp
-            .map_or(&source.alignment.warp, |refined| &refined.warp);
+        let warp = reconstruction_warp(&source.alignment.warp, source.resolution_warp, rx, ry);
+        let centre_visibility = warp.visibility(rx, ry);
+        if !source.reference && centre_visibility.blocks_sampling() {
+            continue;
+        }
         let geometry_confidence = warp.confidence(rx, ry) * source.confidence;
-        if geometry_confidence < 0.35 {
+        // Finite-but-unverified physical projections deliberately carry less
+        // than 0.35 confidence. Let them reach CfaObservation, whose explicit
+        // Unknown visibility weight limits their authority. Keeping the old
+        // cutoff for verified/legacy mappings still rejects weak geometry.
+        let minimum_geometry_confidence =
+            if !source.reference && centre_visibility == WarpVisibility::Unknown {
+                f32::MIN_POSITIVE
+            } else {
+                0.35
+            };
+        if geometry_confidence < minimum_geometry_confidence {
             continue;
         }
         let Some(q) = warp.map(rx, ry) else {
@@ -1950,6 +2014,15 @@ fn joint_cfa_at(
                 let output_offset = [displacement[0] * scale, displacement[1] * scale];
                 let sample_rx = rx + displacement[0];
                 let sample_ry = ry + displacement[1];
+                let visibility = if source.reference {
+                    Visibility::Visible
+                } else {
+                    match warp.visibility(sample_rx, sample_ry) {
+                        WarpVisibility::Visible => Visibility::Visible,
+                        WarpVisibility::Unknown => Visibility::Unknown,
+                        WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
+                    }
+                };
                 let spatial_weight = edge_aligned_hann_weight(
                     output_offset[0],
                     output_offset[1],
@@ -2063,7 +2136,7 @@ fn joint_cfa_at(
                     ),
                     highlight_confidence: sample.highlight_confidence,
                     geometry_confidence: geometry_confidence * local_admission,
-                    visibility: Visibility::Visible,
+                    visibility,
                     response,
                     spatial_weight,
                     baseline_prediction,
@@ -2149,10 +2222,16 @@ fn evaluate_held_out_cfa(
 ) {
     for (index, source) in sources.iter().enumerate() {
         if !source.held_out
-            || !source.alignment.report.accepted
+            || !source.alignment.geometry_accepted()
             || source.mosaic.is_mono()
             || !source.color.calibrated
         {
+            continue;
+        }
+        if source.alignment.warp.visibility(rx, ry).blocks_sampling() {
+            if let Ok(mut accumulator) = accumulators[index].lock() {
+                accumulator.rejected.occluded_or_boundary += 1;
+            }
             continue;
         }
         let Some(q) = source.alignment.warp.map(rx, ry) else {
@@ -2175,6 +2254,17 @@ fn evaluate_held_out_cfa(
             }
             continue;
         };
+        if source
+            .alignment
+            .warp
+            .visibility(target_reference[0], target_reference[1])
+            .blocks_sampling()
+        {
+            if let Ok(mut accumulator) = accumulators[index].lock() {
+                accumulator.rejected.occluded_or_boundary += 1;
+            }
+            continue;
+        }
         let sample_id = [sx as u16, sy as u16];
         let Ok(mut accumulator) = accumulators[index].lock() else {
             continue;
@@ -2310,6 +2400,9 @@ fn production_baseline_xyz_at(
     let mut resolution = ResolutionAccumulator::default();
     for (source_index, source) in sources.iter().enumerate() {
         if source.held_out || (!options.include_mono && source.mosaic.is_mono()) {
+            continue;
+        }
+        if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
             continue;
         }
         let Some(q) = source.alignment.warp.map(rx, ry) else {
@@ -2520,6 +2613,9 @@ fn source_luminance(
     ry: f32,
     options: &SynthOptions,
 ) -> Option<f32> {
+    if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
+        return None;
+    }
     let q = source.alignment.warp.map(rx, ry)?;
     let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
     let gain = source.alignment.gain;
@@ -2548,6 +2644,9 @@ fn source_xyz(
     options: &SynthOptions,
 ) -> Option<[f32; 3]> {
     if source.mosaic.is_mono() || !source.color.calibrated {
+        return None;
+    }
+    if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
         return None;
     }
     let q = source.alignment.warp.map(rx, ry)?;
@@ -2880,7 +2979,8 @@ pub fn photometric_match(
     while y + step < reference.height {
         let mut x = step;
         while x + step < reference.width {
-            if let Some(q) = warp.map(x as f32, y as f32)
+            if !warp.visibility(x as f32, y as f32).blocks_sampling()
+                && let Some(q) = warp.map(x as f32, y as f32)
                 && let Some((t, t_white)) = target.sample_rgb_with_white(q[0], q[1])
                 && let Some((r, r_white)) = reference.sample_rgb_with_white(x as f32, y as f32)
             {
@@ -2947,7 +3047,8 @@ pub fn photometric_field(
     while y + step < reference.height {
         let mut x = step;
         while x + step < reference.width {
-            if let Some(q) = warp.map(x as f32, y as f32)
+            if !warp.visibility(x as f32, y as f32).blocks_sampling()
+                && let Some(q) = warp.map(x as f32, y as f32)
                 && let Some((t, t_white)) = target.sample_rgb_with_white(q[0], q[1])
                 && let Some((r, r_white)) = reference.sample_rgb_with_white(x as f32, y as f32)
             {
@@ -3106,6 +3207,25 @@ mod tests {
         assert!(joint_cfa_structure_weight(0.0, 0.0101) > 0.0);
         assert_eq!(joint_cfa_structure_weight(0.045, 0.0), 1.0);
         assert_eq!(joint_cfa_structure_weight(0.0, 0.045), 1.0);
+    }
+
+    #[test]
+    fn unsupported_resolution_cells_fall_back_without_bypassing_occlusion() {
+        let base = Warp::from_fn(64, 64, 32, Some);
+        let mut local = Warp::from_fn(64, 64, 32, |point| Some([point[0] + 0.25, point[1] - 0.25]));
+        local.confidence.fill(0.0);
+        let mut refined = ResolutionWarp {
+            warp: local,
+            report: ResolutionAlignmentReport::default(),
+        };
+
+        let selected = reconstruction_warp(&base, Some(&refined), 16.0, 16.0);
+        assert!(std::ptr::eq(selected, &base));
+
+        refined.warp.visibility.fill(WarpVisibility::Occluded);
+        let selected = reconstruction_warp(&base, Some(&refined), 16.0, 16.0);
+        assert!(std::ptr::eq(selected, &refined.warp));
+        assert!(selected.visibility(16.0, 16.0).blocks_sampling());
     }
 
     #[test]
