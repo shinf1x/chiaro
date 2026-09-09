@@ -3025,28 +3025,64 @@ fn filter_observable_parameter_specs(
             .collect();
         return (Vec::new(), reports);
     };
+    let automatic = thread::available_parallelism().map_or(1, usize::from);
+    let workers = if options.threads == 0 {
+        automatic
+    } else {
+        options.threads.min(automatic)
+    }
+    .clamp(1, candidates.len().max(1));
+    let parameters_per_worker = candidates.len().div_ceil(workers);
+    let mut column_results = thread::scope(|scope| {
+        let base_cameras = &base_cameras;
+        let base_templates = &base_templates;
+        let handles = candidates
+            .chunks(parameters_per_worker.max(1))
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let first_index = chunk_index * parameters_per_worker.max(1);
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(local_index, spec)| {
+                            let index = first_index + local_index;
+                            let step = spec.difference_step.max(1.0e-6);
+                            let column = observability_jacobian_column(
+                                index,
+                                candidates,
+                                spec,
+                                step,
+                                inputs,
+                                tracks,
+                                base_cameras,
+                                base_templates,
+                                intrinsics_mode,
+                                options,
+                            )
+                            .unwrap_or_default();
+                            let sensitivity = if column.is_empty() {
+                                0.0
+                            } else {
+                                (column.iter().map(|value| value * value).sum::<f64>()
+                                    / column.len() as f64)
+                                    .sqrt()
+                            };
+                            (index, column, sensitivity)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("rig observability worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    column_results.sort_by_key(|(index, _, _)| *index);
     let mut columns = Vec::with_capacity(candidates.len());
     let mut sensitivities = Vec::with_capacity(candidates.len());
-    for (index, spec) in candidates.iter().enumerate() {
-        let step = spec.difference_step.max(1.0e-6);
-        let column = observability_jacobian_column(
-            index,
-            candidates,
-            spec,
-            step,
-            inputs,
-            tracks,
-            &base_cameras,
-            &base_templates,
-            intrinsics_mode,
-            options,
-        )
-        .unwrap_or_default();
-        let sensitivity = if column.is_empty() {
-            0.0
-        } else {
-            (column.iter().map(|value| value * value).sum::<f64>() / column.len() as f64).sqrt()
-        };
+    for (_, column, sensitivity) in column_results {
         columns.push(column);
         sensitivities.push(sensitivity);
     }
@@ -3482,6 +3518,75 @@ impl<'a> IncrementalRigObjective<'a> {
         }
     }
 
+    fn evaluate_trial_readonly(&self, parameter: usize, value: f64) -> RigTrialEvaluation {
+        let spec = self.specs[parameter];
+        let old_value = self.parameters[parameter];
+        let old_prior = (old_value / spec.prior_sigma).powi(2);
+        let new_prior = (value / spec.prior_sigma).powi(2);
+        let prior_sum = self.prior_sum - old_prior + new_prior;
+        if value == old_value {
+            return RigTrialEvaluation {
+                parameter,
+                value,
+                camera_index: spec.camera,
+                camera: None,
+                changed_tracks: Vec::new(),
+                total_cost: self.total_cost,
+                total_samples: self.total_samples,
+                prior_sum,
+                objective: self.objective_from_parts(
+                    self.total_cost,
+                    self.total_samples,
+                    prior_sum,
+                ),
+            };
+        }
+        let refinement = refinement_for_camera(
+            spec.camera,
+            &self.parameters,
+            self.specs,
+            Some((parameter, value)),
+        );
+        let Ok(trial_camera) = self.templates[spec.camera].resolve(&refinement) else {
+            return self.invalid_trial(parameter, value, prior_sum);
+        };
+        let camera_for_commit = trial_camera.clone();
+        let mut cameras = self.cameras.clone();
+        cameras[spec.camera] = trial_camera;
+        let mut total_cost = self.total_cost;
+        let mut total_samples = self.total_samples;
+        let affected = &self.tracks_by_camera[spec.camera];
+        let mut changed_tracks = Vec::with_capacity(affected.len());
+        let mut ray_scratch = Vec::new();
+        for &track_index in affected {
+            let old = self.contributions[track_index];
+            let track = self.tracks[track_index];
+            let new = match self.mode {
+                IncrementalObjectiveMode::Bundle => {
+                    bundle_track_contribution(track, &cameras, self.options, &mut ray_scratch)
+                }
+                IncrementalObjectiveMode::Epipolar { reference_index } => {
+                    epipolar_track_contribution(track, &cameras, reference_index, self.options)
+                }
+            };
+            total_cost += new.cost - old.cost;
+            total_samples = total_samples - old.samples + new.samples;
+            changed_tracks.push((track_index, new));
+        }
+        let objective = self.objective_from_parts(total_cost, total_samples, prior_sum);
+        RigTrialEvaluation {
+            parameter,
+            value,
+            camera_index: spec.camera,
+            camera: Some(camera_for_commit),
+            changed_tracks,
+            total_cost,
+            total_samples,
+            prior_sum,
+            objective,
+        }
+    }
+
     fn invalid_trial(&self, parameter: usize, value: f64, prior_sum: f64) -> RigTrialEvaluation {
         RigTrialEvaluation {
             parameter,
@@ -3545,8 +3650,23 @@ fn coordinate_optimize_rig<'a>(
             let step = spec.difference_step;
             let minus_value = (centre - step).max(-spec.bound);
             let plus_value = (centre + step).min(spec.bound);
-            let minus = objective.evaluate_trial(parameter, minus_value);
-            let plus = objective.evaluate_trial(parameter, plus_value);
+            let (minus, plus) = if objective.tracks_by_camera[spec.camera].len() >= 64 {
+                let shared = &objective;
+                thread::scope(|scope| {
+                    let minus_handle =
+                        scope.spawn(|| shared.evaluate_trial_readonly(parameter, minus_value));
+                    let plus = shared.evaluate_trial_readonly(parameter, plus_value);
+                    let minus = minus_handle
+                        .join()
+                        .expect("rig minus finite-difference worker panicked");
+                    (minus, plus)
+                })
+            } else {
+                (
+                    objective.evaluate_trial(parameter, minus_value),
+                    objective.evaluate_trial(parameter, plus_value),
+                )
+            };
             let f_minus = minus.objective;
             let f_plus = plus.objective;
             let gradient = (f_plus - f_minus) / (2.0 * step);

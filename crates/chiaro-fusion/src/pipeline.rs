@@ -222,11 +222,34 @@ pub struct ColorSelectionReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct AlignmentTimings {
+    pub factory_alignment: f32,
+    pub rig_refinement: f32,
+    pub post_rig_alignment: f32,
+    pub dense_depth: f32,
+    pub dense_depth_audit: f32,
+    pub resolution_refinement: f32,
+    pub highlights_and_diagnostics: f32,
+    pub color_profile: f32,
+    pub crosstalk: f32,
+    pub demosaic_and_photometric: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SynthesisStageTimings {
+    pub setup: f32,
+    pub render_and_png: f32,
+    pub debug_trace: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct FusionTimings {
     pub load: f32,
     pub hotpixel: f32,
     pub align: f32,
     pub synthesize: f32,
+    pub align_detail: AlignmentTimings,
+    pub synthesize_detail: SynthesisStageTimings,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2501,6 +2524,8 @@ pub fn fuse(
 
     // Stage 2: alignment to the reference, modules in parallel.
     let stage_started = Instant::now();
+    let mut align_detail = AlignmentTimings::default();
+    let mut substage_started = Instant::now();
     progress(Progress {
         stage: "align",
         detail: "building luminance pyramids".to_owned(),
@@ -2581,6 +2606,8 @@ pub fn fuse(
         )?;
     }
 
+    align_detail.factory_alignment = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     progress(Progress {
         stage: "align",
         detail: "validating capture-specific physical rig".to_owned(),
@@ -2643,6 +2670,8 @@ pub fn fuse(
         write_rig_residual_field_svg(debug_dir, &rig_outcome.report)?;
         write_rig_held_out_observations(debug_dir, &rig_outcome.report)?;
     }
+    align_detail.rig_refinement = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let factory_cameras = modules
         .iter()
         .map(|module| module.camera.clone())
@@ -2703,6 +2732,8 @@ pub fn fuse(
             false,
         )?;
     }
+    align_detail.post_rig_alignment = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let mut inputs = alignment_inputs(&modules, &luminance);
     let mut depth_options = options.align.depth.clone();
     depth_options.threads = options.threads;
@@ -2792,6 +2823,8 @@ pub fn fuse(
     } else {
         None
     };
+    align_detail.dense_depth = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let dense_depth_audit = if options.align.refine && options.align.depth.enabled {
         match (
             &options.debug_dir,
@@ -2875,6 +2908,8 @@ pub fn fuse(
     } else {
         None
     };
+    align_detail.dense_depth_audit = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let resolution_warps = if options
         .synth
         .resolution_reconstruction
@@ -2905,6 +2940,8 @@ pub fn fuse(
     } else {
         vec![None; alignments.len()]
     };
+    align_detail.resolution_refinement = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let contributor_enabled = modules
         .iter()
         .map(|module| {
@@ -3020,6 +3057,9 @@ pub fn fuse(
         }
     }
 
+    align_detail.highlights_and_diagnostics = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
+
     // Colour per module: use sparse, reliable aligned overlap to select one
     // common A/F11/D65 blend for the array. Recorded neutral gains remain a
     // soft prior and the unconditional fallback when evidence is weak.
@@ -3076,6 +3116,8 @@ pub fn fuse(
         })
         .unzip();
 
+    align_detail.color_profile = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     progress(Progress {
         stage: "crosstalk",
         detail: "fitting capture-adaptive factory residuals".to_owned(),
@@ -3151,6 +3193,9 @@ pub fn fuse(
         })
         .collect::<Vec<_>>();
 
+    align_detail.crosstalk = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
+
     // Advanced demosaicing is prepared only for geometrically accepted colour
     // modules. This avoids allocating an RGB cache for rejected cameras.
     for (index, (module, alignment)) in modules.iter_mut().zip(&alignments).enumerate() {
@@ -3206,10 +3251,13 @@ pub fn fuse(
             }
         }
     }
+    align_detail.demosaic_and_photometric = substage_started.elapsed().as_secs_f32();
+    timings.align_detail = align_detail;
     timings.align = stage_started.elapsed().as_secs_f32();
 
     // Stage 3: framing, canvas, and synthesis.
     let stage_started = Instant::now();
+    let synth_setup_started = Instant::now();
     let reference = &modules[reference_index];
     let framed_focal_length_mm = image_focal_length_mm(&messages);
     let crop = match (options.crop, framed_focal_length_mm) {
@@ -3372,6 +3420,8 @@ pub fn fuse(
             },
         )
         .collect::<Vec<_>>();
+    timings.synthesize_detail.setup = synth_setup_started.elapsed().as_secs_f32();
+    let synth_render_started = Instant::now();
     let synthesis = synthesize(
         output,
         crop,
@@ -3382,6 +3432,8 @@ pub fn fuse(
         &color,
         &options.synth,
     )?;
+    timings.synthesize_detail.render_and_png = synth_render_started.elapsed().as_secs_f32();
+    let synth_debug_started = Instant::now();
     if let Some(debug_dir) = &options.debug_dir {
         write_pipeline_trace(
             debug_dir,
@@ -3393,6 +3445,7 @@ pub fn fuse(
             &synthesis,
         )?;
     }
+    timings.synthesize_detail.debug_trace = synth_debug_started.elapsed().as_secs_f32();
     timings.synthesize = stage_started.elapsed().as_secs_f32();
 
     let output_megapixels = (synthesis.canvas_width * synthesis.canvas_height) as f32 / 1_000_000.0;

@@ -19,8 +19,9 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use crate::parallel;
 
@@ -42,6 +43,16 @@ const ADLER_BASE: u32 = 65521;
 pub enum PngColor {
     Gray16,
     Rgb16,
+}
+
+/// Timing information for the streaming writer. Worker CPU times are summed
+/// across bands, so they intentionally may exceed wall time when rendering or
+/// compression runs in parallel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PngWriteTimings {
+    pub total_seconds: f32,
+    pub render_cpu_seconds: f32,
+    pub filter_deflate_cpu_seconds: f32,
 }
 
 impl PngColor {
@@ -112,6 +123,26 @@ pub fn write_png16_streaming_atomic_with_level(
     level: u32,
     render: impl Fn(Range<usize>, &mut [u8]) + Sync,
 ) -> Result<()> {
+    write_png16_streaming_atomic_with_level_profiled(
+        path, width, height, color, threads, level, render,
+    )
+    .map(|_| ())
+}
+
+/// Profiled variant of [`write_png16_streaming_atomic_with_level`].
+/// `render_cpu_seconds` and `filter_deflate_cpu_seconds` are aggregate worker
+/// CPU-wall times; `total_seconds` is end-to-end wall time including ordered
+/// IDAT writes and the final atomic rename.
+pub fn write_png16_streaming_atomic_with_level_profiled(
+    path: &Path,
+    width: usize,
+    height: usize,
+    color: PngColor,
+    threads: usize,
+    level: u32,
+    render: impl Fn(Range<usize>, &mut [u8]) + Sync,
+) -> Result<PngWriteTimings> {
+    let total_started = Instant::now();
     if width == 0 || height == 0 {
         bail!("PNG dimensions must be non-zero");
     }
@@ -123,15 +154,22 @@ pub fn write_png16_streaming_atomic_with_level(
         File::create(&temporary).with_context(|| format!("create {}", temporary.display()))?;
     let mut out = BufWriter::with_capacity(WRITE_BUFFER, file);
     let result = write_png16_body(&mut out, width, height, color, threads, level, &render)
-        .and_then(|()| out.flush().context("flush PNG"));
+        .and_then(|timings| out.flush().context("flush PNG").map(|()| timings));
     drop(out);
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
+    let (render_ns, filter_deflate_ns) = match result {
+        Ok(timings) => timings,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
     fs::rename(&temporary, path)
         .with_context(|| format!("rename {} to {}", temporary.display(), path.display()))?;
-    Ok(())
+    Ok(PngWriteTimings {
+        total_seconds: total_started.elapsed().as_secs_f32(),
+        render_cpu_seconds: render_ns as f32 * 1.0e-9,
+        filter_deflate_cpu_seconds: filter_deflate_ns as f32 * 1.0e-9,
+    })
 }
 
 /// One compressed band ready for the writer.
@@ -150,7 +188,7 @@ fn write_png16_body(
     threads: usize,
     level: u32,
     render: &(impl Fn(Range<usize>, &mut [u8]) + Sync),
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let bytes_per_pixel = color.channels() * 2;
     let row_bytes = width * bytes_per_pixel;
     let bands = parallel::row_bands(height, height.div_ceil(BAND_ROWS).max(1), BAND_ROWS);
@@ -164,10 +202,14 @@ fn write_png16_body(
     // `workers` times a few megabytes regardless of frame size.
     let (band_tx, band_rx) = mpsc::channel::<Result<CompressedBand>>();
     let next_band = AtomicUsize::new(0);
+    let render_nanos = AtomicU64::new(0);
+    let filter_deflate_nanos = AtomicU64::new(0);
 
     std::thread::scope(|scope| -> Result<()> {
         let bands = &bands;
         let next_band = &next_band;
+        let render_nanos = &render_nanos;
+        let filter_deflate_nanos = &filter_deflate_nanos;
         for _ in 0..workers {
             let band_tx = band_tx.clone();
             scope.spawn(move || {
@@ -179,7 +221,13 @@ fn write_png16_body(
                         break;
                     };
                     let pixels = &mut pixels[..range.len() * row_bytes];
+                    let render_started = Instant::now();
                     render(range.clone(), pixels);
+                    render_nanos.fetch_add(
+                        render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+                    let filter_started = Instant::now();
                     sub_filter_rows(pixels, row_bytes, bytes_per_pixel, &mut filtered);
                     let flush = if index == last_band {
                         FlushCompress::Finish
@@ -193,6 +241,10 @@ fn write_png16_body(
                             adler: adler32(&filtered),
                             filtered_len: filtered.len(),
                         });
+                    filter_deflate_nanos.fetch_add(
+                        filter_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
                     if band_tx.send(result).is_err() {
                         break;
                     }
@@ -230,7 +282,11 @@ fn write_png16_body(
         }
         write_chunk(out, b"IEND", &[])?;
         Ok(())
-    })
+    })?;
+    Ok((
+        render_nanos.load(Ordering::Relaxed),
+        filter_deflate_nanos.load(Ordering::Relaxed),
+    ))
 }
 
 fn write_signature_and_header(

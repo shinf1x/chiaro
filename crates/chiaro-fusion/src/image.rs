@@ -111,6 +111,40 @@ pub struct Mosaic {
     pub demosaiced_rgb: Option<Vec<u16>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BilinearFootprint {
+    entries: [(usize, f32); 4],
+    len: usize,
+}
+
+impl BilinearFootprint {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            entries: [(0, 0.0); 4],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn iter(&self) -> std::slice::Iter<'_, (usize, f32)> {
+        self.entries[..self.len].iter()
+    }
+
+    #[inline]
+    fn add(&mut self, index: usize, weight: f32) {
+        if let Some((_, combined)) = self.entries[..self.len]
+            .iter_mut()
+            .find(|(seen, _)| *seen == index)
+        {
+            *combined += weight;
+        } else {
+            self.entries[self.len] = (index, weight);
+            self.len += 1;
+        }
+    }
+}
+
 impl Mosaic {
     /// Build from decoded RAW-stream order by rotating 180 degrees into the
     /// calibration raster. `pattern` is the camera's recorded CFA layout,
@@ -280,7 +314,7 @@ impl Mosaic {
         let mut highlight_confidence = 255;
         let phases = [CfaPhase::R, CfaPhase::Gr, CfaPhase::Gb, CfaPhase::B];
         for plane in 0..4 {
-            for &(index, interpolation_weight) in &footprints[plane] {
+            for &(index, interpolation_weight) in footprints[plane].iter() {
                 let coefficient = crosstalk_row[plane] * interpolation_weight;
                 if coefficient.abs() <= 1.0e-8 {
                     continue;
@@ -520,7 +554,7 @@ impl Mosaic {
         ox: usize,
         oy: usize,
         step: usize,
-    ) -> Vec<(usize, f32)> {
+    ) -> BilinearFootprint {
         let step_f = step as f32;
         let lx = (x - ox as f32) / step_f;
         let ly = (y - oy as f32) / step_f;
@@ -538,17 +572,13 @@ impl Mosaic {
             (i0, j1, (1.0 - tx) * ty),
             (i1, j1, tx * ty),
         ];
-        let mut footprint = Vec::<(usize, f32)>::with_capacity(4);
+        let mut footprint = BilinearFootprint::new();
         for (i, j, weight) in corners {
             if weight <= 0.0 {
                 continue;
             }
             let index = (oy + j * step) * self.width + ox + i * step;
-            if let Some((_, combined)) = footprint.iter_mut().find(|(seen, _)| *seen == index) {
-                *combined += weight;
-            } else {
-                footprint.push((index, weight));
-            }
+            footprint.add(index, weight);
         }
         footprint
     }

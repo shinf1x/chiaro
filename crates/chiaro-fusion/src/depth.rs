@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::{
     align::{AlignInput, ModuleAlignment, Warp, WarpVisibility},
-    geometry::ResolvedCamera,
+    geometry::{Ray, ResolvedCamera},
     image::Plane,
     math::{Vec2, add, dot, norm, scale, sub},
 };
@@ -2017,6 +2017,14 @@ fn build_cost_volume(
         .collect::<Vec<_>>();
     let label_count = labels.len();
     let node_count = columns * rows;
+    let active_view_indices = (0..inputs.len())
+        .filter(|&index| {
+            index != reference_index
+                && inputs[index].camera.is_some()
+                && inputs[index].depth_evidence_enabled
+                && (geometry_mode.is_physical() || alignments[index].report.accepted)
+        })
+        .collect::<Vec<_>>();
     let worker_count = configured_worker_count(options.threads, rows);
     let rows_per_worker = rows.div_ceil(worker_count);
     let chunks = thread::scope(|scope| {
@@ -2025,6 +2033,7 @@ fn build_cost_volume(
             .map(|first_row| {
                 let last_row = (first_row + rows_per_worker).min(rows);
                 let labels = &labels;
+                let active_view_indices = &active_view_indices;
                 scope.spawn(move || {
                     let chunk_nodes = (last_row - first_row) * columns;
                     let mut scores = Vec::with_capacity(chunk_nodes * label_count);
@@ -2032,22 +2041,101 @@ fn build_cost_volume(
                     let mut costs = Vec::with_capacity(chunk_nodes * label_count);
                     let mut guidance = Vec::with_capacity(chunk_nodes);
                     let mut tested = Vec::with_capacity(chunk_nodes);
+                    let mut view_scores = Vec::with_capacity(active_view_indices.len());
+                    let mut aggregate_scratch = AggregateScratch {
+                        ordered: Vec::with_capacity(active_view_indices.len()),
+                        positive_information: Vec::with_capacity(active_view_indices.len()),
+                    };
+                    let mut reference_patch =
+                        PreparedReferencePatch::with_radius(options.patch_radius);
+                    let mut far_scores = vec![None; inputs.len()];
+                    let mut depth_information = vec![0.0f32; inputs.len()];
                     for row in first_row..last_row {
                         for column in 0..columns {
                             let p = [(column * step) as f64, (row * step) as f64];
                             guidance.push(reference_guidance(&inputs[reference_index], p));
+
+                            let prepared_reference = if geometry_mode.is_physical() {
+                                prepare_reference_patch(
+                                    &inputs[reference_index],
+                                    p,
+                                    options,
+                                    &mut reference_patch,
+                                )
+                            } else {
+                                false
+                            };
+                            let reference_rays = if geometry_mode.is_physical() {
+                                inputs[reference_index]
+                                    .camera
+                                    .map(|camera| local_patch_reference_rays(camera, p))
+                            } else {
+                                None
+                            };
+                            if geometry_mode.is_physical() {
+                                far_scores.fill(None);
+                                depth_information.fill(0.0);
+                                if prepared_reference {
+                                    if let Some(reference_camera) = inputs[reference_index].camera {
+                                        for &index in active_view_indices {
+                                            let target = &inputs[index];
+                                            let Some(target_camera) = target.camera else {
+                                                continue;
+                                            };
+                                            depth_information[index] = physical_depth_information(
+                                                reference_camera,
+                                                target_camera,
+                                                p,
+                                            );
+                                            let Some(reference_rays) = reference_rays.as_ref()
+                                            else {
+                                                continue;
+                                            };
+                                            let Some(projection) = local_patch_projection_from_rays(
+                                                reference_camera,
+                                                target_camera,
+                                                &alignments[index].warp,
+                                                p,
+                                                None,
+                                                options,
+                                                reference_rays,
+                                            ) else {
+                                                continue;
+                                            };
+                                            far_scores[index] = projected_patch_zncc_prepared(
+                                                target,
+                                                &projection,
+                                                [0.0, 0.0],
+                                                &reference_patch,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             let mut node_tested = false;
                             for (label, &depth) in labels.iter().enumerate() {
-                                let views = score_views(
+                                score_views_prepared_into(
                                     inputs,
                                     reference_index,
                                     alignments,
+                                    active_view_indices,
                                     p,
                                     depth,
                                     options,
                                     geometry_mode,
+                                    prepared_reference.then_some(&reference_patch),
+                                    reference_rays.as_ref(),
+                                    &far_scores,
+                                    &depth_information,
+                                    &mut view_scores,
                                 );
-                                let evidence = aggregate(&views, options, geometry_mode);
+                                let evidence = aggregate_with_scratch(
+                                    &view_scores,
+                                    options,
+                                    geometry_mode,
+                                    &mut aggregate_scratch,
+                                );
                                 let photometric_score = evidence
                                     .map(|evidence| evidence.photometric_score)
                                     .unwrap_or(f32::NAN);
@@ -2410,6 +2498,89 @@ fn complete_depth_field(
     }
 }
 
+fn score_views_prepared_into(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    active_view_indices: &[usize],
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+    reference_patch: Option<&PreparedReferencePatch>,
+    reference_rays: Option<&LocalPatchReferenceRays>,
+    far_scores: &[Option<f32>],
+    depth_information: &[f32],
+    output: &mut Vec<ViewScore>,
+) {
+    output.clear();
+    for &index in active_view_indices {
+        let view = match geometry_mode {
+            DepthGeometryMode::PhysicalRig => {
+                let Some(reference_patch) = reference_patch else {
+                    continue;
+                };
+                let Some(reference_rays) = reference_rays else {
+                    continue;
+                };
+                let Some(reference_camera) = inputs[reference_index].camera else {
+                    continue;
+                };
+                let Some(target_camera) = inputs[index].camera else {
+                    continue;
+                };
+                let score = match depth {
+                    None => far_scores[index],
+                    Some(depth) => projected_patch_zncc_from_prepared_rays(
+                        &inputs[reference_index],
+                        &inputs[index],
+                        &alignments[index].warp,
+                        centre,
+                        Some(depth),
+                        [0.0, 0.0],
+                        options,
+                        reference_patch,
+                        reference_rays,
+                    ),
+                };
+                let Some(score) = score else {
+                    continue;
+                };
+                let far_score = depth.and_then(|_| far_scores[index]);
+                let compatibility_score =
+                    far_score.map_or(score, |baseline| (score - baseline).clamp(-1.0, 1.0));
+                let information = if depth_information[index] > 0.0 {
+                    depth_information[index]
+                } else {
+                    physical_depth_information(reference_camera, target_camera, centre)
+                };
+                ViewScore {
+                    source_index: index,
+                    score,
+                    far_score,
+                    compatibility_score,
+                    depth_information: information,
+                }
+            }
+            DepthGeometryMode::WarpSeeded => {
+                let Some(mut view) = score_one_view_warp_seeded(
+                    &inputs[reference_index],
+                    &inputs[index],
+                    &alignments[index].warp,
+                    centre,
+                    depth,
+                    options.patch_radius,
+                ) else {
+                    continue;
+                };
+                view.source_index = index;
+                view
+            }
+        };
+        output.push(view);
+    }
+}
+
 fn score_views(
     inputs: &[AlignInput<'_>],
     reference_index: usize,
@@ -2518,35 +2689,30 @@ fn refine_one_view_physical(
         projection.target_centre[0] as f32,
         projection.target_centre[1] as f32,
     ];
-    let depth_score = projected_patch_zncc(
-        reference,
-        target,
-        measured_proposal,
-        centre,
-        Some(shared_depth),
-        [0.0, 0.0],
-        options,
-    )?;
+    let mut reference_patch = PreparedReferencePatch::with_radius(options.patch_radius);
+    if !prepare_reference_patch(reference, centre, options, &mut reference_patch) {
+        return None;
+    }
+    let depth_score =
+        projected_patch_zncc_prepared(target, &projection, [0.0, 0.0], &reference_patch)?;
 
     // Visibility is decided at the exact shared multiview depth before this
     // function is called. Only then may a visible view absorb a very small
     // residual image-space error. Per-camera depth search is deliberately not
     // allowed here: otherwise an occluded camera could jump to a different
-    // scene layer and appear to validate the shared surface.
+    // scene layer and appear to validate the shared surface. The physical
+    // projection and reference patch are invariant across these residuals.
     let mut best = (depth_score, depth_score, depth_point);
     for dy in [-1.5f32, 0.0, 1.5] {
         for dx in [-1.5f32, 0.0, 1.5] {
             if dx == 0.0 && dy == 0.0 {
                 continue;
             }
-            let Some(score) = projected_patch_zncc(
-                reference,
+            let Some(score) = projected_patch_zncc_prepared(
                 target,
-                measured_proposal,
-                centre,
-                Some(shared_depth),
+                &projection,
                 [f64::from(dx), f64::from(dy)],
-                options,
+                &reference_patch,
             ) else {
                 continue;
             };
@@ -2783,6 +2949,47 @@ struct LocalPatchProjection {
     target_dy: Vec2,
 }
 
+#[derive(Clone, Copy)]
+struct LocalPatchReferenceRays {
+    centre: Ray,
+    left: Ray,
+    right: Ray,
+    above: Ray,
+    below: Ray,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedReferenceSample {
+    point: Vec2,
+    value: f32,
+    weight: f32,
+}
+
+struct PreparedReferencePatch {
+    samples: Vec<PreparedReferenceSample>,
+    count: f32,
+    sum_reference: f32,
+    sum_reference_sq: f32,
+}
+
+impl PreparedReferencePatch {
+    fn with_radius(radius: usize) -> Self {
+        let diameter = radius.saturating_mul(2).saturating_add(1);
+        Self {
+            samples: Vec::with_capacity(diameter.saturating_mul(diameter)),
+            count: 0.0,
+            sum_reference: 0.0,
+            sum_reference_sq: 0.0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AggregateScratch {
+    ordered: Vec<f32>,
+    positive_information: Vec<f32>,
+}
+
 impl LocalPatchProjection {
     #[inline]
     fn map(self, point: Vec2) -> Vec2 {
@@ -2859,25 +3066,39 @@ fn perpendicular_proposal(delta: Vec2, tangent: Option<Vec2>) -> Vec2 {
 /// displacement perpendicular to the physical epipolar trajectory. Its
 /// along-trajectory component is scene parallax and must not become an
 /// infinity anchor or be added again to a finite-depth hypothesis.
-fn local_patch_projection(
+fn local_patch_reference_rays(
+    reference_camera: &ResolvedCamera,
+    centre: Vec2,
+) -> LocalPatchReferenceRays {
+    const DERIVATIVE_STEP: f64 = 2.0;
+    LocalPatchReferenceRays {
+        centre: reference_camera.pixel_to_ray(centre),
+        left: reference_camera.pixel_to_ray([centre[0] - DERIVATIVE_STEP, centre[1]]),
+        right: reference_camera.pixel_to_ray([centre[0] + DERIVATIVE_STEP, centre[1]]),
+        above: reference_camera.pixel_to_ray([centre[0], centre[1] - DERIVATIVE_STEP]),
+        below: reference_camera.pixel_to_ray([centre[0], centre[1] + DERIVATIVE_STEP]),
+    }
+}
+
+fn local_patch_projection_from_rays(
     reference_camera: &ResolvedCamera,
     target_camera: &ResolvedCamera,
     measured_proposal: &Warp,
     centre: Vec2,
     depth: Option<f64>,
     options: &DepthOptions,
+    rays: &LocalPatchReferenceRays,
 ) -> Option<LocalPatchProjection> {
     const DERIVATIVE_STEP: f64 = 2.0;
 
     let surface_depth = depth.unwrap_or(INFINITY_DEPTH);
-    let centre_ray = reference_camera.pixel_to_ray(centre);
+    let centre_ray = rays.centre;
     let surface_point = add(
         centre_ray.origin,
         scale(centre_ray.direction, surface_depth),
     );
     let surface_normal = centre_ray.direction;
-    let project = |point: Vec2| -> Option<Vec2> {
-        let ray = reference_camera.pixel_to_ray(point);
+    let project_ray = |ray: Ray| -> Option<Vec2> {
         let denominator = dot(ray.direction, surface_normal);
         if denominator.abs() <= 1.0e-9 {
             return None;
@@ -2889,7 +3110,7 @@ fn local_patch_projection(
         target_camera.project(add(ray.origin, scale(ray.direction, distance)))
     };
 
-    let physical_centre = project(centre)?;
+    let physical_centre = project_ray(rays.centre)?;
     let proposal = measured_perpendicular_proposal(
         measured_proposal,
         reference_camera,
@@ -2903,10 +3124,10 @@ fn local_patch_projection(
         physical_centre[0] + proposal[0],
         physical_centre[1] + proposal[1],
     ];
-    let left = project([centre[0] - DERIVATIVE_STEP, centre[1]])?;
-    let right = project([centre[0] + DERIVATIVE_STEP, centre[1]])?;
-    let above = project([centre[0], centre[1] - DERIVATIVE_STEP])?;
-    let below = project([centre[0], centre[1] + DERIVATIVE_STEP])?;
+    let left = project_ray(rays.left)?;
+    let right = project_ray(rays.right)?;
+    let above = project_ray(rays.above)?;
+    let below = project_ray(rays.below)?;
     let derivative_scale = 1.0 / (2.0 * DERIVATIVE_STEP);
     Some(LocalPatchProjection {
         centre,
@@ -2920,6 +3141,124 @@ fn local_patch_projection(
             (below[1] - above[1]) * derivative_scale,
         ],
     })
+}
+
+fn local_patch_projection(
+    reference_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    measured_proposal: &Warp,
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+) -> Option<LocalPatchProjection> {
+    let rays = local_patch_reference_rays(reference_camera, centre);
+    local_patch_projection_from_rays(
+        reference_camera,
+        target_camera,
+        measured_proposal,
+        centre,
+        depth,
+        options,
+        &rays,
+    )
+}
+
+fn prepare_reference_patch(
+    reference: &AlignInput<'_>,
+    centre: Vec2,
+    options: &DepthOptions,
+    patch: &mut PreparedReferencePatch,
+) -> bool {
+    patch.samples.clear();
+    patch.count = 0.0;
+    patch.sum_reference = 0.0;
+    patch.sum_reference_sq = 0.0;
+
+    let Some(centre_reference) = reference.luminance.sample(
+        ((centre[0] - 0.5) * 0.5) as f32,
+        ((centre[1] - 0.5) * 0.5) as f32,
+    ) else {
+        return false;
+    };
+    let radius = options.patch_radius;
+    let sigma = (radius as f32 * 0.75).max(1.0);
+    for dy in -(radius as isize)..=radius as isize {
+        for dx in -(radius as isize)..=radius as isize {
+            let point = [centre[0] + dx as f64 * 2.0, centre[1] + dy as f64 * 2.0];
+            let Some(reference_value) = reference.luminance.sample(
+                ((point[0] - 0.5) * 0.5) as f32,
+                ((point[1] - 0.5) * 0.5) as f32,
+            ) else {
+                patch.samples.clear();
+                return false;
+            };
+            let distance_sq = (dx * dx + dy * dy) as f32;
+            let spatial = (-distance_sq / (2.0 * sigma * sigma)).exp();
+            let range = (-1.2 * (reference_value - centre_reference).abs()).exp();
+            let weight = spatial * range;
+            patch.count += weight;
+            patch.sum_reference += weight * reference_value;
+            patch.sum_reference_sq += weight * reference_value * reference_value;
+            patch.samples.push(PreparedReferenceSample {
+                point,
+                value: reference_value,
+                weight,
+            });
+        }
+    }
+    true
+}
+
+fn projected_patch_zncc_prepared(
+    target: &AlignInput<'_>,
+    projection: &LocalPatchProjection,
+    residual: Vec2,
+    reference_patch: &PreparedReferencePatch,
+) -> Option<f32> {
+    let mut sum_target = 0.0f32;
+    let mut sum_target_sq = 0.0f32;
+    let mut sum_product = 0.0f32;
+    for sample in &reference_patch.samples {
+        let mapped = projection.map(sample.point);
+        let mapped = [mapped[0] + residual[0], mapped[1] + residual[1]];
+        let target_value = target.luminance.sample(
+            ((mapped[0] - 0.5) * 0.5) as f32,
+            ((mapped[1] - 0.5) * 0.5) as f32,
+        )?;
+        sum_target += sample.weight * target_value;
+        sum_target_sq += sample.weight * target_value * target_value;
+        sum_product += sample.weight * sample.value * target_value;
+    }
+    let count = reference_patch.count;
+    let covariance = sum_product - reference_patch.sum_reference * sum_target / count;
+    let reference_energy = reference_patch.sum_reference_sq
+        - reference_patch.sum_reference * reference_patch.sum_reference / count;
+    let target_energy = sum_target_sq - sum_target * sum_target / count;
+    let denominator = (reference_energy.max(0.0) * target_energy.max(0.0)).sqrt();
+    (denominator > 1.0e-6).then_some((covariance / denominator).clamp(-1.0, 1.0))
+}
+
+fn projected_patch_zncc_from_prepared_rays(
+    reference: &AlignInput<'_>,
+    target: &AlignInput<'_>,
+    measured_proposal: &Warp,
+    centre: Vec2,
+    depth: Option<f64>,
+    residual: Vec2,
+    options: &DepthOptions,
+    reference_patch: &PreparedReferencePatch,
+    reference_rays: &LocalPatchReferenceRays,
+) -> Option<f32> {
+    let projection = local_patch_projection_from_rays(
+        reference.camera?,
+        target.camera?,
+        measured_proposal,
+        centre,
+        depth,
+        options,
+        reference_rays,
+    )?;
+    projected_patch_zncc_prepared(target, &projection, residual, reference_patch)
 }
 
 /// ZNCC for one candidate scene surface. Matching and depth estimation are
@@ -2995,6 +3334,143 @@ fn projected_patch_zncc(
     let target_energy = sum_target_sq - sum_target * sum_target / count;
     let denominator = (reference_energy.max(0.0) * target_energy.max(0.0)).sqrt();
     (denominator > 1.0e-6).then_some((covariance / denominator).clamp(-1.0, 1.0))
+}
+
+fn aggregate_with_scratch(
+    scores: &[ViewScore],
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+    scratch: &mut AggregateScratch,
+) -> Option<AggregateEvidence> {
+    match geometry_mode {
+        DepthGeometryMode::PhysicalRig => {
+            aggregate_physical_evidence_with_scratch(scores, options, scratch)
+        }
+        DepthGeometryMode::WarpSeeded => {
+            if scores.len() < options.minimum_support {
+                return None;
+            }
+            scratch.ordered.clear();
+            scratch
+                .ordered
+                .extend(scores.iter().map(|score| score.score));
+            scratch.ordered.sort_by(|left, right| right.total_cmp(left));
+            scratch
+                .ordered
+                .truncate(options.best_view_count.min(scratch.ordered.len()));
+            (scratch.ordered.len() >= options.minimum_support).then(|| {
+                let score = scratch.ordered.iter().sum::<f32>() / scratch.ordered.len() as f32;
+                AggregateEvidence {
+                    photometric_score: score,
+                    paired_photometric_score: None,
+                    paired_far_score: None,
+                    ranking_score: score,
+                }
+            })
+        }
+    }
+}
+
+fn aggregate_physical_evidence_with_scratch(
+    scores: &[ViewScore],
+    options: &DepthOptions,
+    scratch: &mut AggregateScratch,
+) -> Option<AggregateEvidence> {
+    if scores.len() < options.minimum_support {
+        return None;
+    }
+
+    scratch.ordered.clear();
+    scratch
+        .ordered
+        .extend(scores.iter().map(|view| view.compatibility_score));
+    scratch.ordered.sort_by(|left, right| right.total_cmp(left));
+    let anchor_count = options.minimum_support.max(2).min(scratch.ordered.len());
+    let anchor = scratch.ordered[..anchor_count].iter().sum::<f32>() / anchor_count as f32;
+    let threshold = anchor - PHYSICAL_CONSENSUS_BAND;
+
+    scratch.positive_information.clear();
+    scratch.positive_information.extend(
+        scores
+            .iter()
+            .map(|view| view.depth_information)
+            .filter(|value| value.is_finite() && *value > 1.0e-6),
+    );
+    scratch.positive_information.sort_by(f32::total_cmp);
+    let median_information = scratch
+        .positive_information
+        .get(scratch.positive_information.len() / 2)
+        .copied()
+        .unwrap_or(1.0)
+        .max(1.0e-6);
+
+    let mut weighted_score = 0.0f32;
+    let mut total_weight = 0.0f32;
+    let mut paired_finite = 0.0f32;
+    let mut paired_far = 0.0f32;
+    let mut paired_weight = 0.0f32;
+    let mut paired_support = 0.0f32;
+    let mut effective_support = 0.0f32;
+    let mut effective_independent_support = 0.0f32;
+    for view in scores {
+        let x = ((view.compatibility_score - threshold) / PHYSICAL_CONSENSUS_SOFTNESS)
+            .clamp(-20.0, 20.0);
+        let compatibility = 1.0 / (1.0 + (-x).exp());
+        effective_support += compatibility;
+
+        let relative_information = if view.depth_information > 1.0e-6 {
+            view.depth_information / median_information
+        } else {
+            0.0
+        };
+        let information_weight = relative_information.clamp(
+            PHYSICAL_MIN_INFORMATION_WEIGHT,
+            PHYSICAL_MAX_INFORMATION_WEIGHT,
+        );
+        let photometric_weight = compatibility * (0.75 + 0.25 * information_weight);
+        weighted_score += photometric_weight * view.score;
+        total_weight += photometric_weight;
+        if let Some(far_score) = view.far_score {
+            paired_finite += photometric_weight * view.score;
+            paired_far += photometric_weight * far_score;
+            paired_weight += photometric_weight;
+            paired_support += compatibility;
+        }
+        let independent_fraction = if relative_information > 0.0 {
+            relative_information / (1.0 + relative_information)
+        } else {
+            0.0
+        };
+        effective_independent_support += compatibility * independent_fraction;
+    }
+
+    if effective_support < options.minimum_support as f32 * 0.75 || total_weight <= 1.0e-6 {
+        return None;
+    }
+    let photometric_score = (weighted_score / total_weight).clamp(-1.0, 1.0);
+    let (paired_photometric_score, paired_far_score) =
+        if paired_weight > 1.0e-6 && paired_support >= options.minimum_support as f32 * 0.75 {
+            (
+                Some((paired_finite / paired_weight).clamp(-1.0, 1.0)),
+                Some((paired_far / paired_weight).clamp(-1.0, 1.0)),
+            )
+        } else {
+            (None, None)
+        };
+    let minimum_independent = options.minimum_support as f32 * 0.5;
+    let excess_support = (effective_independent_support - minimum_independent).max(0.0);
+    let support_confidence = 1.0 - (-excess_support / PHYSICAL_SUPPORT_CONFIDENCE_SATURATION).exp();
+    let ranking_score = if photometric_score > 0.0 {
+        photometric_score + (1.0 - photometric_score) * support_confidence
+    } else {
+        photometric_score
+    };
+    Some(AggregateEvidence {
+        photometric_score,
+        paired_photometric_score,
+        paired_far_score,
+        ranking_score: ranking_score.clamp(-1.0, 1.0),
+    })
 }
 
 fn aggregate(
@@ -3281,6 +3757,111 @@ mod tests {
     }
 
     #[test]
+    fn prepared_patch_zncc_matches_inline_accumulation() {
+        let mut reference_plane = Plane::new(24, 24);
+        let mut target_plane = Plane::new(24, 24);
+        for y in 0..24 {
+            for x in 0..24 {
+                let index = y * 24 + x;
+                reference_plane.data[index] = ((x * 13 + y * 7 + x * y * 3) % 41) as f32 / 40.0;
+                target_plane.data[index] = ((x * 11 + y * 5 + x * y * 2 + 3) % 37) as f32 / 36.0;
+            }
+        }
+        let reference = AlignInput {
+            name: "reference",
+            luminance: &reference_plane,
+            width: 48,
+            height: 48,
+            camera: None,
+            depth_evidence_enabled: true,
+            nominal_focal_px: 1_000.0,
+        };
+        let target = AlignInput {
+            name: "target",
+            luminance: &target_plane,
+            width: 48,
+            height: 48,
+            camera: None,
+            depth_evidence_enabled: true,
+            nominal_focal_px: 1_000.0,
+        };
+        let options = DepthOptions {
+            patch_radius: 3,
+            ..DepthOptions::default()
+        };
+        let centre = [24.5, 22.5];
+        let projection = LocalPatchProjection {
+            centre,
+            target_centre: [25.1, 22.2],
+            target_dx: [1.01, 0.02],
+            target_dy: [-0.01, 0.99],
+        };
+        let residual = [0.15, -0.08];
+
+        let mut prepared = PreparedReferencePatch::with_radius(options.patch_radius);
+        assert!(prepare_reference_patch(
+            &reference,
+            centre,
+            &options,
+            &mut prepared
+        ));
+        let actual = projected_patch_zncc_prepared(&target, &projection, residual, &prepared)
+            .expect("prepared ZNCC");
+
+        let centre_reference = reference
+            .luminance
+            .sample(
+                ((centre[0] - 0.5) * 0.5) as f32,
+                ((centre[1] - 0.5) * 0.5) as f32,
+            )
+            .unwrap();
+        let radius = options.patch_radius;
+        let sigma = (radius as f32 * 0.75).max(1.0);
+        let mut count = 0.0f32;
+        let mut sum_reference = 0.0f32;
+        let mut sum_target = 0.0f32;
+        let mut sum_reference_sq = 0.0f32;
+        let mut sum_target_sq = 0.0f32;
+        let mut sum_product = 0.0f32;
+        for dy in -(radius as isize)..=radius as isize {
+            for dx in -(radius as isize)..=radius as isize {
+                let point = [centre[0] + dx as f64 * 2.0, centre[1] + dy as f64 * 2.0];
+                let reference_value = reference
+                    .luminance
+                    .sample(
+                        ((point[0] - 0.5) * 0.5) as f32,
+                        ((point[1] - 0.5) * 0.5) as f32,
+                    )
+                    .unwrap();
+                let mapped = projection.map(point);
+                let target_value = target
+                    .luminance
+                    .sample(
+                        ((mapped[0] + residual[0] - 0.5) * 0.5) as f32,
+                        ((mapped[1] + residual[1] - 0.5) * 0.5) as f32,
+                    )
+                    .unwrap();
+                let distance_sq = (dx * dx + dy * dy) as f32;
+                let spatial = (-distance_sq / (2.0 * sigma * sigma)).exp();
+                let range = (-1.2 * (reference_value - centre_reference).abs()).exp();
+                let weight = spatial * range;
+                count += weight;
+                sum_reference += weight * reference_value;
+                sum_target += weight * target_value;
+                sum_reference_sq += weight * reference_value * reference_value;
+                sum_target_sq += weight * target_value * target_value;
+                sum_product += weight * reference_value * target_value;
+            }
+        }
+        let covariance = sum_product - sum_reference * sum_target / count;
+        let reference_energy = sum_reference_sq - sum_reference * sum_reference / count;
+        let target_energy = sum_target_sq - sum_target * sum_target / count;
+        let expected = (covariance / (reference_energy.max(0.0) * target_energy.max(0.0)).sqrt())
+            .clamp(-1.0, 1.0);
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    #[test]
     fn physical_proposal_discards_scene_parallax_along_the_depth_locus() {
         assert_eq!(
             perpendicular_proposal([33.0, 14.0], Some([1.0, 0.0])),
@@ -3477,6 +4058,71 @@ mod tests {
         assert!((two.photometric_score - 0.90).abs() < 1.0e-5);
         assert!((ten.photometric_score - 0.90).abs() < 1.0e-5);
         assert!(ten.ranking_score > two.ranking_score);
+    }
+
+    #[test]
+    fn scratch_aggregation_matches_the_allocating_paths() {
+        let options = DepthOptions {
+            best_view_count: 3,
+            minimum_support: 2,
+            ..DepthOptions::default()
+        };
+        let views = [
+            ViewScore {
+                source_index: 1,
+                score: 0.91,
+                far_score: Some(0.72),
+                compatibility_score: 0.19,
+                depth_information: 0.4,
+            },
+            ViewScore {
+                source_index: 2,
+                score: 0.84,
+                far_score: Some(0.71),
+                compatibility_score: 0.13,
+                depth_information: 1.0,
+            },
+            ViewScore {
+                source_index: 3,
+                score: 0.68,
+                far_score: Some(0.75),
+                compatibility_score: -0.07,
+                depth_information: 2.5,
+            },
+            ViewScore {
+                source_index: 4,
+                score: 0.37,
+                far_score: None,
+                compatibility_score: -0.33,
+                depth_information: 0.0,
+            },
+        ];
+
+        for mode in [
+            DepthGeometryMode::PhysicalRig,
+            DepthGeometryMode::WarpSeeded,
+        ] {
+            let expected = aggregate(&views, &options, mode).expect("allocating aggregate");
+            let mut scratch = AggregateScratch::default();
+            let actual = aggregate_with_scratch(&views, &options, mode, &mut scratch)
+                .expect("scratch aggregate");
+            assert_eq!(
+                actual.photometric_score.to_bits(),
+                expected.photometric_score.to_bits()
+            );
+            assert_eq!(
+                actual.paired_photometric_score.map(f32::to_bits),
+                expected.paired_photometric_score.map(f32::to_bits)
+            );
+            assert_eq!(
+                actual.paired_far_score.map(f32::to_bits),
+                expected.paired_far_score.map(f32::to_bits)
+            );
+            assert_eq!(
+                actual.ranking_score.to_bits(),
+                expected.ranking_score.to_bits()
+            );
+        }
     }
 
     #[test]

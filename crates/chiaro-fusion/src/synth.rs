@@ -23,11 +23,11 @@ use chiaro::lri::NoiseModel;
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryState};
 use chiaro_hotpixel_core::png16::{
-    PngColor, write_png16_streaming_atomic_with_level, write_rgb16_native_atomic,
+    PngColor, write_png16_streaming_atomic_with_level_profiled, write_rgb16_native_atomic,
 };
 use std::path::Path;
 
-use crate::align::{ModuleAlignment, Warp, WarpVisibility};
+use crate::align::{ModuleAlignment, Warp, WarpSample, WarpVisibility};
 use crate::cfa::{
     CameraResponseBase, CfaObservation, CfaSolverScratch, HighlightProvenance, JointCfaEstimate,
     NoiseDependency, Visibility, account_shared_sample_dependence_with_scratch,
@@ -218,15 +218,43 @@ impl ModuleColor {
         self.balanced_to_xyz(balanced)
     }
 
-    /// Luminance (XYZ Y) of a camera RGB sample.
+    /// Luminance (XYZ Y) of a camera RGB sample. Evaluate only the Y row of
+    /// the forward matrix; this is algebraically identical to `to_xyz(rgb)[1]`
+    /// but avoids computing unused X/Z values in high-frequency structure tests.
     #[inline]
     pub fn luminance(&self, rgb: [f32; 3]) -> f32 {
-        self.to_xyz(rgb)[1]
+        let balanced = [
+            rgb[0] * self.wb_gains[0],
+            rgb[1] * self.wb_gains[1],
+            rgb[2] * self.wb_gains[2],
+        ];
+        let f = &self.forward[1];
+        f[0] * balanced[0] + f[1] * balanced[1] + f[2] * balanced[2]
     }
 
     #[inline]
     pub fn luminance_clipped(&self, rgb: [f32; 3], sensor_white: [f32; 3]) -> f32 {
-        self.to_xyz_clipped(rgb, sensor_white)[1]
+        let mut balanced = [
+            rgb[0] * self.wb_gains[0],
+            rgb[1] * self.wb_gains[1],
+            rgb[2] * self.wb_gains[2],
+        ];
+        let proximity = rgb
+            .into_iter()
+            .zip(sensor_white)
+            .filter_map(|(value, white)| {
+                (value.is_finite() && white.is_finite() && white > 0.0).then_some(value / white)
+            })
+            .fold(0.0f32, f32::max);
+        let reconstruction = smoothstep((proximity - 0.94) / 0.06);
+        if reconstruction > 0.0 {
+            let mut levels = balanced;
+            levels.sort_by(f32::total_cmp);
+            let neutral = levels[1];
+            balanced = balanced.map(|value| value + (neutral - value) * reconstruction);
+        }
+        let f = &self.forward[1];
+        f[0] * balanced[0] + f[1] * balanced[1] + f[2] * balanced[2]
     }
 
     #[inline]
@@ -767,6 +795,18 @@ impl ResolutionAccumulator {
 
 /// Per-module statistics of a synthesis run.
 #[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SynthTimingReport {
+    /// End-to-end wall time spent inside the streaming PNG writer.
+    pub png_wall_seconds: f32,
+    /// Sum of worker time spent producing pixel bytes. This may exceed wall
+    /// time because bands render concurrently.
+    pub render_cpu_seconds: f32,
+    /// Sum of worker time spent applying the PNG filter and deflating bands.
+    /// This may exceed wall time because bands compress concurrently.
+    pub filter_deflate_cpu_seconds: f32,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SynthReport {
     pub canvas_width: usize,
     pub canvas_height: usize,
@@ -793,6 +833,7 @@ pub struct SynthReport {
     pub source_contributions: Vec<SourceContributionReport>,
     /// Reference/output pixel stride of the ownership diagnostics.
     pub ownership_diagnostic_step: usize,
+    pub timings: SynthTimingReport,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1050,7 +1091,7 @@ pub fn synthesize(
         })
         .collect::<Vec<_>>();
 
-    write_png16_streaming_atomic_with_level(
+    let png_timings = write_png16_streaming_atomic_with_level_profiled(
         output,
         width,
         height,
@@ -1068,6 +1109,7 @@ pub fn synthesize(
             let mut band_edge_checked = 0usize;
             let mut band_edge_rejected = 0usize;
             let mut per_source_weights = vec![[0.0f32; 2]; local_source_counters.len()];
+            let mut touched_source_weights = Vec::with_capacity(usable.len());
             let mut reconstruction_geometries = vec![None; usable.len()];
             // Modules whose footprint can reach this band. Narrow modules
             // cover a small part of the canvas, so most bands skip them.
@@ -1075,18 +1117,23 @@ pub fn synthesize(
                 .iter()
                 .filter(|(_, source)| band_touches_module(source, rows.clone(), &crop, scale))
                 .collect::<Vec<_>>();
+            let reference_band_source = band_sources
+                .iter()
+                .find(|(_, source)| source.reference)
+                .map(|(_, source)| *source);
             for (row_offset, v) in rows.clone().enumerate() {
                 let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
                 for u in 0..width {
-                    per_source_weights.fill([0.0; 2]);
+                    for &source_index in &touched_source_weights {
+                        per_source_weights[source_index] = [0.0; 2];
+                    }
+                    touched_source_weights.clear();
                     reconstruction_geometries.fill(None);
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
-                    let reference_source = band_sources
-                        .iter()
-                        .find(|(_, source)| source.reference)
-                        .map(|(_, source)| *source);
-                    let reference_photometric = reference_source
-                        .and_then(|source| source_photometric(source, rx, ry, options));
+                    let reference_source = reference_band_source;
+                    let reference_prepared = reference_source
+                        .and_then(|source| prepare_source_sample(source, rx, ry, options));
+                    let reference_photometric = reference_prepared.map(|sample| sample.photometric);
                     let reference_luminance = reference_photometric.map(|sample| sample.0);
                     let reference_color = reference_photometric.and_then(|sample| sample.1);
                     let reference_structure = reference_source.and_then(|source| {
@@ -1123,9 +1170,18 @@ pub fn synthesize(
                             continue;
                         }
                         let source_index = *source_index;
-                        let warp_sample = source.alignment.warp.sample(rx, ry);
-                        let Some(q) = warp_sample.mapped else {
-                            continue;
+                        let prepared_source =
+                            source.reference.then_some(reference_prepared).flatten();
+                        let warp_sample = prepared_source
+                            .map(|sample| sample.warp_sample)
+                            .unwrap_or_else(|| source.alignment.warp.sample(rx, ry));
+                        let q = if let Some(sample) = prepared_source {
+                            sample.q
+                        } else {
+                            let Some(q) = warp_sample.mapped else {
+                                continue;
+                            };
+                            q
                         };
                         local_source_counters[source_index].visibility_checked += 1;
                         if !source.reference && warp_sample.visibility.blocks_sampling() {
@@ -1133,9 +1189,13 @@ pub fn synthesize(
                             continue;
                         }
                         let mosaic = source.mosaic;
-                        let Some((rgb, sensor_white)) = mosaic.sample_rgb_with_white(q[0], q[1])
-                        else {
-                            continue;
+                        let (rgb, sensor_white) = if let Some(sample) = prepared_source {
+                            (sample.rgb, sample.sensor_white)
+                        } else {
+                            let Some(sample) = mosaic.sample_rgb_with_white(q[0], q[1]) else {
+                                continue;
+                            };
+                            sample
                         };
                         let border = q[0]
                             .min(q[1])
@@ -1166,9 +1226,14 @@ pub fn synthesize(
                         }
                         let gain = source.alignment.gain;
                         let offset = source.alignment.offset;
-                        let field = source
-                            .gain_field
-                            .at(q[0], q[1], mosaic.width, mosaic.height);
+                        let field =
+                            prepared_source
+                                .map(|sample| sample.field)
+                                .unwrap_or_else(|| {
+                                    source
+                                        .gain_field
+                                        .at(q[0], q[1], mosaic.width, mosaic.height)
+                                });
                         let reconstruction_geometry = options
                             .resolution_reconstruction
                             .uses_resolution_warps()
@@ -1178,7 +1243,10 @@ pub fn synthesize(
                             reconstruction_geometries[source_index] = Some(geometry);
                         }
                         if mosaic.is_mono() || !source.color.calibrated {
-                            let y = (gain * (rgb[1] - offset)).max(0.0) * field[1];
+                            let y = prepared_source.map_or_else(
+                                || (gain * (rgb[1] - offset)).max(0.0) * field[1],
+                                |sample| sample.photometric.0,
+                            );
                             let sample_structure = (!source.reference && needs_source_structure)
                                 .then(|| {
                                     source_log_luminance_structure_with_centre(
@@ -1242,6 +1310,7 @@ pub fn synthesize(
                                 baseline_only_luminance = true;
                             }
                             per_source_weights[source_index][0] = weight;
+                            touched_source_weights.push(source_index);
                             luminance += weight * y;
                             luminance_weight += weight;
                             if luminance_owner.is_none_or(|(_, best)| weight > best) {
@@ -1252,17 +1321,22 @@ pub fn synthesize(
                                 reference_luminance_weight += weight;
                             }
                         } else {
-                            let matched_rgb = rgb.map(|v| (gain * (v - offset)).max(0.0));
-                            let matched_white =
-                                sensor_white.map(|v| (gain * (v - offset)).max(0.0));
-                            let mut matched = source.color.xyz_for_output(
-                                matched_rgb,
-                                matched_white,
-                                options.highlight_correction,
-                            );
-                            for c in 0..3 {
-                                matched[c] *= field[c];
-                            }
+                            let matched = if let Some(sample) = prepared_source {
+                                sample.photometric.1.expect("calibrated source has XYZ")
+                            } else {
+                                let matched_rgb = rgb.map(|v| (gain * (v - offset)).max(0.0));
+                                let matched_white =
+                                    sensor_white.map(|v| (gain * (v - offset)).max(0.0));
+                                let mut matched = source.color.xyz_for_output(
+                                    matched_rgb,
+                                    matched_white,
+                                    options.highlight_correction,
+                                );
+                                for c in 0..3 {
+                                    matched[c] *= field[c];
+                                }
+                                matched
+                            };
                             let sample_structure = (!source.reference && needs_source_structure)
                                 .then(|| {
                                     source_log_luminance_structure_with_centre(
@@ -1332,6 +1406,7 @@ pub fn synthesize(
                             let color_source_weight = base_weight * edge_weight * chroma_weight;
                             per_source_weights[source_index] =
                                 [luminance_source_weight, color_source_weight];
+                            touched_source_weights.push(source_index);
                             for c in 0..3 {
                                 xyz[c] += color_source_weight * matched[c];
                             }
@@ -1398,7 +1473,8 @@ pub fn synthesize(
                         } else {
                             1.0
                         };
-                        for (source_index, weights) in per_source_weights.iter().enumerate() {
+                        for &source_index in &touched_source_weights {
+                            let weights = per_source_weights[source_index];
                             let is_reference = Some(source_index) == reference_source_index;
                             let luminance_share = weights[0]
                                 * if is_reference { 1.0 } else { other_scale }
@@ -1903,6 +1979,11 @@ pub fn synthesize(
         ),
         source_contributions,
         ownership_diagnostic_step: OWNERSHIP_STEP,
+        timings: SynthTimingReport {
+            png_wall_seconds: png_timings.total_seconds,
+            render_cpu_seconds: png_timings.render_cpu_seconds,
+            filter_deflate_cpu_seconds: png_timings.filter_deflate_cpu_seconds,
+        },
     })
 }
 
@@ -2915,6 +2996,71 @@ fn dot3(first: [f32; 3], second: [f32; 3]) -> f32 {
 /// Calibrated luminance at an actual module-raster sample position. This is
 /// the same photometric path as pull synthesis without its subpixel bilinear
 /// lookup in the module raster.
+#[derive(Clone, Copy)]
+struct PreparedSourceSample {
+    warp_sample: WarpSample,
+    q: [f32; 2],
+    rgb: [f32; 3],
+    sensor_white: [f32; 3],
+    field: [f32; 3],
+    photometric: (f32, Option<[f32; 3]>),
+}
+
+#[inline]
+fn calibrated_luminance_for_output(
+    color: &ModuleColor,
+    rgb: [f32; 3],
+    sensor_white: [f32; 3],
+    highlight_correction: bool,
+) -> f32 {
+    if highlight_correction {
+        color.luminance_clipped(rgb, sensor_white)
+    } else {
+        color.luminance(rgb)
+    }
+}
+
+fn prepare_source_sample(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<PreparedSourceSample> {
+    let warp_sample = source.alignment.warp.sample(rx, ry);
+    if !source.reference && warp_sample.visibility.blocks_sampling() {
+        return None;
+    }
+    let q = warp_sample.mapped?;
+    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
+    let field = source
+        .gain_field
+        .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
+    let gain = source.alignment.gain;
+    let offset = source.alignment.offset;
+    let photometric = if source.mosaic.is_mono() || !source.color.calibrated {
+        ((gain * (rgb[1] - offset)).max(0.0) * field[1], None)
+    } else {
+        let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
+        let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
+        let mut xyz =
+            source
+                .color
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
+        for channel in 0..3 {
+            xyz[channel] *= field[channel];
+        }
+        (xyz[1], Some(xyz))
+    };
+    Some(PreparedSourceSample {
+        warp_sample,
+        q,
+        rgb,
+        sensor_white,
+        field,
+        photometric,
+    })
+}
+
 fn source_luminance_at_sensor(
     source: &SynthSource<'_>,
     x: f32,
@@ -2933,10 +3079,12 @@ fn source_luminance_at_sensor(
         let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
         let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
         Some(
-            source
-                .color
-                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction)[1]
-                * field[1],
+            calibrated_luminance_for_output(
+                &source.color,
+                matched_rgb,
+                matched_white,
+                options.highlight_correction,
+            ) * field[1],
         )
     }
 }
@@ -2947,6 +3095,15 @@ fn source_photometric(
     ry: f32,
     options: &SynthOptions,
 ) -> Option<(f32, Option<[f32; 3]>)> {
+    prepare_source_sample(source, rx, ry, options).map(|sample| sample.photometric)
+}
+
+fn source_luminance(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<f32> {
     let warp_sample = source.alignment.warp.sample(rx, ry);
     if !source.reference && warp_sample.visibility.blocks_sampling() {
         return None;
@@ -2959,28 +3116,19 @@ fn source_photometric(
         .gain_field
         .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
     if source.mosaic.is_mono() || !source.color.calibrated {
-        Some(((gain * (rgb[1] - offset)).max(0.0) * field[1], None))
+        Some((gain * (rgb[1] - offset)).max(0.0) * field[1])
     } else {
         let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
         let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
-        let mut xyz =
-            source
-                .color
-                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
-        for channel in 0..3 {
-            xyz[channel] *= field[channel];
-        }
-        Some((xyz[1], Some(xyz)))
+        Some(
+            calibrated_luminance_for_output(
+                &source.color,
+                matched_rgb,
+                matched_white,
+                options.highlight_correction,
+            ) * field[1],
+        )
     }
-}
-
-fn source_luminance(
-    source: &SynthSource<'_>,
-    rx: f32,
-    ry: f32,
-    options: &SynthOptions,
-) -> Option<f32> {
-    source_photometric(source, rx, ry, options).map(|sample| sample.0)
 }
 
 fn source_xyz(
@@ -3595,6 +3743,25 @@ mod tests {
         };
         let raw = [0.2, 0.35, 0.3];
         assert_eq!(color.to_xyz_clipped(raw, [1.0; 3]), color.to_xyz(raw));
+    }
+
+    #[test]
+    fn y_only_color_paths_match_full_xyz_conversion() {
+        let color = ModuleColor {
+            wb_gains: [1.7, 0.9, 1.35],
+            forward: [[0.61, 0.22, 0.17], [0.19, 0.73, 0.08], [0.03, 0.14, 0.83]],
+            calibrated: true,
+        };
+        for rgb in [[0.12, 0.37, 0.81], [0.93, 0.78, 0.69], [1.0, 0.8, 0.9]] {
+            assert_eq!(
+                color.luminance(rgb).to_bits(),
+                color.to_xyz(rgb)[1].to_bits()
+            );
+            assert_eq!(
+                color.luminance_clipped(rgb, [1.0; 3]).to_bits(),
+                color.to_xyz_clipped(rgb, [1.0; 3])[1].to_bits()
+            );
+        }
     }
 
     #[test]
