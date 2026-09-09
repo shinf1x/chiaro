@@ -384,27 +384,41 @@ pub struct SynthSource<'a> {
     pub gain_field: GainField,
 }
 
-/// Prefer a locally verified resolution warp where it actually has support.
-/// Sparse refinement grids intentionally leave unsupported cells at zero
-/// confidence; those cells must retain the physical base projection instead
-/// of making an otherwise usable camera disappear. Explicit visibility blocks
-/// remain authoritative and are never bypassed by this fallback.
-fn reconstruction_warp<'a>(
+/// Choose the locally best reconstruction warp without allowing sparse
+/// resolution registration to erase physical visibility. Explicit occlusion or
+/// boundary state on the base depth warp always wins. An unsupported
+/// resolution-warp cell falls back to that physical base mapping instead of
+/// turning into an unmapped hole.
+fn select_reconstruction_warp<'a>(
     base: &'a Warp,
     refined: Option<&'a ResolutionWarp>,
-    x: f32,
-    y: f32,
-) -> &'a Warp {
-    let Some(refined) = refined else {
-        return base;
-    };
-    if refined.warp.visibility(x, y).blocks_sampling()
-        || (refined.warp.confidence(x, y) > 0.0 && refined.warp.map(x, y).is_some())
-    {
-        &refined.warp
-    } else {
-        base
+    reference: bool,
+    rx: f32,
+    ry: f32,
+) -> Option<&'a Warp> {
+    if !reference && base.visibility(rx, ry).blocks_sampling() {
+        return None;
     }
+    if let Some(refined) = refined {
+        let warp = &refined.warp;
+        if !reference && warp.visibility(rx, ry).blocks_sampling() {
+            return None;
+        }
+        if warp.confidence(rx, ry) > 0.0 && warp.map(rx, ry).is_some() {
+            return Some(warp);
+        }
+    }
+    base.map(rx, ry).map(|_| base)
+}
+
+fn reconstruction_warp_at<'s>(source: &'s SynthSource<'_>, rx: f32, ry: f32) -> Option<&'s Warp> {
+    select_reconstruction_warp(
+        &source.alignment.warp,
+        source.resolution_warp,
+        source.reference,
+        rx,
+        ry,
+    )
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -420,6 +434,13 @@ pub struct SourceContributionReport {
     pub luminance_owner_fraction: f32,
     /// Equivalent ownership fraction for colour.
     pub color_owner_fraction: f32,
+    /// Mean normalized share of the final luminance blend over covered output
+    /// pixels. Unlike `luminance_owner_fraction`, this accounts for every
+    /// admitted source rather than naming only the largest one.
+    pub luminance_weight_fraction: f32,
+    /// Mean normalized share of the final XYZ blend over covered output
+    /// pixels (zero where no calibrated colour source was available).
+    pub color_weight_fraction: f32,
     /// Fraction of sampled pixels where known scene depth strongly disagreed
     /// with this magnified source's focus plane.
     pub focus_suppressed_fraction: f32,
@@ -447,6 +468,8 @@ struct SourceCounters {
     sampled: std::sync::atomic::AtomicUsize,
     luminance_owner: std::sync::atomic::AtomicUsize,
     color_owner: std::sync::atomic::AtomicUsize,
+    luminance_weight_micro: std::sync::atomic::AtomicU64,
+    color_weight_micro: std::sync::atomic::AtomicU64,
     focus_suppressed: std::sync::atomic::AtomicUsize,
     color_sampled: std::sync::atomic::AtomicUsize,
     chroma_suppressed: std::sync::atomic::AtomicUsize,
@@ -883,6 +906,7 @@ pub fn synthesize(
             let mut band_covered = 0usize;
             let mut band_edge_checked = 0usize;
             let mut band_edge_rejected = 0usize;
+            let mut per_source_weights = vec![[0.0f32; 2]; source_counters.len()];
             // Modules whose footprint can reach this band. Narrow modules
             // cover a small part of the canvas, so most bands skip them.
             let band_sources = usable
@@ -892,6 +916,7 @@ pub fn synthesize(
             for (row_offset, v) in rows.clone().enumerate() {
                 let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
                 for u in 0..width {
+                    per_source_weights.fill([0.0; 2]);
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
                     let reference_luminance = band_sources
                         .iter()
@@ -1049,6 +1074,7 @@ pub fn synthesize(
                                 // Bayer-only solve cannot replace.
                                 baseline_only_luminance = true;
                             }
+                            per_source_weights[source_index][0] = weight;
                             luminance += weight * y;
                             luminance_weight += weight;
                             if luminance_owner.is_none_or(|(_, best)| weight > best) {
@@ -1140,6 +1166,8 @@ pub fn synthesize(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let color_source_weight = base_weight * edge_weight * chroma_weight;
+                            per_source_weights[source_index] =
+                                [luminance_source_weight, color_source_weight];
                             for c in 0..3 {
                                 xyz[c] += color_source_weight * matched[c];
                             }
@@ -1202,6 +1230,32 @@ pub fn synthesize(
                         &mut band[(row_offset * width + u) * 3..(row_offset * width + u) * 3 + 3];
                     if luminance_weight > 0.0 {
                         band_covered += 1;
+                        let color_other_scale = if reference_color_weight > 0.0 {
+                            other_scale
+                        } else {
+                            1.0
+                        };
+                        for (source_index, weights) in per_source_weights.iter().enumerate() {
+                            let is_reference = Some(source_index) == reference_source_index;
+                            let luminance_share = weights[0]
+                                * if is_reference { 1.0 } else { other_scale }
+                                / luminance_weight;
+                            source_counters[source_index]
+                                .luminance_weight_micro
+                                .fetch_add(
+                                    (luminance_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            if color_weight > 0.0 {
+                                let color_share = weights[1]
+                                    * if is_reference { 1.0 } else { color_other_scale }
+                                    / color_weight;
+                                source_counters[source_index].color_weight_micro.fetch_add(
+                                    (color_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
                         if let Some((owner, _)) = luminance_owner {
                             source_counters[owner]
                                 .luminance_owner
@@ -1511,6 +1565,16 @@ pub fn synthesize(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     covered_pixels,
                 ),
+                luminance_weight_fraction: counters
+                    .luminance_weight_micro
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / (covered_pixels.max(1) as f32 * 1_000_000.0),
+                color_weight_fraction: counters
+                    .color_weight_micro
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
+                    / (covered_pixels.max(1) as f32 * 1_000_000.0),
                 focus_suppressed_fraction: fraction(
                     counters
                         .focus_suppressed
@@ -1807,10 +1871,7 @@ fn projected_camera_luminance(
     reference_structure: Option<[f32; 3]>,
     options: &SynthOptions,
 ) -> Option<ProjectedCameraSample> {
-    let warp = reconstruction_warp(&source.alignment.warp, source.resolution_warp, rx, ry);
-    if !source.reference && warp.visibility(rx, ry).blocks_sampling() {
-        return None;
-    }
+    let warp = reconstruction_warp_at(source, rx, ry)?;
     let local_confidence = warp.confidence(rx, ry);
     if local_confidence <= 0.0 {
         return None;
@@ -1971,24 +2032,31 @@ fn joint_cfa_at(
         {
             continue;
         }
-        let warp = reconstruction_warp(&source.alignment.warp, source.resolution_warp, rx, ry);
-        let centre_visibility = warp.visibility(rx, ry);
-        if !source.reference && centre_visibility.blocks_sampling() {
+        let Some(warp) = reconstruction_warp_at(source, rx, ry) else {
             continue;
-        }
-        let geometry_confidence = warp.confidence(rx, ry) * source.confidence;
-        // Finite-but-unverified physical projections deliberately carry less
-        // than 0.35 confidence. Let them reach CfaObservation, whose explicit
-        // Unknown visibility weight limits their authority. Keeping the old
-        // cutoff for verified/legacy mappings still rejects weak geometry.
-        let minimum_geometry_confidence =
-            if !source.reference && centre_visibility == WarpVisibility::Unknown {
-                f32::MIN_POSITIVE
-            } else {
-                0.35
-            };
-        if geometry_confidence < minimum_geometry_confidence {
-            continue;
+        };
+        let centre_visibility = if source.reference {
+            WarpVisibility::Visible
+        } else {
+            warp.visibility(rx, ry)
+        };
+        let mut geometry_confidence = warp.confidence(rx, ry) * source.confidence;
+        match centre_visibility {
+            WarpVisibility::Visible => {
+                if geometry_confidence < 0.35 {
+                    continue;
+                }
+            }
+            WarpVisibility::Unknown => {
+                // Finite physical geometry whose visibility could not be
+                // independently verified is still useful evidence, but never
+                // with the authority of an explicitly visible observation.
+                if geometry_confidence < 0.05 {
+                    continue;
+                }
+                geometry_confidence *= 0.35;
+            }
+            WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
         }
         let Some(q) = warp.map(rx, ry) else {
             continue;
@@ -3219,13 +3287,12 @@ mod tests {
             report: ResolutionAlignmentReport::default(),
         };
 
-        let selected = reconstruction_warp(&base, Some(&refined), 16.0, 16.0);
+        let selected = select_reconstruction_warp(&base, Some(&refined), false, 16.0, 16.0)
+            .expect("physical base fallback");
         assert!(std::ptr::eq(selected, &base));
 
         refined.warp.visibility.fill(WarpVisibility::Occluded);
-        let selected = reconstruction_warp(&base, Some(&refined), 16.0, 16.0);
-        assert!(std::ptr::eq(selected, &refined.warp));
-        assert!(selected.visibility(16.0, 16.0).blocks_sampling());
+        assert!(select_reconstruction_warp(&base, Some(&refined), false, 16.0, 16.0).is_none());
     }
 
     #[test]

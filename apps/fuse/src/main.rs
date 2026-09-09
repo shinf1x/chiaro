@@ -212,7 +212,8 @@ struct Cli {
     #[arg(long)]
     no_flat_field: bool,
 
-    /// Write per-module alignment checkerboards into this folder.
+    /// Write a visual trace of physical, measured, rig-candidate and final
+    /// depth warps, plus confidence/visibility/ownership diagnostics.
     #[arg(long, value_name = "DIRECTORY")]
     debug_dir: Option<PathBuf>,
 
@@ -314,26 +315,48 @@ fn main() -> Result<()> {
         report.synthesis.covered * 100.0,
     );
     let rig = &report.rig_refinement;
-    println!(
-        "physical rig: {} - {} tracks ({} with 3+ cameras; {} fit/{} held out), RMS {:.3}->{:.3} px, held-out {:.3}->{:.3} px ({:+.2}%){}",
-        if rig.accepted {
-            "accepted"
-        } else {
-            "factory retained"
-        },
-        rig.tracks,
-        rig.tracks_three_plus,
-        rig.fit_tracks,
-        rig.validation_tracks,
-        rig.reprojection_rms_before,
-        rig.reprojection_rms_after,
-        rig.held_out_rms_before,
-        rig.held_out_rms_after,
-        rig.held_out_relative_improvement * 100.0,
-        rig.fallback_reason
-            .as_ref()
-            .map_or(String::new(), |reason| format!("; {reason}")),
-    );
+    if rig.validation_evaluated {
+        println!(
+            "physical rig: {} - {} tracks ({} with 3+ cameras; {} fit/{} held out), RMS {:.3}->{:.3} px, held-out {:.3}->{:.3} px ({:+.2}%){}",
+            if rig.accepted {
+                "accepted"
+            } else {
+                "factory retained"
+            },
+            rig.tracks,
+            rig.tracks_three_plus,
+            rig.fit_tracks,
+            rig.validation_tracks,
+            rig.reprojection_rms_before,
+            rig.reprojection_rms_after,
+            rig.held_out_rms_before,
+            rig.held_out_rms_after,
+            rig.held_out_relative_improvement * 100.0,
+            rig.fallback_reason
+                .as_ref()
+                .map_or(String::new(), |reason| format!("; {reason}")),
+        );
+    } else if rig.enabled && rig.accepted {
+        println!(
+            "physical rig: accepted - {} all-track production fit tracks, RMS {:.3}->{:.3} px{}",
+            rig.fit_tracks,
+            rig.reprojection_rms_before,
+            rig.reprojection_rms_after,
+            rig.fallback_reason
+                .as_ref()
+                .map_or(String::new(), |reason| format!("; {reason}")),
+        );
+    } else if rig.enabled {
+        println!(
+            "physical rig: factory retained - {} all-track production fit tracks{}",
+            rig.fit_tracks,
+            rig.fallback_reason
+                .as_ref()
+                .map_or(String::new(), |reason| format!("; {reason}")),
+        );
+    } else {
+        println!("physical rig: not run (--no-rig-refine)");
+    }
     if rig.image_space_evaluated_cameras > 0 {
         println!(
             "  downstream residual correction: median {:.2}->{:.2} px across {} fitted cameras ({:+.2}%)",
@@ -343,7 +366,14 @@ fn main() -> Result<()> {
             rig.image_space_relative_improvement * 100.0,
         );
     }
-    if rig.fit_tracks > 0 {
+    if let Some(warning) = &rig.image_space_warning {
+        println!("  downstream residual diagnostic warning: {warning}");
+    }
+    if rig.validation_evaluated {
+        println!(
+            "  rig optimizer: {} coordinate sweeps, {} robust membership passes",
+            rig.optimizer_iterations, rig.membership_iterations,
+        );
         println!(
             "  positive-depth tracks: fit {:.1}->{:.1}%, held-out {:.1}->{:.1}%",
             rig.fit_positive_depth_fraction_before * 100.0,
@@ -351,33 +381,134 @@ fn main() -> Result<()> {
             rig.held_out_positive_depth_fraction_before * 100.0,
             rig.held_out_positive_depth_fraction_after * 100.0,
         );
+        println!(
+            "  held-out residual percentiles: sensor median/p75/p90/p95 {:.3}/{:.3}/{:.3}/{:.3} px; reference-equivalent {:.3}/{:.3}/{:.3}/{:.3} px; angular {:.5}/{:.5}/{:.5}/{:.5} deg",
+            rig.held_out_residuals_after.sensor_pixels.median,
+            rig.held_out_residuals_after.sensor_pixels.p75,
+            rig.held_out_residuals_after.sensor_pixels.p90,
+            rig.held_out_residuals_after.sensor_pixels.p95,
+            rig.held_out_residuals_after
+                .reference_equivalent_pixels
+                .median,
+            rig.held_out_residuals_after.reference_equivalent_pixels.p75,
+            rig.held_out_residuals_after.reference_equivalent_pixels.p90,
+            rig.held_out_residuals_after.reference_equivalent_pixels.p95,
+            rig.held_out_residuals_after.angular_degrees.median,
+            rig.held_out_residuals_after.angular_degrees.p75,
+            rig.held_out_residuals_after.angular_degrees.p90,
+            rig.held_out_residuals_after.angular_degrees.p95,
+        );
     }
-    if rig.accepted {
-        for correction in rig.corrections.iter().filter(|correction| {
-            correction.orientation_offset_degrees != [0.0; 3]
-                || correction.mirror_angle_offset_degrees != 0.0
-        }) {
+    if rig.physical_match_candidates > 0 {
+        println!(
+            "  physical matcher: {} candidates, {} tracks/{} target observations; pruned {} inconsistent observations and rejected {} inconsistent tracks; used {}",
+            rig.physical_match_candidates,
+            rig.physical_match_tracks,
+            rig.physical_match_observations,
+            rig.rejected_inconsistent_observations,
+            rig.rejected_inconsistent_tracks,
+            rig.physical_match_used,
+        );
+        println!(
+            "  candidate funnel: {} no supported depth, {} ambiguous depth, {} insufficient native-resolution views, {} failed physical consistency",
+            rig.physical_match_rejected_no_supported_depth,
+            rig.physical_match_rejected_ambiguous_depth,
+            rig.physical_match_rejected_insufficient_views,
+            rig.rejected_inconsistent_tracks,
+        );
+        println!(
+            "  depth hierarchy: {:.1} hypotheses/candidate, up to {} refinement levels, {:.2} px worst final projected step ({:.1} px limit)",
+            rig.physical_match_depth_hypotheses as f64
+                / rig.physical_match_candidates.max(1) as f64,
+            rig.physical_match_max_depth_refinement_levels,
+            rig.physical_match_observed_max_projected_step_px,
+            rig.physical_match_max_projected_step_px,
+        );
+        println!(
+            "  depth levels (level: candidates): {}",
+            rig.physical_match_depth_refinement_histogram
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(level, count)| format!("{level}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if rig.membership_iterations > 0 {
             println!(
-                "  {} physical correction: orientation {:+.4},{:+.4},{:+.4} deg, mirror {:+.4} deg{}",
-                correction.camera,
-                correction.orientation_offset_degrees[0],
-                correction.orientation_offset_degrees[1],
-                correction.orientation_offset_degrees[2],
-                correction.mirror_angle_offset_degrees,
-                if correction.reached_bound {
-                    " (at bound)"
-                } else {
-                    ""
-                },
+                "  persistent-track solve: {} membership passes, {} fit observations/{} tracks rejected without rematching",
+                rig.membership_iterations,
+                rig.fit_membership_rejected_observations,
+                rig.fit_membership_rejected_tracks,
             );
         }
     }
-    for module in &report.modules {
+    for correction in rig.corrections.iter().filter(|correction| {
+        correction.orientation_offset_degrees != [0.0; 3]
+            || correction.mirror_angle_offset_degrees != 0.0
+            || correction.center_offset_world != [0.0; 3]
+            || correction.sensor_offset_px != [0.0; 2]
+    }) {
         println!(
-            "  {:<3} {:<14} coverage {:>5.1}%  inliers {:>4}/{:<4} residual median {:>5.2} px p90 {:>5.2} px  correction {:+.1},{:+.1} px  {}",
+            "  {} {}physical correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, sensor {:+.2},{:+.2} px, mirror {:+.4} deg{}",
+            correction.camera,
+            if rig.accepted { "" } else { "candidate " },
+            correction.orientation_offset_degrees[0],
+            correction.orientation_offset_degrees[1],
+            correction.orientation_offset_degrees[2],
+            correction.center_offset_world[0],
+            correction.center_offset_world[1],
+            correction.center_offset_world[2],
+            correction.sensor_offset_px[0],
+            correction.sensor_offset_px[1],
+            correction.mirror_angle_offset_degrees,
+            if correction.reached_bound {
+                " (at bound)"
+            } else {
+                ""
+            },
+        );
+    }
+    if let Some(audit) = &report.dense_depth_audit {
+        println!(
+            "dense-depth A/B audit (selected: {}; common anchor: {}):",
+            audit.selected_path, audit.common_anchor,
+        );
+        for (name, branch) in [("factory", &audit.factory), ("candidate", &audit.candidate)] {
+            println!(
+                "  {name:<9} {}/{} measured ({:.2}%), {} regularized, {} accepted target views, available {}; funnel {} selected -> {} neighbour -> {} component, {} supported fallback",
+                branch.measured_nodes,
+                branch.tested_nodes,
+                branch.reconstructed_fraction * 100.0,
+                branch.regularized_nodes,
+                branch.accepted_views,
+                branch.depth_available,
+                branch.direct_selected_nodes,
+                branch.neighbour_consistent_nodes,
+                branch.component_consistent_nodes,
+                branch.far_supported_nodes,
+            );
+        }
+        println!(
+            "  candidate-factory: {:+} measured nodes, {:+.2} percentage points",
+            audit.candidate.measured_nodes as i64 - audit.factory.measured_nodes as i64,
+            (audit.candidate.reconstructed_fraction - audit.factory.reconstructed_fraction) * 100.0,
+        );
+    }
+    for module in &report.modules {
+        let depth_support = module.depth.as_ref().map(|depth| {
+            format!(
+                ", warp defined {:.1}%/direct {:.1}%",
+                depth.defined_fraction * 100.0,
+                depth.directly_supported_fraction * 100.0
+            )
+        });
+        println!(
+            "  {:<3} {:<14} overlap {:>5.1}%{}  inliers {:>4}/{:<4} residual median {:>5.2} px p90 {:>5.2} px  correction {:+.1},{:+.1} px  {}",
             module.camera,
             module.initialised_from,
             module.coverage * 100.0,
+            depth_support.as_deref().unwrap_or(""),
             module.inliers,
             module.patches,
             module.residual_median_px,
@@ -447,16 +578,20 @@ fn main() -> Result<()> {
         report.synthesis.edge_rejected_fraction * 100.0
     );
     let resolution = &report.synthesis.resolution_reconstruction;
-    println!(
-        "resolution reconstruction: {} - {:.2}% candidates, {:.2}% sampling-supported, {:.2}% reconstructed, {:.2} cameras, {:.3} px phase spread, {:.3} confidence",
-        resolution.mode,
-        resolution.candidate_fraction * 100.0,
-        resolution.phase_supported_fraction * 100.0,
-        resolution.reconstructed_fraction * 100.0,
-        resolution.mean_cameras,
-        resolution.mean_phase_spread,
-        resolution.mean_confidence,
-    );
+    if resolution.mode == chiaro_fusion::resolution::ResolutionReconstruction::Resample {
+        println!("resolution reconstruction: disabled (resample mode)");
+    } else {
+        println!(
+            "resolution reconstruction: {} - {:.2}% candidates, {:.2}% sampling-supported, {:.2}% reconstructed, {:.2} cameras, {:.3} px phase spread, {:.3} confidence",
+            resolution.mode,
+            resolution.candidate_fraction * 100.0,
+            resolution.phase_supported_fraction * 100.0,
+            resolution.reconstructed_fraction * 100.0,
+            resolution.mean_cameras,
+            resolution.mean_phase_spread,
+            resolution.mean_confidence,
+        );
+    }
     if let Some(joint) = &report.synthesis.joint_cfa {
         println!(
             "joint CFA: {:.2}% of {} candidate points reconstructed (stride {}), solver ran at {:.2}% and skipped {:.2}% by structure gate, {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample affine fit {:+.2}% (diagnostic only)",
@@ -501,6 +636,17 @@ fn main() -> Result<()> {
             );
         }
     }
+    println!("blend contribution (actual normalized weights; owner is only the per-pixel argmax):");
+    for source in &report.synthesis.source_contributions {
+        println!(
+            "  {:<3} luminance {:>6.2}% (owner {:>6.2}%), colour {:>6.2}% (owner {:>6.2}%)",
+            source.camera,
+            source.luminance_weight_fraction * 100.0,
+            source.luminance_owner_fraction * 100.0,
+            source.color_weight_fraction * 100.0,
+            source.color_owner_fraction * 100.0,
+        );
+    }
     println!(
         "timings: load {:.1}s, hotpixel {:.1}s, align {:.1}s, synthesize {:.1}s",
         report.seconds.load,
@@ -518,6 +664,12 @@ fn main() -> Result<()> {
             |bytes| format!(", peak RSS {:.1} MiB", bytes as f64 / 1_048_576.0),
         ),
     );
+    if let Some(debug_dir) = &cli.debug_dir {
+        println!(
+            "visual pipeline trace: {}",
+            debug_dir.join("index.html").display()
+        );
+    }
     Ok(())
 }
 

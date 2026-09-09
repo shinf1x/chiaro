@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     time::Instant,
@@ -26,7 +27,9 @@ use chiaro_hotpixel_core::{
 };
 use serde::Serialize;
 
-use crate::align::{AlignInput, AlignOptions, AlignmentReport, ModuleAlignment, align_module};
+use crate::align::{
+    AlignInput, AlignOptions, AlignmentReport, ModuleAlignment, Warp, WarpVisibility, align_module,
+};
 use crate::array_color::{
     ArrayColorSelectionReport, ArrayColorSource, ColorProfileMode, ProfileBlend,
     blended_profile as blended_array_profile, module_color_for_blend, select_array_profile,
@@ -38,18 +41,25 @@ use crate::calibration::{
 use crate::crosstalk::{
     AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
 };
-use crate::depth::{DepthGeometryMode, refine_multiview_depth};
+use crate::depth::{
+    DenseDepthMap, DepthAlignmentReport, DepthGeometryMode, refine_multiview_depth,
+};
 use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
-use crate::resolution::refine_resolution_warp;
+use crate::resolution::{ResolutionReconstruction, refine_resolution_warp};
 use crate::rig::{
-    RigCameraInput, RigRefinementOptions, RigRefinementReport, gate_on_image_space_alignment,
+    RigCameraInput, RigRefinementOptions, RigRefinementReport, evaluate_image_space_alignment,
     refine_capture_rig,
 };
 use crate::synth::{
     ColorPipeline, CropWindow, GainField, ModuleColor, SynthOptions, SynthReport, SynthSource,
     auto_exposure, canvas_scale, photometric_field, photometric_match, synthesize,
 };
+
+/// The same effectively-infinite distance used by the ordinary alignment
+/// initializer. Keeping it here makes the debug projection an exact picture of
+/// the physical seed, before image evidence adds a residual correction.
+const DEBUG_FAR_DEPTH: f64 = 1.0e8;
 
 /// Hot-pixel stage settings. `None` skips the stage.
 #[derive(Clone, Debug)]
@@ -76,8 +86,8 @@ pub struct FusionOptions {
     /// excluded completely from reconstruction.
     pub cfa_held_out: Vec<String>,
     pub align: AlignOptions,
-    /// Capture-specific bounded physical rig refinement, accepted only on an
-    /// independently held-out correspondence subset.
+    /// Capture-specific bounded physical rig refinement. Debug-report runs
+    /// reserve an independently held-out subset; production uses all tracks.
     pub rig_refinement: RigRefinementOptions,
     pub synth: SynthOptions,
     /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
@@ -96,7 +106,8 @@ pub struct FusionOptions {
     /// Explicit reference-raster crop for diagnostics and matched experiments.
     /// When present this takes precedence over `crop_to_framing`.
     pub crop: Option<CropWindow>,
-    /// Write per-module alignment checkerboards (`<module>_check.png`) here.
+    /// Write a human-readable visual trace of every geometry handoff here.
+    /// Legacy `<module>_check.png` files remain aliases of the final warp.
     pub debug_dir: Option<PathBuf>,
     /// Threads for per-frame kernels (`0` = all cores).
     pub threads: usize,
@@ -143,9 +154,14 @@ pub struct FusionReport {
     /// 35 mm-equivalent focal length recorded for the framing, if any.
     pub framed_focal_length_mm: Option<i32>,
     pub modules: Vec<AlignmentReport>,
-    /// Capture-specific physical orientation/mirror refinement performed
+    /// Capture-specific physical pose/raster/mirror refinement performed
     /// before the downstream residual image-space warp.
     pub rig_refinement: RigRefinementReport,
+    /// Debug-mode A/B dense-depth solve. Both branches use the same measured
+    /// perpendicular epipolar proposal/output fallback; neither branch is
+    /// allowed to use the scene-fitted warp as physical depth evidence or fall
+    /// back to WarpSeeded matching.
+    pub dense_depth_audit: Option<DenseDepthAuditReport>,
     /// RAW-domain clipped-sample reconstruction performed per module.
     pub highlights: Vec<(String, HighlightRecoveryReport)>,
     /// Camera-specific learned cleanup availability and correction results.
@@ -161,6 +177,36 @@ pub struct FusionReport {
     pub synthesis: SynthReport,
     pub seconds: FusionTimings,
     pub resources: FusionResources,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DenseDepthAuditReport {
+    pub selected_path: String,
+    pub common_anchor: String,
+    pub factory: DenseDepthAuditBranchReport,
+    pub candidate: DenseDepthAuditBranchReport,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DenseDepthAuditBranchReport {
+    pub depth_available: bool,
+    pub tested_nodes: usize,
+    pub direct_selected_nodes: usize,
+    pub neighbour_consistent_nodes: usize,
+    pub component_consistent_nodes: usize,
+    pub far_supported_nodes: usize,
+    pub measured_nodes: usize,
+    pub regularized_nodes: usize,
+    pub reconstructed_fraction: f32,
+    pub accepted_views: usize,
+    pub cameras: Vec<DenseDepthAuditCameraReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DenseDepthAuditCameraReport {
+    pub camera: String,
+    pub geometry_accepted: bool,
+    pub depth: Option<DepthAlignmentReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -588,22 +634,1211 @@ fn alignment_inputs<'a>(
         .collect()
 }
 
+fn alignment_inputs_with_cameras<'a>(
+    modules: &'a [LoadedModule],
+    luminance: &'a [Plane],
+    cameras: &'a [Option<ResolvedCamera>],
+) -> Vec<AlignInput<'a>> {
+    modules
+        .iter()
+        .zip(luminance)
+        .zip(cameras)
+        .map(|((module, luminance), camera)| AlignInput {
+            name: &module.raw.name,
+            luminance,
+            width: module.raw.width,
+            height: module.raw.height,
+            camera: camera.as_ref(),
+            depth_evidence_enabled: true,
+            nominal_focal_px: camera
+                .as_ref()
+                .map(|camera| camera.focal_px)
+                .unwrap_or_else(|| nominal_focal_px(&module.raw.name)),
+        })
+        .collect()
+}
+
+fn disable_held_out_depth_evidence(inputs: &mut [AlignInput<'_>], held_out: &[String]) {
+    for input in inputs {
+        if held_out
+            .iter()
+            .any(|camera| camera.eq_ignore_ascii_case(input.name))
+        {
+            input.depth_evidence_enabled = false;
+        }
+    }
+}
+
 fn align_all_modules(
     inputs: &[AlignInput<'_>],
     reference_index: usize,
     options: &AlignOptions,
+    threads: usize,
 ) -> Result<Vec<ModuleAlignment>> {
     let reference = &inputs[reference_index];
+    let automatic_workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let requested_workers = if threads == 0 {
+        automatic_workers
+    } else {
+        threads
+    };
+    let worker_count = requested_workers.clamp(1, inputs.len().max(1));
+    let inputs_per_worker = inputs.len().div_ceil(worker_count);
     std::thread::scope(|scope| {
-        let handles = inputs
-            .iter()
-            .map(|input| scope.spawn(move || align_module(reference, input, options)))
+        let handles = (0..inputs.len())
+            .step_by(inputs_per_worker)
+            .map(|first_index| {
+                let last_index = (first_index + inputs_per_worker).min(inputs.len());
+                scope.spawn(move || {
+                    (first_index..last_index)
+                        .map(|index| (index, align_module(reference, &inputs[index], options)))
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect::<Vec<_>>();
-        handles
+        let mut outputs = std::iter::repeat_with(|| None)
+            .take(inputs.len())
+            .collect::<Vec<_>>();
+        for handle in handles {
+            for (index, result) in handle.join().expect("alignment worker panicked") {
+                outputs[index] = Some(result);
+            }
+        }
+        outputs
             .into_iter()
-            .map(|handle| handle.join().expect("alignment worker panicked"))
-            .collect::<Result<Vec<_>>>()
+            .map(|result| result.expect("alignment worker omitted a module"))
+            .collect()
     })
+}
+
+fn alignment_debug_warps(alignments: &[ModuleAlignment]) -> Vec<Option<Warp>> {
+    alignments
+        .iter()
+        .map(|alignment| Some(alignment.warp.clone()))
+        .collect()
+}
+
+fn physical_debug_warps(
+    cameras: &[Option<ResolvedCamera>],
+    reference_index: usize,
+    width: usize,
+    height: usize,
+) -> Vec<Option<Warp>> {
+    let Some(reference) = cameras.get(reference_index).and_then(Option::as_ref) else {
+        return vec![None; cameras.len()];
+    };
+    cameras
+        .iter()
+        .map(|camera| {
+            let camera = camera.as_ref()?;
+            Some(Warp::from_fn(width, height, 8, |pixel| {
+                camera
+                    .map_from(reference, pixel, DEBUG_FAR_DEPTH)
+                    .filter(|point| camera.contains(*point))
+            }))
+        })
+        .collect()
+}
+
+fn candidate_debug_cameras(
+    modules: &[LoadedModule],
+    calibration: &CalibrationDatabase,
+    report: &RigRefinementReport,
+    intrinsics_mode: IntrinsicsMode,
+) -> Vec<Option<ResolvedCamera>> {
+    modules
+        .iter()
+        .map(|module| {
+            let correction = report
+                .corrections
+                .iter()
+                .find(|correction| correction.camera == module.raw.name);
+            let refinement = correction.map_or_else(CameraRefinement::default, |correction| {
+                let orientation = correction.orientation_offset_degrees;
+                CameraRefinement {
+                    mirror_angle_offset_degrees: correction.mirror_angle_offset_degrees,
+                    orientation_offset_degrees: (orientation != [0.0; 3]).then_some(orientation),
+                    center_offset_world: (correction.center_offset_world != [0.0; 3])
+                        .then_some(correction.center_offset_world),
+                    sensor_offset_px: (correction.sensor_offset_px != [0.0; 2])
+                        .then_some(correction.sensor_offset_px),
+                }
+            });
+            ResolvedCamera::new(
+                calibration.cameras.get(&module.raw.name)?,
+                module.state.as_ref()?,
+                intrinsics_mode,
+                &refinement,
+            )
+            .ok()
+        })
+        .collect()
+}
+
+fn diagnostic_error_color(error_px: f32) -> [u16; 3] {
+    if !error_px.is_finite() {
+        return [0; 3];
+    }
+    // Log-like landmarks: <=1 px green, 4 px yellow, 16 px orange and
+    // >=32 px magenta. These are deliberately fixed across runs so two debug
+    // directories can be compared without auto-scaling hiding a regression.
+    let stops = [
+        (0.0, [0.0, 0.15, 0.0]),
+        (1.0, [0.0, 1.0, 0.0]),
+        (4.0, [1.0, 1.0, 0.0]),
+        (16.0, [1.0, 0.25, 0.0]),
+        (32.0, [1.0, 0.0, 1.0]),
+    ];
+    let error_px = error_px.clamp(0.0, 32.0);
+    let (left, right) = stops
+        .windows(2)
+        .find_map(|pair| (error_px <= pair[1].0).then_some((pair[0], pair[1])))
+        .unwrap_or((stops[stops.len() - 2], stops[stops.len() - 1]));
+    let t = ((error_px - left.0) / (right.0 - left.0).max(f32::EPSILON)).clamp(0.0, 1.0);
+    std::array::from_fn(|channel| {
+        ((left.1[channel] + (right.1[channel] - left.1[channel]) * t) * 65_535.0).round() as u16
+    })
+}
+
+#[inline]
+fn diagnostic_point_inside_raster(point: [f32; 2], width: usize, height: usize) -> bool {
+    width > 0
+        && height > 0
+        && point[0].is_finite()
+        && point[1].is_finite()
+        && point[0] >= 0.0
+        && point[1] >= 0.0
+        && point[0] <= width.saturating_sub(1) as f32
+        && point[1] <= height.saturating_sub(1) as f32
+}
+
+fn write_warp_maps(
+    directory: &Path,
+    camera: &str,
+    warp: &Warp,
+    measured: Option<&Warp>,
+    target_width: usize,
+    target_height: usize,
+) -> Result<()> {
+    let confidence = warp
+        .points
+        .iter()
+        .zip(&warp.confidence)
+        .map(|(&point, value)| {
+            if diagnostic_point_inside_raster(point, target_width, target_height) {
+                (value.clamp(0.0, 1.0) * 65_535.0).round() as u16
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    chiaro_hotpixel_core::png16::write_gray16_native_atomic(
+        &directory.join(format!("{camera}-confidence.png")),
+        warp.columns,
+        warp.rows,
+        &confidence,
+    )?;
+
+    let mut visibility = Vec::with_capacity(warp.points.len() * 3);
+    for (point, state) in warp.points.iter().zip(&warp.visibility) {
+        let color = if !diagnostic_point_inside_raster(*point, target_width, target_height) {
+            [0, 0, 0]
+        } else {
+            match state {
+                WarpVisibility::Visible => [0, 65_535, 0],
+                WarpVisibility::Unknown => [65_535, 49_152, 0],
+                WarpVisibility::Occluded => [65_535, 0, 0],
+                WarpVisibility::Boundary => [65_535, 0, 65_535],
+            }
+        };
+        visibility.extend(color);
+    }
+    chiaro_hotpixel_core::png16::write_rgb16_native_atomic(
+        &directory.join(format!("{camera}-visibility.png")),
+        warp.columns,
+        warp.rows,
+        &visibility,
+    )?;
+
+    if let Some(measured) = measured {
+        let mut disagreement = Vec::with_capacity(warp.points.len() * 3);
+        for row in 0..warp.rows {
+            for column in 0..warp.columns {
+                let pixel = [(column * warp.step) as f32, (row * warp.step) as f32];
+                let color = match (
+                    warp.map(pixel[0], pixel[1]),
+                    measured.map(pixel[0], pixel[1]),
+                ) {
+                    (Some(first), Some(second))
+                        if diagnostic_point_inside_raster(first, target_width, target_height)
+                            && diagnostic_point_inside_raster(
+                                second,
+                                target_width,
+                                target_height,
+                            ) =>
+                    {
+                        diagnostic_error_color((first[0] - second[0]).hypot(first[1] - second[1]))
+                    }
+                    _ => [0; 3],
+                };
+                disagreement.extend(color);
+            }
+        }
+        chiaro_hotpixel_core::png16::write_rgb16_native_atomic(
+            &directory.join(format!("{camera}-vs-measured-error.png")),
+            warp.columns,
+            warp.rows,
+            &disagreement,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_debug_warp_stage(
+    debug_dir: &Path,
+    stage: &str,
+    modules: &[LoadedModule],
+    luminance: &[Plane],
+    reference_index: usize,
+    warps: &[Option<Warp>],
+    measured: Option<&[Option<Warp>]>,
+    write_maps: bool,
+) -> Result<()> {
+    let directory = debug_dir.join(stage);
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create debug stage {}", directory.display()))?;
+    for index in 0..modules.len() {
+        if index == reference_index {
+            continue;
+        }
+        let Some(warp) = warps.get(index).and_then(Option::as_ref) else {
+            continue;
+        };
+        let camera = &modules[index].raw.name;
+        let (samples, width, height) = crate::align::debug_checkerboard(
+            &luminance[reference_index],
+            &luminance[index],
+            warp,
+            64,
+        );
+        chiaro_hotpixel_core::png16::write_gray16_native_atomic(
+            &directory.join(format!("{camera}-checkerboard.png")),
+            width,
+            height,
+            &samples,
+        )?;
+        if write_maps {
+            write_warp_maps(
+                &directory,
+                camera,
+                warp,
+                measured
+                    .and_then(|warps| warps.get(index))
+                    .and_then(Option::as_ref),
+                modules[index].raw.width,
+                modules[index].raw.height,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn dense_depth_audit_branch_report(
+    depth_map: Option<&DenseDepthMap>,
+    alignments: &[ModuleAlignment],
+    reference_index: usize,
+) -> DenseDepthAuditBranchReport {
+    let shared = alignments
+        .iter()
+        .find_map(|alignment| alignment.report.depth.as_ref());
+    DenseDepthAuditBranchReport {
+        depth_available: depth_map.is_some(),
+        tested_nodes: shared.map_or(0, |depth| depth.tested_nodes),
+        direct_selected_nodes: shared.map_or(0, |depth| depth.direct_selected_nodes),
+        neighbour_consistent_nodes: shared.map_or(0, |depth| depth.neighbour_consistent_nodes),
+        component_consistent_nodes: shared.map_or(0, |depth| depth.component_consistent_nodes),
+        far_supported_nodes: shared.map_or(0, |depth| depth.far_supported_nodes),
+        measured_nodes: shared.map_or(0, |depth| depth.measured_nodes),
+        regularized_nodes: shared.map_or(0, |depth| depth.regularized_nodes),
+        reconstructed_fraction: shared.map_or(0.0, |depth| depth.reconstructed_fraction),
+        accepted_views: alignments
+            .iter()
+            .enumerate()
+            .filter(|(index, alignment)| *index != reference_index && alignment.geometry_accepted())
+            .count(),
+        cameras: alignments
+            .iter()
+            .map(|alignment| DenseDepthAuditCameraReport {
+                camera: alignment.name.clone(),
+                geometry_accepted: alignment.geometry_accepted(),
+                depth: alignment.report.depth.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn run_dense_depth_audit_branch(
+    debug_dir: &Path,
+    stage: &str,
+    modules: &[LoadedModule],
+    luminance: &[Plane],
+    cameras: &[Option<ResolvedCamera>],
+    reference_index: usize,
+    measured_seed: &[ModuleAlignment],
+    measured_warps: &[Option<Warp>],
+    held_out: &[String],
+    options: &crate::depth::DepthOptions,
+) -> Result<DenseDepthAuditBranchReport> {
+    let mut alignments = measured_seed.to_vec();
+    let mut inputs = alignment_inputs_with_cameras(modules, luminance, cameras);
+    disable_held_out_depth_evidence(&mut inputs, held_out);
+    let depth_map = refine_multiview_depth(
+        &inputs,
+        reference_index,
+        &mut alignments,
+        options,
+        DepthGeometryMode::PhysicalRig,
+    );
+    write_dense_depth_audit_outputs(
+        debug_dir,
+        stage,
+        modules,
+        luminance,
+        reference_index,
+        &alignments,
+        depth_map.as_ref(),
+        measured_warps,
+    )
+}
+
+fn write_dense_depth_audit_outputs(
+    debug_dir: &Path,
+    stage: &str,
+    modules: &[LoadedModule],
+    luminance: &[Plane],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    depth_map: Option<&DenseDepthMap>,
+    measured_warps: &[Option<Warp>],
+) -> Result<DenseDepthAuditBranchReport> {
+    let warps = alignment_debug_warps(&alignments);
+    write_debug_warp_stage(
+        debug_dir,
+        stage,
+        modules,
+        luminance,
+        reference_index,
+        &warps,
+        Some(measured_warps),
+        true,
+    )?;
+    if let Some(depth_map) = depth_map {
+        let directory = debug_dir.join(stage);
+        depth_map.write_diagnostics(
+            &directory.join("depth-inverse.png"),
+            &directory.join("depth-provenance.png"),
+        )?;
+        depth_map.write_visualization(&directory.join("depth-visualization.png"))?;
+    }
+    Ok(dense_depth_audit_branch_report(
+        depth_map,
+        alignments,
+        reference_index,
+    ))
+}
+
+fn write_rig_residual_field_svg(debug_dir: &Path, report: &RigRefinementReport) -> Result<()> {
+    let cameras = report
+        .residual_field
+        .iter()
+        .map(|field| field.camera.as_str())
+        .fold(Vec::<&str>::new(), |mut cameras, camera| {
+            if !cameras.contains(&camera) {
+                cameras.push(camera);
+            }
+            cameras
+        });
+    if cameras.is_empty() {
+        return Ok(());
+    }
+    const PANEL_WIDTH: usize = 360;
+    const PANEL_HEIGHT: usize = 275;
+    const COLUMNS: usize = 3;
+    let rows = cameras.len().div_ceil(COLUMNS);
+    let mut svg = String::new();
+    let _ = writeln!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
+        PANEL_WIDTH * COLUMNS,
+        PANEL_HEIGHT * rows + 45,
+        PANEL_WIDTH * COLUMNS,
+        PANEL_HEIGHT * rows + 45,
+    );
+    svg.push_str(
+        r##"<rect width="100%" height="100%" fill="#11151b"/><style>text{font-family:monospace;fill:#e8edf2}.grid{stroke:#34404c;stroke-width:1}.before{stroke:#ff5d5d;stroke-width:2}.after{stroke:#46e0e0;stroke-width:2}</style>"##,
+    );
+    svg.push_str(
+        r#"<text x="18" y="27" font-size="15">Held-out reprojection residuals: red=factory, cyan=candidate; arrow scale 5 SVG px per sensor px</text>"#,
+    );
+    for (camera_index, camera) in cameras.iter().enumerate() {
+        let origin_x = (camera_index % COLUMNS) * PANEL_WIDTH + 25;
+        let origin_y = (camera_index / COLUMNS) * PANEL_HEIGHT + 70;
+        let plot_width = 300.0;
+        let plot_height = 210.0;
+        let _ = writeln!(
+            svg,
+            r##"<g><text x="{}" y="{}" font-size="18">{}</text><rect x="{}" y="{}" width="{}" height="{}" fill="none" stroke="#6b7885"/>"##,
+            origin_x,
+            origin_y - 12,
+            camera,
+            origin_x,
+            origin_y,
+            plot_width,
+            plot_height,
+        );
+        for column in 1..4 {
+            let x = origin_x as f64 + plot_width * column as f64 / 4.0;
+            let _ = writeln!(
+                svg,
+                r#"<line class="grid" x1="{x}" y1="{}" x2="{x}" y2="{}"/>"#,
+                origin_y,
+                origin_y as f64 + plot_height,
+            );
+        }
+        for row in 1..3 {
+            let y = origin_y as f64 + plot_height * row as f64 / 3.0;
+            let _ = writeln!(
+                svg,
+                r#"<line class="grid" x1="{}" y1="{y}" x2="{}" y2="{y}"/>"#,
+                origin_x,
+                origin_x as f64 + plot_width,
+            );
+        }
+        for field in report
+            .residual_field
+            .iter()
+            .filter(|field| field.camera == **camera)
+        {
+            let x = origin_x as f64 + plot_width * (field.cell[0] as f64 + 0.5) / 4.0;
+            let y = origin_y as f64 + plot_height * (field.cell[1] as f64 + 0.5) / 3.0;
+            let arrow = |residual: [f64; 2]| {
+                let length = residual[0].hypot(residual[1]);
+                let scale = if length > 12.0 { 60.0 / length } else { 5.0 };
+                [x + residual[0] * scale, y + residual[1] * scale]
+            };
+            let before = arrow(field.mean_before);
+            let after = arrow(field.mean_after);
+            let _ = writeln!(
+                svg,
+                r##"<circle cx="{x}" cy="{y}" r="2" fill="#fff"/><line class="before" x1="{x}" y1="{y}" x2="{}" y2="{}"/><line class="after" x1="{x}" y1="{y}" x2="{}" y2="{}"/><text x="{}" y="{}" font-size="9">n={}</text>"##,
+                before[0],
+                before[1],
+                after[0],
+                after[1],
+                x + 4.0,
+                y - 4.0,
+                field.samples,
+            );
+        }
+        svg.push_str("</g>");
+    }
+    svg.push_str("</svg>");
+    fs::write(debug_dir.join("rig-held-out-residual-field.svg"), svg)
+        .with_context(|| format!("write debug residual field in {}", debug_dir.display()))
+}
+
+fn write_rig_held_out_observations(debug_dir: &Path, report: &RigRefinementReport) -> Result<()> {
+    let observations = &report.held_out_observations;
+    if observations.is_empty() {
+        return Ok(());
+    }
+    let cameras = observations
+        .iter()
+        .map(|observation| observation.camera.as_str())
+        .fold(Vec::<&str>::new(), |mut cameras, camera| {
+            if !cameras.contains(&camera) {
+                cameras.push(camera);
+            }
+            cameras
+        });
+    const PANEL_WIDTH: usize = 420;
+    const PANEL_HEIGHT: usize = 320;
+    const COLUMNS: usize = 3;
+    let rows = cameras.len().div_ceil(COLUMNS);
+    let mut svg = String::new();
+    let _ = writeln!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
+        PANEL_WIDTH * COLUMNS,
+        PANEL_HEIGHT * rows + 80,
+        PANEL_WIDTH * COLUMNS,
+        PANEL_HEIGHT * rows + 80,
+    );
+    svg.push_str(
+        r##"<rect width="100%" height="100%" fill="#11151b"/><style>text{font-family:monospace;fill:#e8edf2}.grid{stroke:#34404c;stroke-width:1}.before{stroke:#ff5d5d;stroke-width:1.4;opacity:.72}.after{stroke:#46e0e0;stroke-width:1.4;opacity:.82}.factory-tail{fill:none;stroke:#ff8c42;stroke-width:1.5;stroke-dasharray:2 2}.candidate-tail{fill:none;stroke:#ffd166;stroke-width:2.5}.tail-label{fill:#ffd166;font-size:9px}</style>"##,
+    );
+    let _ = writeln!(
+        svg,
+        r#"<text x="18" y="25" font-size="15">Individual held-out observations: red=factory, cyan=candidate, yellow ring=candidate p95 tail (&gt;={:.3} reference px)</text>"#,
+        report
+            .held_out_residuals_after
+            .reference_equivalent_pixels
+            .p95,
+    );
+    svg.push_str(
+        r#"<text x="18" y="47" font-size="12">Arrow scale 3 SVG px per sensor px; arrows above 15 sensor px are capped. Hover a point for exact values. Orange dashed ring=factory p95 tail.</text>"#,
+    );
+    for (camera_index, camera) in cameras.iter().enumerate() {
+        let origin_x = (camera_index % COLUMNS) * PANEL_WIDTH + 30;
+        let origin_y = (camera_index / COLUMNS) * PANEL_HEIGHT + 100;
+        let plot_width = 350.0;
+        let plot_height = 245.0;
+        let camera_observations = observations
+            .iter()
+            .filter(|observation| observation.camera == **camera)
+            .collect::<Vec<_>>();
+        let [sensor_width, sensor_height] = camera_observations[0].sensor_size;
+        let _ = writeln!(
+            svg,
+            r##"<g><text x="{}" y="{}" font-size="18">{} — n={}</text><rect x="{}" y="{}" width="{}" height="{}" fill="#080a0d" stroke="#6b7885"/>"##,
+            origin_x,
+            origin_y - 12,
+            camera,
+            camera_observations.len(),
+            origin_x,
+            origin_y,
+            plot_width,
+            plot_height,
+        );
+        for division in 1..4 {
+            let x = origin_x as f64 + plot_width * division as f64 / 4.0;
+            let y = origin_y as f64 + plot_height * division as f64 / 4.0;
+            let _ = writeln!(
+                svg,
+                r#"<line class="grid" x1="{x}" y1="{}" x2="{x}" y2="{}"/><line class="grid" x1="{}" y1="{y}" x2="{}" y2="{y}"/>"#,
+                origin_y,
+                origin_y as f64 + plot_height,
+                origin_x,
+                origin_x as f64 + plot_width,
+            );
+        }
+        for observation in camera_observations {
+            let x =
+                origin_x as f64 + plot_width * observation.pixel[0] / sensor_width.max(1) as f64;
+            let y =
+                origin_y as f64 + plot_height * observation.pixel[1] / sensor_height.max(1) as f64;
+            let arrow = |residual: [f64; 2]| {
+                let length = residual[0].hypot(residual[1]);
+                let scale = if length > 15.0 { 45.0 / length } else { 3.0 };
+                [x + residual[0] * scale, y + residual[1] * scale]
+            };
+            let before = arrow(observation.factory_residual);
+            let after = arrow(observation.candidate_residual);
+            let _ = writeln!(
+                svg,
+                r##"<g><title>{} ({:.1},{:.1}) factory {:.3} ref px/{:.4} deg; candidate {:.3} ref px/{:.4} deg</title><line class="before" x1="{x}" y1="{y}" x2="{}" y2="{}"/><line class="after" x1="{x}" y1="{y}" x2="{}" y2="{}"/><circle cx="{x}" cy="{y}" r="1.7" fill="#f4f7fa"/>"##,
+                observation.camera,
+                observation.pixel[0],
+                observation.pixel[1],
+                observation.factory_reference_pixels,
+                observation.factory_angular_degrees,
+                observation.candidate_reference_pixels,
+                observation.candidate_angular_degrees,
+                before[0],
+                before[1],
+                after[0],
+                after[1],
+            );
+            if observation.factory_p95_tail {
+                let _ = write!(
+                    svg,
+                    r#"<circle class="factory-tail" cx="{x}" cy="{y}" r="5"/>"#,
+                );
+            }
+            if observation.candidate_p95_tail {
+                let _ = write!(
+                    svg,
+                    r#"<circle class="candidate-tail" cx="{x}" cy="{y}" r="7"/><text class="tail-label" x="{}" y="{}">{:.1}</text>"#,
+                    x + 8.0,
+                    y - 7.0,
+                    observation.candidate_reference_pixels,
+                );
+            }
+            svg.push_str("</g>");
+        }
+        svg.push_str("</g>");
+    }
+    svg.push_str("</svg>");
+    fs::write(debug_dir.join("rig-held-out-observations.svg"), svg)
+        .with_context(|| format!("write held-out observation map in {}", debug_dir.display()))?;
+
+    let mut csv = String::from(
+        "camera,x,y,factory_dx,factory_dy,candidate_dx,candidate_dy,factory_sensor_px,candidate_sensor_px,factory_reference_px,candidate_reference_px,factory_angular_deg,candidate_angular_deg,factory_p95_tail,candidate_p95_tail\n",
+    );
+    for observation in observations {
+        let _ = writeln!(
+            csv,
+            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.9},{:.9},{},{}",
+            observation.camera,
+            observation.pixel[0],
+            observation.pixel[1],
+            observation.factory_residual[0],
+            observation.factory_residual[1],
+            observation.candidate_residual[0],
+            observation.candidate_residual[1],
+            observation.factory_sensor_pixels,
+            observation.candidate_sensor_pixels,
+            observation.factory_reference_pixels,
+            observation.candidate_reference_pixels,
+            observation.factory_angular_degrees,
+            observation.candidate_angular_degrees,
+            observation.factory_p95_tail,
+            observation.candidate_p95_tail,
+        );
+    }
+    fs::write(debug_dir.join("rig-held-out-observations.csv"), csv).with_context(|| {
+        format!(
+            "write held-out observation table in {}",
+            debug_dir.display()
+        )
+    })
+}
+
+fn write_pipeline_trace(
+    debug_dir: &Path,
+    reference: &str,
+    rig: &RigRefinementReport,
+    geometry_mode: DepthGeometryMode,
+    dense_depth_audit: Option<&DenseDepthAuditReport>,
+    alignments: &[ModuleAlignment],
+    synthesis: &SynthReport,
+) -> Result<()> {
+    let mut trace = String::new();
+    let _ = writeln!(trace, "Chiaro visual pipeline trace");
+    let _ = writeln!(trace, "============================");
+    let _ = writeln!(trace, "Reference camera: {reference}");
+    let _ = writeln!(trace, "Dense geometry mode: {geometry_mode:?}");
+    let _ = writeln!(trace, "Rig candidate accepted: {}", rig.accepted);
+    if let Some(reason) = &rig.fallback_reason {
+        let _ = writeln!(trace, "Rig fallback reason: {reason}");
+    }
+    if rig.validation_evaluated {
+        let _ = writeln!(
+            trace,
+            "Rig held-out RMS: {:.3} -> {:.3} px ({:+.2}%)",
+            rig.held_out_rms_before,
+            rig.held_out_rms_after,
+            rig.held_out_relative_improvement * 100.0,
+        );
+        let _ = writeln!(
+            trace,
+            "Rig tracks: {} fit, {} held out; physical matcher used: {}",
+            rig.fit_tracks, rig.validation_tracks, rig.physical_match_used,
+        );
+        let _ = writeln!(
+            trace,
+            "Rig optimization: {} coordinate sweeps, {} robust membership passes",
+            rig.optimizer_iterations, rig.membership_iterations,
+        );
+        let _ = writeln!(
+            trace,
+            "Rig bootstrap: factory-first, then stage-02 perpendicular epipolar proposal +/-{:.1} target px, followed by <= {:.1} reference px proposal-normalized physical consistency; {} observations/{} tracks rejected before optimization",
+            rig.physical_match_residual_radius_px,
+            rig.physical_match_pre_solve_reprojection_px,
+            rig.rejected_inconsistent_observations,
+            rig.rejected_inconsistent_tracks,
+        );
+        if rig.physical_match_candidates > 0 {
+            let _ = writeln!(
+                trace,
+                "Rig matcher yield: {} candidates -> {} physical tracks; rejected: {} no supported depth, {} ambiguous depth, {} insufficient native-resolution views, {} failed physical consistency",
+                rig.physical_match_candidates,
+                rig.physical_match_tracks,
+                rig.physical_match_rejected_no_supported_depth,
+                rig.physical_match_rejected_ambiguous_depth,
+                rig.physical_match_rejected_insufficient_views,
+                rig.rejected_inconsistent_tracks,
+            );
+            let _ = writeln!(
+                trace,
+                "Rig depth hierarchy: {:.1} evaluated hypotheses/reference candidate, up to {} refinements, {:.2} target px worst final neighbouring-depth motion ({:.1} px limit)",
+                rig.physical_match_depth_hypotheses as f64
+                    / rig.physical_match_candidates.max(1) as f64,
+                rig.physical_match_max_depth_refinement_levels,
+                rig.physical_match_observed_max_projected_step_px,
+                rig.physical_match_max_projected_step_px,
+            );
+            let _ = writeln!(
+                trace,
+                "Rig depth levels (level:candidates): {}",
+                rig.physical_match_depth_refinement_histogram
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, count)| **count > 0)
+                    .map(|(level, count)| format!("{level}:{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    } else {
+        let _ = writeln!(
+            trace,
+            "Rig held-out RMS: not evaluated (production uses all usable tracks)"
+        );
+        if rig.enabled {
+            let _ = writeln!(
+                trace,
+                "Rig tracks: {} all-track fit, 0 held out; accepted: {}; physical matcher used: {}",
+                rig.fit_tracks, rig.accepted, rig.physical_match_used,
+            );
+            if rig.physical_match_candidates > 0 {
+                let _ = writeln!(
+                    trace,
+                    "Rig matcher yield: {} candidates -> {} physical tracks; rejected: {} no supported depth, {} ambiguous depth, {} insufficient native-resolution views, {} failed physical consistency",
+                    rig.physical_match_candidates,
+                    rig.physical_match_tracks,
+                    rig.physical_match_rejected_no_supported_depth,
+                    rig.physical_match_rejected_ambiguous_depth,
+                    rig.physical_match_rejected_insufficient_views,
+                    rig.rejected_inconsistent_tracks,
+                );
+                let _ = writeln!(
+                    trace,
+                    "Rig depth hierarchy: {:.1} evaluated hypotheses/reference candidate, up to {} refinements, {:.2} target px worst final neighbouring-depth motion ({:.1} px limit)",
+                    rig.physical_match_depth_hypotheses as f64
+                        / rig.physical_match_candidates.max(1) as f64,
+                    rig.physical_match_max_depth_refinement_levels,
+                    rig.physical_match_observed_max_projected_step_px,
+                    rig.physical_match_max_projected_step_px,
+                );
+                let _ = writeln!(
+                    trace,
+                    "Rig depth levels (level:candidates): {}",
+                    rig.physical_match_depth_refinement_histogram
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, count)| **count > 0)
+                        .map(|(level, count)| format!("{level}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        } else {
+            let _ = writeln!(trace, "Rig tracks/optimization: not run (disabled)");
+        }
+    }
+    if let Some(passed) = rig.image_space_validation_passed {
+        let _ = writeln!(
+            trace,
+            "Downstream residual diagnostic: {} across {} optimized cameras; median correction {:.3} -> {:.3} px ({:+.2}%). This diagnostic does not select factory versus candidate geometry.",
+            if passed {
+                "passed reference threshold"
+            } else {
+                "warning"
+            },
+            rig.image_space_evaluated_cameras,
+            rig.image_space_median_correction_before_px,
+            rig.image_space_median_correction_after_px,
+            rig.image_space_relative_improvement * 100.0,
+        );
+    }
+    if let Some(warning) = &rig.image_space_warning {
+        let _ = writeln!(trace, "Downstream residual warning: {warning}");
+    }
+    if !rig.corrections.is_empty() {
+        trace.push_str("\nRig candidate corrections\n-------------------------\n");
+        trace.push_str(
+            "camera  optimized  rotation(x,y,z) deg          centre(x,y,z)       sensor(x,y) px  mirror deg  bound\n",
+        );
+        for correction in &rig.corrections {
+            let _ = writeln!(
+                trace,
+                "{:<7} {:<9} ({:+7.4},{:+7.4},{:+7.4})  ({:+6.3},{:+6.3},{:+6.3})  ({:+6.2},{:+6.2})   {:+7.4}    {}",
+                correction.camera,
+                correction.optimized,
+                correction.orientation_offset_degrees[0],
+                correction.orientation_offset_degrees[1],
+                correction.orientation_offset_degrees[2],
+                correction.center_offset_world[0],
+                correction.center_offset_world[1],
+                correction.center_offset_world[2],
+                correction.sensor_offset_px[0],
+                correction.sensor_offset_px[1],
+                correction.mirror_angle_offset_degrees,
+                correction.reached_bound,
+            );
+        }
+    }
+    trace.push_str("\nHow to read the stage folders\n-----------------------------\n");
+    trace.push_str(
+        "01-factory-physical: factory camera projection at effectively infinite depth, before image evidence.\n",
+    );
+    trace.push_str(
+        "02-measured-residual: correlation-refined image alignment; this is the measured baseline.\n",
+    );
+    trace.push_str(
+        "03-rig-candidate-physical: proposed pose/raster/mirror correction without a residual image warp.\n",
+    );
+    trace.push_str(
+        "04-active-pre-depth: the accepted/fallback image alignment immediately before dense depth.\n",
+    );
+    trace.push_str(
+        "05-final-depth: the warp actually sent downstream after PhysicalRig or WarpSeeded depth.\n",
+    );
+    if dense_depth_audit.is_some() {
+        trace.push_str(
+            "05a-factory-depth-audit: diagnostic factory PhysicalRig dense solve with no WarpSeeded fallback.\n",
+        );
+        trace.push_str(
+            "05b-candidate-depth-audit: diagnostic proposed-rig PhysicalRig dense solve, run even when the rig candidate is rejected.\n",
+        );
+    }
+    trace.push_str(
+        "Checkerboards should have continuous edges across tile boundaries. Factory/candidate physical checkerboards use an effectively infinite scene plane; finite-scene parallax is therefore expected until stage 05. In *-vs-measured-error.png, the displacement between that stage and the measured capture warp is green <=1 px, yellow ~4 px, orange ~16 px, magenta >=32 px, black=no shared in-sensor domain. It is not the held-out rig RMS and, before depth, includes scene parallax.\n",
+    );
+    trace.push_str(
+        "Visibility colors: green=directly visible, amber=in-sensor but visibility unknown, red=occluded, magenta=depth boundary, black=outside the target sensor/undefined. In stages 01 and 03, confidence is only binary in-sensor projection validity (white=in sensor); it is not image evidence or calibration confidence.\n",
+    );
+    trace.push_str(
+        "rig-held-out-residual-field.svg shows spatial residual direction before/after the candidate; coherent position-dependent arrows suggest a missing camera-model degree of freedom.\n",
+    );
+    if !rig.held_out_observations.is_empty() {
+        let factory_tail = rig
+            .held_out_observations
+            .iter()
+            .filter(|observation| observation.factory_p95_tail)
+            .count();
+        let candidate_tail = rig
+            .held_out_observations
+            .iter()
+            .filter(|observation| observation.candidate_p95_tail)
+            .count();
+        let _ = writeln!(
+            trace,
+            "rig-held-out-observations.svg/csv contain all {} paired held-out observations; {factory_tail} factory and {candidate_tail} candidate samples are at or above their respective global p95 thresholds.",
+            rig.held_out_observations.len(),
+        );
+    }
+
+    if let Some(depth) = alignments
+        .iter()
+        .find_map(|alignment| alignment.report.depth.as_ref())
+    {
+        let _ = writeln!(
+            trace,
+            "\nShared reference-space depth\n----------------------------\n{} / {} tested nodes directly measured ({:.2}%); {} regularized.\nDense acceptance funnel: {} direct finite selections -> {} neighbour-consistent -> {} component-consistent; {} nodes directly support the stage-2 output fallback.\nThis one field is projected into every camera, so it is intentionally not a per-camera percentage.",
+            depth.measured_nodes,
+            depth.tested_nodes,
+            depth.reconstructed_fraction * 100.0,
+            depth.regularized_nodes,
+            depth.direct_selected_nodes,
+            depth.neighbour_consistent_nodes,
+            depth.component_consistent_nodes,
+            depth.far_supported_nodes,
+        );
+    }
+
+    if let Some(audit) = dense_depth_audit {
+        trace.push_str("\nDense-depth A/B audit\n---------------------\n");
+        let _ = writeln!(trace, "Selected production path: {}", audit.selected_path);
+        let _ = writeln!(trace, "Common comparison anchor: {}", audit.common_anchor);
+        for (name, branch) in [
+            ("factory PhysicalRig", &audit.factory),
+            ("candidate PhysicalRig", &audit.candidate),
+        ] {
+            let _ = writeln!(
+                trace,
+                "{name}: available={}, {}/{} finite measured ({:.2}%), {} regularized, {} accepted target views; funnel {} selected -> {} neighbour -> {} component, {} supported fallback",
+                branch.depth_available,
+                branch.measured_nodes,
+                branch.tested_nodes,
+                branch.reconstructed_fraction * 100.0,
+                branch.regularized_nodes,
+                branch.accepted_views,
+                branch.direct_selected_nodes,
+                branch.neighbour_consistent_nodes,
+                branch.component_consistent_nodes,
+                branch.far_supported_nodes,
+            );
+        }
+        let measured_delta =
+            audit.candidate.measured_nodes as i64 - audit.factory.measured_nodes as i64;
+        let _ = writeln!(
+            trace,
+            "Candidate - factory: {measured_delta:+} measured nodes, {:+.2} percentage points reconstructed",
+            (audit.candidate.reconstructed_fraction - audit.factory.reconstructed_fraction) * 100.0,
+        );
+        trace.push_str(
+            "These branches are diagnostics only: both use stage 02 only as the same perpendicular epipolar proposal/output fallback, both force PhysicalRig without WarpSeeded matching, and acceptance still controls the production path.\n",
+        );
+        trace.push_str(
+            "camera  factory-defined  candidate-defined  factory-finite  candidate-finite  factory-far  candidate-far  accepted(F/C)\n",
+        );
+        for factory_camera in &audit.factory.cameras {
+            let candidate_camera = audit
+                .candidate
+                .cameras
+                .iter()
+                .find(|candidate| candidate.camera == factory_camera.camera);
+            let factory_depth = factory_camera.depth.as_ref();
+            let candidate_depth = candidate_camera.and_then(|camera| camera.depth.as_ref());
+            let _ = writeln!(
+                trace,
+                "{:<7} {:>7.2}%          {:>7.2}%          {:>7}          {:>7}       {:>7}        {:>7}       {}/{}",
+                factory_camera.camera,
+                factory_depth.map_or(0.0, |depth| depth.defined_fraction * 100.0),
+                candidate_depth.map_or(0.0, |depth| depth.defined_fraction * 100.0),
+                factory_depth.map_or(0, |depth| depth.refined_nodes),
+                candidate_depth.map_or(0, |depth| depth.refined_nodes),
+                factory_depth.map_or(0, |depth| depth.fallback_nodes),
+                candidate_depth.map_or(0, |depth| depth.fallback_nodes),
+                factory_camera.geometry_accepted,
+                candidate_camera.is_some_and(|camera| camera.geometry_accepted),
+            );
+        }
+    }
+
+    trace.push_str("\nPer-camera geometry\n-------------------\n");
+    let _ = writeln!(
+        trace,
+        "camera  legacy  physical  overlap  warp-defined  direct-support  correction(x,y) px  view-refined  far-fallback  occluded"
+    );
+    for alignment in alignments {
+        let depth = alignment.report.depth.as_ref();
+        let defined = depth
+            .map(|depth| format!("{:>7.2}%", depth.defined_fraction * 100.0))
+            .unwrap_or_else(|| "    n/a".to_owned());
+        let direct = depth
+            .map(|depth| format!("{:>7.2}%", depth.directly_supported_fraction * 100.0))
+            .unwrap_or_else(|| "    n/a".to_owned());
+        let _ = writeln!(
+            trace,
+            "{:<7} {:<7} {:<8} {:>6.2}%    {}        {}       ({:>7.2},{:>7.2})  {:>7.2}%      {:>7}    {:>7}",
+            alignment.name,
+            if alignment.report.accepted {
+                "accept"
+            } else {
+                "reject"
+            },
+            if alignment.geometry_accepted() {
+                "accept"
+            } else {
+                "reject"
+            },
+            alignment.report.coverage * 100.0,
+            defined,
+            direct,
+            alignment.report.correction_median_px[0],
+            alignment.report.correction_median_px[1],
+            depth.map_or(0.0, |depth| depth.refined_fraction * 100.0),
+            depth.map_or(0, |depth| depth.fallback_nodes),
+            depth.map_or(0, |depth| depth.occluded_nodes),
+        );
+    }
+
+    trace.push_str("\nSynthesis\n---------\n");
+    let _ = writeln!(
+        trace,
+        "Canvas: {}x{}, {:.3} canvas pixels/reference pixel, {:.2}% covered",
+        synthesis.canvas_width,
+        synthesis.canvas_height,
+        synthesis.scale,
+        synthesis.covered * 100.0,
+    );
+    let _ = writeln!(
+        trace,
+        "Non-reference edge/detail rejection: {:.2}%",
+        synthesis.edge_rejected_fraction * 100.0,
+    );
+    let resolution = &synthesis.resolution_reconstruction;
+    if resolution.mode == ResolutionReconstruction::Resample {
+        trace.push_str("Resolution reconstruction: disabled by resample mode.\n");
+    } else {
+        let _ = writeln!(
+            trace,
+            "Resolution reconstruction: {:.2}% candidates, {:.4}% applied, mean confidence {:.3}",
+            resolution.candidate_fraction * 100.0,
+            resolution.reconstructed_fraction * 100.0,
+            resolution.mean_confidence,
+        );
+    }
+    if let Some(joint) = &synthesis.joint_cfa {
+        let _ = writeln!(
+            trace,
+            "Joint CFA: {} / {} candidates reconstructed ({:.4}%), mean {:.2} cameras",
+            joint.reconstructed_pixels,
+            joint.attempted_pixels,
+            joint.reconstructed_fraction * 100.0,
+            joint.mean_cameras_per_pixel,
+        );
+    }
+    trace.push_str("\nSource ownership and rejection\n------------------------------\n");
+    trace.push_str(
+        "Weight share is the actual normalized blend contribution. Owner is only the largest single weight at each pixel; it does not mean other cameras were excluded.\n",
+    );
+    let _ = writeln!(
+        trace,
+        "camera  enabled  mag    luma-share  color-share  luma-owner  color-owner  visibility-reject  chroma-reject  resolution-use"
+    );
+    for source in &synthesis.source_contributions {
+        let _ = writeln!(
+            trace,
+            "{:<7} {:<7} {:>4.2}x  {:>7.2}%     {:>7.2}%     {:>7.2}%     {:>7.2}%      {:>7.2}%            {:>7.2}%       {:>7.3}%",
+            source.camera,
+            source.fusion_enabled,
+            source.magnification,
+            source.luminance_weight_fraction * 100.0,
+            source.color_weight_fraction * 100.0,
+            source.luminance_owner_fraction * 100.0,
+            source.color_owner_fraction * 100.0,
+            source.visibility_suppressed_fraction * 100.0,
+            source.chroma_suppressed_fraction * 100.0,
+            source.resolution_contributor_fraction * 100.0,
+        );
+    }
+    trace.push_str("\nFast warning signs\n------------------\n");
+    trace.push_str(
+        "- Physical checkerboard worse than measured checkerboard: the physical model is not yet an adequate correspondence model.\n",
+    );
+    trace.push_str(
+        "- Mostly amber/black final visibility: dense depth has little directly verified support.\n",
+    );
+    trace.push_str("- High edge rejection: downstream safety gates are discarding much of the aligned evidence.\n");
+    if resolution.mode != ResolutionReconstruction::Resample {
+        trace.push_str(
+            "- Near-zero resolution use: reconstruction could not establish sufficiently distinct, locally registered sampling phases.\n",
+        );
+    }
+    trace.push_str(
+        "- Large canvas scale beyond the finest optical magnification: apparent softness is expected because output pixels exceed measured sampling density.\n",
+    );
+    fs::write(debug_dir.join("PIPELINE_TRACE.txt"), trace)
+        .with_context(|| format!("write pipeline trace in {}", debug_dir.display()))?;
+
+    let mut stages = vec![
+        ("01-factory-physical", "Factory physical (infinity plane)"),
+        ("02-measured-residual", "Measured residual"),
+        (
+            "03-rig-candidate-physical",
+            "Rig candidate (infinity plane)",
+        ),
+        ("04-active-pre-depth", "Active pre-depth"),
+        ("05-final-depth", "Final depth"),
+    ];
+    if debug_dir.join("05a-factory-depth-audit").is_dir() {
+        stages.push(("05a-factory-depth-audit", "Audit: factory dense depth"));
+    }
+    if debug_dir.join("05b-candidate-depth-audit").is_dir() {
+        stages.push(("05b-candidate-depth-audit", "Audit: candidate dense depth"));
+    }
+    let mut html = String::from(
+        r##"<!doctype html><html><head><meta charset="utf-8"><title>Chiaro pipeline trace</title><style>
+body{margin:0;padding:24px;background:#11151b;color:#e8edf2;font:15px system-ui,sans-serif}a{color:#65c9ff}h1,h2{margin:.4em 0}.hint{color:#aab6c2;max-width:1000px}.camera{margin:24px 0;padding:16px;background:#1a2028;border-radius:10px;overflow:auto}.stages{display:flex;gap:12px;min-width:max-content}.stage{background:#0c1015;padding:8px;border-radius:6px;min-width:260px;flex:1}.stage img{display:block;width:100%;height:auto;background:#000}.maps{display:flex;gap:10px;flex-wrap:wrap;margin-top:7px;font-size:12px}.overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px}.overview img,.overview object{width:100%;max-height:700px;object-fit:contain;background:#080a0d}code{color:#ffd166}</style></head><body>"##,
+    );
+    let _ = writeln!(
+        html,
+        "<h1>Chiaro pipeline trace — reference {reference}</h1>"
+    );
+    html.push_str(
+        "<p class=\"hint\">Read each row left to right. Continuous edges across checkerboard tiles mean the mapping agrees with the images. The crucial comparison is measured residual versus final depth: a degradation there identifies the geometry handoff, independently of final colour or sharpening.</p>",
+    );
+    html.push_str(
+        "<p class=\"hint\"><strong>Physical-stage maps:</strong> stages 01 and 03 project an effectively infinite plane because dense scene depth is not available yet. Their error map is displacement from the measured capture warp, so it includes finite-depth parallax and is not the held-out rig RMS. White confidence means only that the projection lands inside the target sensor. Amber means in-sensor with visibility not yet known; black means outside the target sensor or undefined.</p>",
+    );
+    html.push_str(
+        "<p><a href=\"PIPELINE_TRACE.txt\">Open the numerical/plain-language trace</a></p>",
+    );
+    for alignment in alignments {
+        if alignment.name == reference {
+            continue;
+        }
+        let _ = writeln!(
+            html,
+            "<section class=\"camera\"><h2>{}</h2><div class=\"stages\">",
+            alignment.name
+        );
+        for &(directory, title) in &stages {
+            let checkerboard = format!("{directory}/{}-checkerboard.png", alignment.name);
+            let _ = writeln!(
+                html,
+                "<div class=\"stage\"><strong>{title}</strong><a href=\"{checkerboard}\"><img loading=\"lazy\" src=\"{checkerboard}\"></a>"
+            );
+            if matches!(
+                directory,
+                "01-factory-physical"
+                    | "03-rig-candidate-physical"
+                    | "05-final-depth"
+                    | "05a-factory-depth-audit"
+                    | "05b-candidate-depth-audit"
+            ) {
+                let (error_label, confidence_label, visibility_label) = if matches!(
+                    directory,
+                    "01-factory-physical" | "03-rig-candidate-physical"
+                ) {
+                    (
+                        "far-plane displacement",
+                        "in-sensor domain",
+                        "pre-depth visibility",
+                    )
+                } else {
+                    ("vs measured displacement", "confidence", "visibility")
+                };
+                let _ = writeln!(
+                    html,
+                    "<div class=\"maps\"><a href=\"{directory}/{}-vs-measured-error.png\">{error_label}</a><a href=\"{directory}/{}-confidence.png\">{confidence_label}</a><a href=\"{directory}/{}-visibility.png\">{visibility_label}</a></div>",
+                    alignment.name, alignment.name, alignment.name,
+                );
+            }
+            html.push_str("</div>");
+        }
+        html.push_str("</div></section>");
+    }
+    html.push_str("<h2>Whole-run diagnostics</h2><div class=\"overview\">");
+    if !rig.held_out_observations.is_empty() {
+        html.push_str(
+            "<div><h3>Individual held-out observations</h3><object data=\"rig-held-out-observations.svg\" type=\"image/svg+xml\"></object><p><a href=\"rig-held-out-observations.svg\">Open full-size map</a> · <a href=\"rig-held-out-observations.csv\">Open exact values (CSV)</a></p></div>",
+        );
+    }
+    if !rig.residual_field.is_empty() {
+        html.push_str(
+            "<div><h3>Held-out rig residual field</h3><object data=\"rig-held-out-residual-field.svg\" type=\"image/svg+xml\"></object></div>",
+        );
+    }
+    if alignments
+        .iter()
+        .any(|alignment| alignment.report.depth.is_some())
+    {
+        html.push_str(
+            "<div><h3>Depth</h3><a href=\"depth-visualization.png\"><img loading=\"lazy\" src=\"depth-visualization.png\"></a></div>",
+        );
+    }
+    for (directory, title) in [
+        (
+            "05a-factory-depth-audit",
+            "Factory PhysicalRig depth provenance",
+        ),
+        (
+            "05b-candidate-depth-audit",
+            "Candidate PhysicalRig depth provenance",
+        ),
+    ] {
+        if debug_dir
+            .join(directory)
+            .join("depth-provenance.png")
+            .is_file()
+        {
+            let _ = writeln!(
+                html,
+                "<div><h3>{title}</h3><a href=\"{directory}/depth-provenance.png\"><img loading=\"lazy\" src=\"{directory}/depth-provenance.png\"></a></div>"
+            );
+        }
+    }
+    html.push_str(
+        "<div><h3>Luminance ownership</h3><a href=\"source-luminance-ownership.png\"><img loading=\"lazy\" src=\"source-luminance-ownership.png\"></a></div><div><h3>Colour ownership</h3><a href=\"source-color-ownership.png\"><img loading=\"lazy\" src=\"source-color-ownership.png\"></a></div>",
+    );
+    html.push_str("</div></body></html>");
+    fs::write(debug_dir.join("index.html"), html)
+        .with_context(|| format!("write debug gallery in {}", debug_dir.display()))
 }
 
 fn correct_fusion_raw(
@@ -1275,8 +2510,52 @@ pub fn fuse(
         );
     }
     let inputs = alignment_inputs(&modules, &luminance);
-    let factory_alignments = align_all_modules(&inputs, reference_index, &options.align)?;
+    let factory_alignments =
+        align_all_modules(&inputs, reference_index, &options.align, options.threads)?;
     drop(inputs);
+    let factory_measured_debug_warps = options
+        .debug_dir
+        .as_ref()
+        .map(|_| alignment_debug_warps(&factory_alignments));
+    let factory_depth_audit_seed = options
+        .debug_dir
+        .as_ref()
+        .map(|_| factory_alignments.clone());
+    if let (Some(debug_dir), Some(measured_warps)) =
+        (&options.debug_dir, &factory_measured_debug_warps)
+    {
+        fs::create_dir_all(debug_dir).with_context(|| format!("create {}", debug_dir.display()))?;
+        let factory_cameras = modules
+            .iter()
+            .map(|module| module.camera.clone())
+            .collect::<Vec<_>>();
+        let factory_physical = physical_debug_warps(
+            &factory_cameras,
+            reference_index,
+            modules[reference_index].raw.width,
+            modules[reference_index].raw.height,
+        );
+        write_debug_warp_stage(
+            debug_dir,
+            "01-factory-physical",
+            &modules,
+            &luminance,
+            reference_index,
+            &factory_physical,
+            Some(measured_warps),
+            true,
+        )?;
+        write_debug_warp_stage(
+            debug_dir,
+            "02-measured-residual",
+            &modules,
+            &luminance,
+            reference_index,
+            measured_warps,
+            None,
+            false,
+        )?;
+    }
 
     progress(Progress {
         stage: "align",
@@ -1285,20 +2564,61 @@ pub fn fuse(
     });
     let rig_inputs = modules
         .iter()
-        .map(|module| RigCameraInput {
+        .enumerate()
+        .map(|(index, module)| RigCameraInput {
             name: &module.raw.name,
             calibration: calibration.cameras.get(&module.raw.name),
             state: module.state.as_ref(),
+            match_evidence_enabled: !options
+                .cfa_held_out
+                .iter()
+                .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name)),
+            luminance: luminance.get(index),
         })
         .collect::<Vec<_>>();
+    let mut rig_options = options.rig_refinement.clone();
+    rig_options.threads = options.threads;
+    rig_options.held_out_validation = options.debug_dir.is_some();
     let mut rig_outcome = refine_capture_rig(
         &rig_inputs,
         reference_index,
         &factory_alignments,
         options.intrinsics_mode,
-        &options.rig_refinement,
+        &rig_options,
     );
     drop(rig_inputs);
+    let candidate_audit_cameras = options.debug_dir.as_ref().map(|_| {
+        candidate_debug_cameras(
+            &modules,
+            &calibration,
+            &rig_outcome.report,
+            options.intrinsics_mode,
+        )
+    });
+    if let (Some(debug_dir), Some(measured_warps), Some(candidate_cameras)) = (
+        &options.debug_dir,
+        &factory_measured_debug_warps,
+        &candidate_audit_cameras,
+    ) {
+        let candidate_physical = physical_debug_warps(
+            candidate_cameras,
+            reference_index,
+            modules[reference_index].raw.width,
+            modules[reference_index].raw.height,
+        );
+        write_debug_warp_stage(
+            debug_dir,
+            "03-rig-candidate-physical",
+            &modules,
+            &luminance,
+            reference_index,
+            &candidate_physical,
+            Some(measured_warps),
+            true,
+        )?;
+        write_rig_residual_field_svg(debug_dir, &rig_outcome.report)?;
+        write_rig_held_out_observations(debug_dir, &rig_outcome.report)?;
+    }
     let factory_cameras = modules
         .iter()
         .map(|module| module.camera.clone())
@@ -1322,36 +2642,46 @@ pub fn fuse(
             fraction: 0.44,
         });
         let refined_inputs = alignment_inputs(&modules, &luminance);
-        let refined_alignments =
-            align_all_modules(&refined_inputs, reference_index, &options.align)?;
-        if gate_on_image_space_alignment(
+        let refined_alignments = align_all_modules(
+            &refined_inputs,
+            reference_index,
+            &options.align,
+            options.threads,
+        )?;
+        evaluate_image_space_alignment(
             &mut rig_outcome.report,
             &factory_alignments,
             &refined_alignments,
             options
                 .rig_refinement
                 .min_image_space_correction_improvement,
-        ) {
-            refined_alignments
-        } else {
-            for (module, factory_camera) in modules.iter_mut().zip(factory_cameras) {
-                module.camera = factory_camera;
-            }
-            factory_alignments
-        }
+        );
+        refined_alignments
     } else {
         factory_alignments
     };
-    let mut inputs = alignment_inputs(&modules, &luminance);
-    for (index, module) in modules.iter().enumerate() {
-        if options
-            .cfa_held_out
-            .iter()
-            .any(|camera| camera.eq_ignore_ascii_case(&module.raw.name))
-        {
-            inputs[index].depth_evidence_enabled = false;
-        }
+    let active_pre_depth_debug_warps = options
+        .debug_dir
+        .as_ref()
+        .map(|_| alignment_debug_warps(&alignments));
+    if let (Some(debug_dir), Some(active_warps)) =
+        (&options.debug_dir, &active_pre_depth_debug_warps)
+    {
+        write_debug_warp_stage(
+            debug_dir,
+            "04-active-pre-depth",
+            &modules,
+            &luminance,
+            reference_index,
+            active_warps,
+            None,
+            false,
+        )?;
     }
+    let mut inputs = alignment_inputs(&modules, &luminance);
+    let mut depth_options = options.align.depth.clone();
+    depth_options.threads = options.threads;
+    disable_held_out_depth_evidence(&mut inputs, &options.cfa_held_out);
     for (module, alignment) in modules.iter().zip(&mut alignments) {
         alignment.report.focus_achieved = module.focus.achieved;
         alignment.report.calibrated_focus_distance = module
@@ -1377,7 +2707,7 @@ pub fn fuse(
             *index != reference_index && input.camera.is_some() && input.depth_evidence_enabled
         })
         .count();
-    let depth_geometry_mode = if inputs[reference_index].camera.is_some()
+    let mut depth_geometry_mode = if inputs[reference_index].camera.is_some()
         && calibrated_depth_views >= options.align.depth.minimum_support
     {
         DepthGeometryMode::PhysicalRig
@@ -1400,7 +2730,7 @@ pub fn fuse(
                 &inputs,
                 reference_index,
                 &mut alignments,
-                &options.align.depth,
+                &depth_options,
                 DepthGeometryMode::PhysicalRig,
             );
             let physical_views = inputs
@@ -1416,11 +2746,12 @@ pub fn fuse(
                 physical
             } else {
                 alignments = warp_seeded_alignments;
+                depth_geometry_mode = DepthGeometryMode::WarpSeeded;
                 refine_multiview_depth(
                     &inputs,
                     reference_index,
                     &mut alignments,
-                    &options.align.depth,
+                    &depth_options,
                     DepthGeometryMode::WarpSeeded,
                 )
             }
@@ -1429,9 +2760,92 @@ pub fn fuse(
                 &inputs,
                 reference_index,
                 &mut alignments,
-                &options.align.depth,
+                &depth_options,
                 DepthGeometryMode::WarpSeeded,
             )
+        }
+    } else {
+        None
+    };
+    let dense_depth_audit = if options.align.refine && options.align.depth.enabled {
+        match (
+            &options.debug_dir,
+            &factory_depth_audit_seed,
+            &factory_measured_debug_warps,
+            &candidate_audit_cameras,
+        ) {
+            (
+                Some(debug_dir),
+                Some(measured_seed),
+                Some(measured_warps),
+                Some(candidate_cameras),
+            ) => {
+                progress(Progress {
+                    stage: "align",
+                    detail: "auditing factory and candidate physical depth independently"
+                        .to_owned(),
+                    fraction: 0.48,
+                });
+                let factory = if matches!(depth_geometry_mode, DepthGeometryMode::PhysicalRig)
+                    && !rig_outcome.report.accepted
+                    && depth_map.is_some()
+                {
+                    // The production branch is already exactly the forced
+                    // factory PhysicalRig solve in this case. Reuse it rather
+                    // than rebuilding the same full cost volume a second time.
+                    write_dense_depth_audit_outputs(
+                        debug_dir,
+                        "05a-factory-depth-audit",
+                        &modules,
+                        &luminance,
+                        reference_index,
+                        &alignments,
+                        depth_map.as_ref(),
+                        measured_warps,
+                    )?
+                } else {
+                    run_dense_depth_audit_branch(
+                        debug_dir,
+                        "05a-factory-depth-audit",
+                        &modules,
+                        &luminance,
+                        &factory_cameras,
+                        reference_index,
+                        measured_seed,
+                        measured_warps,
+                        &options.cfa_held_out,
+                        &depth_options,
+                    )?
+                };
+                let candidate = run_dense_depth_audit_branch(
+                    debug_dir,
+                    "05b-candidate-depth-audit",
+                    &modules,
+                    &luminance,
+                    candidate_cameras,
+                    reference_index,
+                    measured_seed,
+                    measured_warps,
+                    &options.cfa_held_out,
+                    &depth_options,
+                )?;
+                let selected_path = match depth_geometry_mode {
+                    DepthGeometryMode::WarpSeeded => "WarpSeeded compatibility fallback",
+                    DepthGeometryMode::PhysicalRig if rig_outcome.report.accepted => {
+                        "accepted candidate PhysicalRig"
+                    }
+                    DepthGeometryMode::PhysicalRig => "factory PhysicalRig",
+                };
+                Some(DenseDepthAuditReport {
+                    selected_path: selected_path.to_owned(),
+                    common_anchor:
+                        "02-measured-residual perpendicular epipolar proposal/output fallback"
+                            .to_owned(),
+                    factory,
+                    candidate,
+                })
+            }
+            _ => None,
         }
     } else {
         None
@@ -1518,6 +2932,17 @@ pub fn fuse(
     }
     if let Some(debug_dir) = &options.debug_dir {
         fs::create_dir_all(debug_dir).with_context(|| format!("create {}", debug_dir.display()))?;
+        let final_depth_warps = alignment_debug_warps(&alignments);
+        write_debug_warp_stage(
+            debug_dir,
+            "05-final-depth",
+            &modules,
+            &luminance,
+            reference_index,
+            &final_depth_warps,
+            active_pre_depth_debug_warps.as_deref(),
+            true,
+        )?;
         if let Some(depth_map) = &depth_map {
             depth_map.write_diagnostics(
                 &debug_dir.join("depth-inverse.png"),
@@ -1932,6 +3357,17 @@ pub fn fuse(
         &color,
         &options.synth,
     )?;
+    if let Some(debug_dir) = &options.debug_dir {
+        write_pipeline_trace(
+            debug_dir,
+            &reference_name,
+            &rig_outcome.report,
+            depth_geometry_mode,
+            dense_depth_audit.as_ref(),
+            &alignments,
+            &synthesis,
+        )?;
+    }
     timings.synthesize = stage_started.elapsed().as_secs_f32();
 
     let output_megapixels = (synthesis.canvas_width * synthesis.canvas_height) as f32 / 1_000_000.0;
@@ -1948,6 +3384,7 @@ pub fn fuse(
         framed_focal_length_mm,
         modules: alignments.iter().map(|a| a.report.clone()).collect(),
         rig_refinement: rig_outcome.report,
+        dense_depth_audit,
         highlights: modules
             .iter()
             .map(|module| (module.raw.name.clone(), module.highlight.report.clone()))
@@ -1996,6 +3433,68 @@ mod tests {
         hotpixel::write_hotpixel_rec,
     };
     use std::{collections::HashSet, fs};
+
+    #[test]
+    fn diagnostic_domain_excludes_finite_points_outside_the_target_sensor() {
+        assert!(diagnostic_point_inside_raster([0.0, 0.0], 10, 8));
+        assert!(diagnostic_point_inside_raster([9.0, 7.0], 10, 8));
+        assert!(!diagnostic_point_inside_raster([-0.01, 4.0], 10, 8));
+        assert!(!diagnostic_point_inside_raster([10.0, 4.0], 10, 8));
+        assert!(!diagnostic_point_inside_raster([4.0, 8.0], 10, 8));
+        assert!(!diagnostic_point_inside_raster([f32::NAN, 4.0], 10, 8));
+        assert!(!diagnostic_point_inside_raster([4.0, 4.0], 0, 8));
+    }
+
+    #[test]
+    fn dense_depth_audit_keeps_finite_fill_separate_from_defined_warp_support() {
+        let alignment = |name: &str, reference: bool| ModuleAlignment {
+            name: name.to_owned(),
+            warp: Warp::from_fn(8, 8, 4, Some),
+            correspondences: Vec::new(),
+            gain: 1.0,
+            offset: 0.0,
+            report: AlignmentReport {
+                accepted: true,
+                geometry_accepted: Some(true),
+                depth: (!reference).then_some(DepthAlignmentReport {
+                    physical_geometry: true,
+                    tested_nodes: 100,
+                    measured_nodes: 10,
+                    regularized_nodes: 0,
+                    fallback_nodes: 80,
+                    refined_nodes: 8,
+                    defined_nodes: 90,
+                    defined_fraction: 0.90,
+                    reconstructed_fraction: 0.10,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        let alignments = [alignment("B4", true), alignment("B5", false)];
+        let depth_map = DenseDepthMap {
+            columns: 1,
+            rows: 1,
+            step: 4,
+            near_depth: 500.0,
+            far_depth: 10_000_000.0,
+            nodes: vec![crate::depth::DenseDepthNode {
+                depth: Some(2_000.0),
+                confidence: 0.9,
+                provenance: crate::depth::DepthProvenance::Measured,
+            }],
+        };
+        let report = dense_depth_audit_branch_report(Some(&depth_map), &alignments, 0);
+        assert!(report.depth_available);
+        assert_eq!(report.measured_nodes, 10);
+        assert_eq!(report.regularized_nodes, 0);
+        assert_eq!(report.reconstructed_fraction, 0.10);
+        assert_eq!(report.accepted_views, 1);
+        assert_eq!(
+            report.cameras[1].depth.as_ref().unwrap().defined_fraction,
+            0.90
+        );
+    }
 
     fn colour_profile(
         illuminant: i32,
