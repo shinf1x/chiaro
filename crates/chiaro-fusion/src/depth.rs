@@ -1748,6 +1748,7 @@ fn score_prepared_depth(
         reference_rays,
         far_scores,
         depth_information,
+        None,
         view_scores,
     );
     aggregate_with_scratch(view_scores, options, geometry_mode, aggregate_scratch)
@@ -1829,6 +1830,7 @@ fn physical_visibility_memberships(
                                 reference_rays.as_ref(),
                                 &far_scores,
                                 &depth_information,
+                                None,
                                 &mut view_scores,
                             );
                             let local_index = (row - first_row) * columns + column;
@@ -2422,6 +2424,13 @@ fn build_cost_volume(
                         PreparedReferencePatch::with_radius(options.patch_radius);
                     let mut far_scores = vec![None; inputs.len()];
                     let mut depth_information = vec![0.0f32; inputs.len()];
+                    let finite_label_count = label_count.saturating_sub(1);
+                    let mut measured_centres = vec![None::<[f32; 2]>; inputs.len()];
+                    let mut epipolar_centres = (0..inputs.len())
+                        .map(|_| vec![None::<Vec2>; finite_label_count])
+                        .collect::<Vec<_>>();
+                    let mut physical_projections =
+                        vec![None::<LocalPatchProjection>; inputs.len()];
                     for row in first_row..last_row {
                         for column in 0..columns {
                             let p = [(column * step) as f64, (row * step) as f64];
@@ -2449,37 +2458,62 @@ fn build_cost_volume(
                                 depth_information.fill(0.0);
                                 if prepared_reference {
                                     if let Some(reference_camera) = inputs[reference_index].camera {
-                                        for &index in active_view_indices {
-                                            let target = &inputs[index];
-                                            let Some(target_camera) = target.camera else {
-                                                continue;
-                                            };
-                                            depth_information[index] = physical_depth_information(
-                                                reference_camera,
-                                                target_camera,
-                                                p,
-                                            );
-                                            let Some(reference_rays) = reference_rays.as_ref()
-                                            else {
-                                                continue;
-                                            };
-                                            let Some(projection) = local_patch_projection_from_rays(
-                                                reference_camera,
-                                                target_camera,
-                                                &alignments[index].warp,
-                                                p,
-                                                None,
-                                                options,
-                                                reference_rays,
-                                            ) else {
-                                                continue;
-                                            };
-                                            far_scores[index] = projected_patch_zncc_prepared(
-                                                target,
-                                                &projection,
-                                                [0.0, 0.0],
-                                                &reference_patch,
-                                            );
+                                        if let Some(reference_rays) = reference_rays.as_ref() {
+                                            let centre_ray = reference_rays.centre;
+                                            for &index in active_view_indices {
+                                                let target = &inputs[index];
+                                                let Some(target_camera) = target.camera else {
+                                                    continue;
+                                                };
+                                                depth_information[index] = physical_depth_information(
+                                                    reference_camera,
+                                                    target_camera,
+                                                    p,
+                                                );
+                                                measured_centres[index] = alignments[index]
+                                                    .warp
+                                                    .map(p[0] as f32, p[1] as f32);
+                                                for (finite_index, depth) in
+                                                    labels.iter().skip(1).enumerate()
+                                                {
+                                                    let depth = (*depth).expect(
+                                                        "finite depth labels follow the far label",
+                                                    );
+                                                    epipolar_centres[index][finite_index] =
+                                                        target_camera.project(add(
+                                                            centre_ray.origin,
+                                                            scale(centre_ray.direction, depth),
+                                                        ));
+                                                }
+                                                // Keep the far baseline bit-for-bit on the old
+                                                // tangent construction; it is reused by every
+                                                // finite-depth comparison.
+                                                let tangent = physical_epipolar_tangent(
+                                                    reference_camera,
+                                                    target_camera,
+                                                    p,
+                                                    None,
+                                                    options,
+                                                );
+                                                let Some(projection) =
+                                                    local_patch_projection_from_rays_cached_proposal(
+                                                        target_camera,
+                                                        p,
+                                                        None,
+                                                        reference_rays,
+                                                        measured_centres[index],
+                                                        tangent,
+                                                    )
+                                                else {
+                                                    continue;
+                                                };
+                                                far_scores[index] = projected_patch_zncc_prepared(
+                                                    target,
+                                                    &projection,
+                                                    [0.0, 0.0],
+                                                    &reference_patch,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -2487,6 +2521,54 @@ fn build_cost_volume(
 
                             let mut node_tested = false;
                             for (label, &depth) in labels.iter().enumerate() {
+                                let physical_projection_slice = if geometry_mode.is_physical()
+                                    && label > 0
+                                {
+                                    for &index in active_view_indices {
+                                        physical_projections[index] = None;
+                                    }
+                                    if prepared_reference {
+                                        if let (Some(reference_camera), Some(reference_rays)) = (
+                                            inputs[reference_index].camera,
+                                            reference_rays.as_ref(),
+                                        ) {
+                                            let finite_index = label - 1;
+                                            for &index in active_view_indices {
+                                                let Some(target_camera) = inputs[index].camera else {
+                                                    continue;
+                                                };
+                                                let tangent = if finite_index == 0
+                                                    || finite_index + 1 == finite_label_count
+                                                {
+                                                    physical_epipolar_tangent(
+                                                        reference_camera,
+                                                        target_camera,
+                                                        p,
+                                                        depth,
+                                                        options,
+                                                    )
+                                                } else {
+                                                    epipolar_tangent_from_centres(
+                                                        &epipolar_centres[index],
+                                                        finite_index,
+                                                    )
+                                                };
+                                                physical_projections[index] =
+                                                    local_patch_projection_from_rays_cached_proposal(
+                                                        target_camera,
+                                                        p,
+                                                        depth,
+                                                        reference_rays,
+                                                        measured_centres[index],
+                                                        tangent,
+                                                    );
+                                            }
+                                        }
+                                    }
+                                    Some(physical_projections.as_slice())
+                                } else {
+                                    None
+                                };
                                 score_views_prepared_into(
                                     inputs,
                                     reference_index,
@@ -2500,6 +2582,7 @@ fn build_cost_volume(
                                     reference_rays.as_ref(),
                                     &far_scores,
                                     &depth_information,
+                                    physical_projection_slice,
                                     &mut view_scores,
                                 );
                                 let evidence = aggregate_with_scratch(
@@ -2883,6 +2966,7 @@ fn score_views_prepared_into(
     reference_rays: Option<&LocalPatchReferenceRays>,
     far_scores: &[Option<f32>],
     depth_information: &[f32],
+    physical_projections: Option<&[Option<LocalPatchProjection>]>,
     output: &mut Vec<ViewScore>,
 ) {
     output.clear();
@@ -2903,17 +2987,34 @@ fn score_views_prepared_into(
                 };
                 let score = match depth {
                     None => far_scores[index],
-                    Some(depth) => projected_patch_zncc_from_prepared_rays(
-                        &inputs[reference_index],
-                        &inputs[index],
-                        &alignments[index].warp,
-                        centre,
-                        Some(depth),
-                        [0.0, 0.0],
-                        options,
-                        reference_patch,
-                        reference_rays,
-                    ),
+                    Some(depth) => {
+                        if let Some(projections) = physical_projections {
+                            projections
+                                .get(index)
+                                .copied()
+                                .flatten()
+                                .and_then(|projection| {
+                                    projected_patch_zncc_prepared(
+                                        &inputs[index],
+                                        &projection,
+                                        [0.0, 0.0],
+                                        reference_patch,
+                                    )
+                                })
+                        } else {
+                            projected_patch_zncc_from_prepared_rays(
+                                &inputs[reference_index],
+                                &inputs[index],
+                                &alignments[index].warp,
+                                centre,
+                                Some(depth),
+                                [0.0, 0.0],
+                                options,
+                                reference_patch,
+                                reference_rays,
+                            )
+                        }
+                    }
                 };
                 let Some(score) = score else {
                     continue;
@@ -3316,16 +3417,28 @@ fn physical_epipolar_tangent(
     (length > 1.0e-6).then_some([delta[0] / length, delta[1] / length])
 }
 
-fn measured_perpendicular_proposal(
-    measured_warp: &Warp,
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
-    centre: Vec2,
+fn epipolar_tangent_from_centres(centres: &[Option<Vec2>], finite_index: usize) -> Option<Vec2> {
+    if centres.len() < 2 || finite_index >= centres.len() {
+        return None;
+    }
+    let first_index = finite_index.saturating_sub(1);
+    let second_index = (finite_index + 1).min(centres.len() - 1);
+    if first_index == second_index {
+        return None;
+    }
+    let first = centres[first_index]?;
+    let second = centres[second_index]?;
+    let delta = [second[0] - first[0], second[1] - first[1]];
+    let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+    (length > 1.0e-6).then_some([delta[0] / length, delta[1] / length])
+}
+
+fn measured_perpendicular_proposal_from_sample(
+    measured: Option<[f32; 2]>,
     physical: Vec2,
-    depth: Option<f64>,
-    options: &DepthOptions,
+    tangent: Option<Vec2>,
 ) -> Vec2 {
-    let Some(measured) = measured_warp.map(centre[0] as f32, centre[1] as f32) else {
+    let Some(measured) = measured else {
         return [0.0, 0.0];
     };
     let delta = [
@@ -3335,9 +3448,22 @@ fn measured_perpendicular_proposal(
     if !delta[0].is_finite() || !delta[1].is_finite() {
         return [0.0, 0.0];
     }
+    perpendicular_proposal(delta, tangent)
+}
+
+fn measured_perpendicular_proposal(
+    measured_warp: &Warp,
+    reference_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    centre: Vec2,
+    physical: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+) -> Vec2 {
+    let measured = measured_warp.map(centre[0] as f32, centre[1] as f32);
     let tangent =
         physical_epipolar_tangent(reference_camera, target_camera, centre, depth, options);
-    perpendicular_proposal(delta, tangent)
+    measured_perpendicular_proposal_from_sample(measured, physical, tangent)
 }
 
 fn perpendicular_proposal(delta: Vec2, tangent: Option<Vec2>) -> Vec2 {
@@ -3370,14 +3496,12 @@ fn local_patch_reference_rays(
     }
 }
 
-fn local_patch_projection_from_rays(
-    reference_camera: &ResolvedCamera,
+fn local_patch_projection_from_rays_core(
     target_camera: &ResolvedCamera,
-    measured_proposal: &Warp,
     centre: Vec2,
     depth: Option<f64>,
-    options: &DepthOptions,
     rays: &LocalPatchReferenceRays,
+    proposal_for_centre: impl FnOnce(Vec2) -> Vec2,
 ) -> Option<LocalPatchProjection> {
     const DERIVATIVE_STEP: f64 = 2.0;
 
@@ -3401,15 +3525,7 @@ fn local_patch_projection_from_rays(
     };
 
     let physical_centre = project_ray(rays.centre)?;
-    let proposal = measured_perpendicular_proposal(
-        measured_proposal,
-        reference_camera,
-        target_camera,
-        centre,
-        physical_centre,
-        depth,
-        options,
-    );
+    let proposal = proposal_for_centre(physical_centre);
     let target_centre = [
         physical_centre[0] + proposal[0],
         physical_centre[1] + proposal[1],
@@ -3430,6 +3546,41 @@ fn local_patch_projection_from_rays(
             (below[0] - above[0]) * derivative_scale,
             (below[1] - above[1]) * derivative_scale,
         ],
+    })
+}
+
+fn local_patch_projection_from_rays(
+    reference_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    measured_proposal: &Warp,
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+    rays: &LocalPatchReferenceRays,
+) -> Option<LocalPatchProjection> {
+    local_patch_projection_from_rays_core(target_camera, centre, depth, rays, |physical_centre| {
+        measured_perpendicular_proposal(
+            measured_proposal,
+            reference_camera,
+            target_camera,
+            centre,
+            physical_centre,
+            depth,
+            options,
+        )
+    })
+}
+
+fn local_patch_projection_from_rays_cached_proposal(
+    target_camera: &ResolvedCamera,
+    centre: Vec2,
+    depth: Option<f64>,
+    rays: &LocalPatchReferenceRays,
+    measured: Option<[f32; 2]>,
+    tangent: Option<Vec2>,
+) -> Option<LocalPatchProjection> {
+    local_patch_projection_from_rays_core(target_camera, centre, depth, rays, |physical_centre| {
+        measured_perpendicular_proposal_from_sample(measured, physical_centre, tangent)
     })
 }
 

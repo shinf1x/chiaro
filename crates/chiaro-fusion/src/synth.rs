@@ -413,6 +413,32 @@ pub struct SynthSource<'a> {
     pub gain_field: GainField,
 }
 
+/// The reference module is constructed with an exact identity alignment grid.
+/// Avoid evaluating that bilinear grid for every reference sample while still
+/// preserving the old out-of-grid behaviour at image/structure boundaries.
+#[inline]
+fn source_base_warp_sample(source: &SynthSource<'_>, x: f32, y: f32) -> WarpSample {
+    let warp = &source.alignment.warp;
+    if source.reference
+        && source.alignment.report.initialised_from == "reference"
+        && warp.step > 0
+        && warp.columns > 0
+        && warp.rows > 0
+        && x >= 0.0
+        && y >= 0.0
+        && x <= (warp.columns.saturating_sub(1) * warp.step) as f32
+        && y <= (warp.rows.saturating_sub(1) * warp.step) as f32
+    {
+        WarpSample {
+            mapped: Some([x, y]),
+            confidence: 1.0,
+            visibility: WarpVisibility::Unknown,
+        }
+    } else {
+        warp.sample(x, y)
+    }
+}
+
 /// Choose the locally best reconstruction warp without allowing sparse
 /// resolution registration to erase physical visibility. Explicit occlusion or
 /// boundary state on the base depth warp always wins. An unsupported
@@ -494,7 +520,7 @@ fn reconstruction_geometry_at<'a>(
     rx: f32,
     ry: f32,
 ) -> Option<ReconstructionGeometry<'a>> {
-    let base_sample = source.alignment.warp.sample(rx, ry);
+    let base_sample = source_base_warp_sample(source, rx, ry);
     reconstruction_geometry_from_base_sample(source, rx, ry, base_sample)
 }
 
@@ -1130,6 +1156,10 @@ pub fn synthesize(
             let mut per_source_weights = vec![[0.0f32; 2]; local_source_counters.len()];
             let mut touched_source_weights = Vec::with_capacity(usable.len());
             let mut reconstruction_geometries = vec![None; usable.len()];
+            let mut touched_reconstruction_geometries = Vec::with_capacity(usable.len());
+            let mut sensor_luminance_caches = (0..usable.len())
+                .map(|_| None::<SensorLuminanceCache>)
+                .collect::<Vec<_>>();
             // Modules whose footprint can reach this band. Narrow modules
             // cover a small part of the canvas, so most bands skip them.
             let band_sources = usable
@@ -1147,7 +1177,10 @@ pub fn synthesize(
                         per_source_weights[source_index] = [0.0; 2];
                     }
                     touched_source_weights.clear();
-                    reconstruction_geometries.fill(None);
+                    for &source_index in &touched_reconstruction_geometries {
+                        reconstruction_geometries[source_index] = None;
+                    }
+                    touched_reconstruction_geometries.clear();
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
                     let reference_source = reference_band_source;
                     let reference_prepared = reference_source
@@ -1193,7 +1226,7 @@ pub fn synthesize(
                             source.reference.then_some(reference_prepared).flatten();
                         let warp_sample = prepared_source
                             .map(|sample| sample.warp_sample)
-                            .unwrap_or_else(|| source.alignment.warp.sample(rx, ry));
+                            .unwrap_or_else(|| source_base_warp_sample(source, rx, ry));
                         let q = if let Some(sample) = prepared_source {
                             sample.q
                         } else {
@@ -1267,6 +1300,7 @@ pub fn synthesize(
                             .flatten();
                         if let Some(geometry) = reconstruction_geometry {
                             reconstruction_geometries[source_index] = Some(geometry);
+                            touched_reconstruction_geometries.push(source_index);
                         }
                         if mosaic.is_mono() || !source.color.calibrated {
                             let y = prepared_source.map_or_else(
@@ -1309,6 +1343,10 @@ pub fn synthesize(
                                     scale,
                                     reference_structure,
                                     options,
+                                    Some(
+                                        sensor_luminance_caches[source_index]
+                                            .get_or_insert_with(SensorLuminanceCache::new),
+                                    ),
                                 )
                             {
                                 local_source_counters[source_index].resolution_candidate += 1;
@@ -1401,6 +1439,10 @@ pub fn synthesize(
                                     scale,
                                     reference_structure,
                                     options,
+                                    Some(
+                                        sensor_luminance_caches[source_index]
+                                            .get_or_insert_with(SensorLuminanceCache::new),
+                                    ),
                                 )
                             {
                                 local_source_counters[source_index].resolution_candidate += 1;
@@ -2119,7 +2161,14 @@ fn projected_camera_luminance(
     options: &SynthOptions,
 ) -> Option<ProjectedCameraSample> {
     let geometry = reconstruction_geometry_at(source, rx, ry)?;
-    projected_camera_luminance_from_geometry(source, geometry, scale, reference_structure, options)
+    projected_camera_luminance_from_geometry(
+        source,
+        geometry,
+        scale,
+        reference_structure,
+        options,
+        None,
+    )
 }
 
 fn projected_camera_luminance_from_geometry(
@@ -2128,6 +2177,7 @@ fn projected_camera_luminance_from_geometry(
     scale: f32,
     reference_structure: Option<[f32; 3]>,
     options: &SynthOptions,
+    mut luminance_cache: Option<&mut SensorLuminanceCache>,
 ) -> Option<ProjectedCameraSample> {
     let local_confidence = geometry.local_confidence;
     if local_confidence <= 0.0 {
@@ -2176,7 +2226,13 @@ fn projected_camera_luminance_from_geometry(
             if coarse_kernel <= 0.0 && broad_kernel.unwrap_or(0.0) <= 0.0 {
                 continue;
             }
-            let luminance = source_luminance_at_sensor(source, sx as usize, sy as usize, options)?;
+            let sx = sx as usize;
+            let sy = sy as usize;
+            let luminance = if let Some(cache) = luminance_cache.as_deref_mut() {
+                cache.get_or_compute(source, sx, sy, options)
+            } else {
+                source_luminance_at_sensor(source, sx, sy, options)
+            }?;
             if coarse_kernel > 0.0 {
                 coarse_luminance += coarse_kernel * luminance;
                 coarse_weight += coarse_kernel;
@@ -2844,7 +2900,7 @@ fn production_baseline_xyz_at(
         if source.held_out || (!options.include_mono && source.mosaic.is_mono()) {
             continue;
         }
-        let warp_sample = source.alignment.warp.sample(rx, ry);
+        let warp_sample = source_base_warp_sample(source, rx, ry);
         if !source.reference && warp_sample.visibility.blocks_sampling() {
             continue;
         }
@@ -3060,7 +3116,7 @@ fn prepare_source_sample(
     ry: f32,
     options: &SynthOptions,
 ) -> Option<PreparedSourceSample> {
-    let warp_sample = source.alignment.warp.sample(rx, ry);
+    let warp_sample = source_base_warp_sample(source, rx, ry);
     if !source.reference && warp_sample.visibility.blocks_sampling() {
         return None;
     }
@@ -3093,6 +3149,62 @@ fn prepare_source_sample(
         field,
         photometric,
     })
+}
+
+const SENSOR_LUMINANCE_CACHE_SLOTS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct SensorLuminanceCacheEntry {
+    key: usize,
+    value: f32,
+    state: u8,
+}
+
+struct SensorLuminanceCache {
+    entries: Vec<SensorLuminanceCacheEntry>,
+}
+
+impl SensorLuminanceCache {
+    fn new() -> Self {
+        Self {
+            entries: vec![
+                SensorLuminanceCacheEntry {
+                    key: 0,
+                    value: 0.0,
+                    state: 0,
+                };
+                SENSOR_LUMINANCE_CACHE_SLOTS
+            ],
+        }
+    }
+
+    #[inline]
+    fn get_or_compute(
+        &mut self,
+        source: &SynthSource<'_>,
+        x: usize,
+        y: usize,
+        options: &SynthOptions,
+    ) -> Option<f32> {
+        let key = y.wrapping_mul(source.mosaic.width).wrapping_add(x);
+        debug_assert!(self.entries.len().is_power_of_two());
+        let slot = key.wrapping_mul(0x9E37_79B1usize) & (self.entries.len() - 1);
+        let entry = &mut self.entries[slot];
+        if entry.state != 0 && entry.key == key {
+            return (entry.state == 1).then_some(entry.value);
+        }
+
+        let value = source_luminance_at_sensor(source, x, y, options);
+        entry.key = key;
+        if let Some(value) = value {
+            entry.value = value;
+            entry.state = 1;
+        } else {
+            entry.value = 0.0;
+            entry.state = 2;
+        }
+        value
+    }
 }
 
 fn source_luminance_at_sensor(
@@ -3140,7 +3252,7 @@ fn source_luminance(
     ry: f32,
     options: &SynthOptions,
 ) -> Option<f32> {
-    let warp_sample = source.alignment.warp.sample(rx, ry);
+    let warp_sample = source_base_warp_sample(source, rx, ry);
     if !source.reference && warp_sample.visibility.blocks_sampling() {
         return None;
     }

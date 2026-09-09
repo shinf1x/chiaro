@@ -154,14 +154,31 @@ impl InverseWarpJacobian {
 /// single capture-wide homography.
 pub(crate) fn inverse_warp_jacobian(warp: &Warp, x: f32, y: f32) -> Option<InverseWarpJacobian> {
     const STEP: f32 = 0.5;
-    let left = warp.map(x - STEP, y)?;
-    let right = warp.map(x + STEP, y)?;
-    let above = warp.map(x, y - STEP)?;
-    let below = warp.map(x, y + STEP)?;
-    let jxx = (right[0] - left[0]) / (2.0 * STEP);
-    let jyx = (right[1] - left[1]) / (2.0 * STEP);
-    let jxy = (below[0] - above[0]) / (2.0 * STEP);
-    let jyy = (below[1] - above[1]) / (2.0 * STEP);
+    let (dx, dy) = if let Some(jacobian) = warp.local_jacobian_same_cell(x, y, STEP) {
+        jacobian
+    } else {
+        // Preserve the previous finite-difference behaviour at grid-cell
+        // boundaries, where one stencil can legitimately span two bilinear
+        // pieces and therefore has no single analytic derivative.
+        let left = warp.map(x - STEP, y)?;
+        let right = warp.map(x + STEP, y)?;
+        let above = warp.map(x, y - STEP)?;
+        let below = warp.map(x, y + STEP)?;
+        (
+            [
+                (right[0] - left[0]) / (2.0 * STEP),
+                (right[1] - left[1]) / (2.0 * STEP),
+            ],
+            [
+                (below[0] - above[0]) / (2.0 * STEP),
+                (below[1] - above[1]) / (2.0 * STEP),
+            ],
+        )
+    };
+    let jxx = dx[0];
+    let jyx = dx[1];
+    let jxy = dy[0];
+    let jyy = dy[1];
     let determinant = jxx * jyy - jxy * jyx;
     if !determinant.is_finite() || determinant.abs() < 1.0e-6 {
         return None;

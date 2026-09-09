@@ -253,6 +253,59 @@ impl Warp {
         (!out[0].is_nan() && !out[1].is_nan()).then_some(out)
     }
 
+    /// Analytic local Jacobian of the bilinear warp, but only when the full
+    /// requested stencil remains inside the same grid cell. Callers that need
+    /// exact behaviour across cell boundaries can fall back to finite
+    /// differences there. Returning the two derivative columns avoids four
+    /// repeated grid-cell lookups in the common interior case.
+    #[inline]
+    pub(crate) fn local_jacobian_same_cell(
+        &self,
+        x: f32,
+        y: f32,
+        stencil_radius: f32,
+    ) -> Option<([f32; 2], [f32; 2])> {
+        let cell = self.cell(x, y)?;
+        let same_cell = |sample: WarpCell| {
+            sample.c0 == cell.c0
+                && sample.c1 == cell.c1
+                && sample.r0 == cell.r0
+                && sample.r1 == cell.r1
+        };
+        for (sx, sy) in [
+            (x - stencil_radius, y),
+            (x + stencil_radius, y),
+            (x, y - stencil_radius),
+            (x, y + stencil_radius),
+        ] {
+            let Some(sample) = self.cell(sx, sy) else {
+                return None;
+            };
+            if !same_cell(sample) {
+                return None;
+            }
+        }
+
+        let p = |c: usize, r: usize| self.points[r * self.columns + c];
+        let (a, b, c, d) = (
+            p(cell.c0, cell.r0),
+            p(cell.c1, cell.r0),
+            p(cell.c0, cell.r1),
+            p(cell.c1, cell.r1),
+        );
+        let inverse_step = (self.step as f32).recip();
+        let mut dx = [0.0f32; 2];
+        let mut dy = [0.0f32; 2];
+        for k in 0..2 {
+            dx[k] = ((b[k] - a[k]) * (1.0 - cell.ty) + (d[k] - c[k]) * cell.ty) * inverse_step;
+            dy[k] = ((c[k] - a[k]) * (1.0 - cell.tx) + (d[k] - b[k]) * cell.tx) * inverse_step;
+        }
+        dx.into_iter()
+            .chain(dy)
+            .all(f32::is_finite)
+            .then_some((dx, dy))
+    }
+
     /// Bilinearly interpolated local confidence for synthesis.
     #[inline]
     pub fn confidence(&self, x: f32, y: f32) -> f32 {
