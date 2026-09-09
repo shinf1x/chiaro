@@ -28,7 +28,8 @@ use chiaro_hotpixel_core::{
 use serde::Serialize;
 
 use crate::align::{
-    AlignInput, AlignOptions, AlignmentReport, ModuleAlignment, Warp, WarpVisibility, align_module,
+    AlignInput, AlignOptions, AlignPyramidCache, AlignmentReport, ModuleAlignment, Warp,
+    WarpVisibility, align_module_seeded_cached,
 };
 use crate::array_color::{
     ArrayColorSelectionReport, ArrayColorSource, ColorProfileMode, ProfileBlend,
@@ -671,11 +672,13 @@ fn disable_held_out_depth_evidence(inputs: &mut [AlignInput<'_>], held_out: &[St
 
 fn align_all_modules(
     inputs: &[AlignInput<'_>],
+    pyramids: &[AlignPyramidCache],
     reference_index: usize,
     options: &AlignOptions,
     threads: usize,
 ) -> Result<Vec<ModuleAlignment>> {
     let reference = &inputs[reference_index];
+    debug_assert_eq!(inputs.len(), pyramids.len());
     let automatic_workers = std::thread::available_parallelism().map_or(1, usize::from);
     let requested_workers = if threads == 0 {
         automatic_workers
@@ -691,7 +694,19 @@ fn align_all_modules(
                 let last_index = (first_index + inputs_per_worker).min(inputs.len());
                 scope.spawn(move || {
                     (first_index..last_index)
-                        .map(|index| (index, align_module(reference, &inputs[index], options)))
+                        .map(|index| {
+                            (
+                                index,
+                                align_module_seeded_cached(
+                                    reference,
+                                    &inputs[index],
+                                    options,
+                                    None,
+                                    &pyramids[reference_index],
+                                    &pyramids[index],
+                                ),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
             })
@@ -2495,6 +2510,10 @@ pub fn fuse(
         .iter()
         .map(|module| module.mosaic.luminance_half())
         .collect::<Vec<Plane>>();
+    let alignment_pyramids = luminance
+        .iter()
+        .map(AlignPyramidCache::new)
+        .collect::<Vec<_>>();
     let reference_index = modules
         .iter()
         .position(|module| module.raw.name == reference_name)
@@ -2510,8 +2529,13 @@ pub fn fuse(
         );
     }
     let inputs = alignment_inputs(&modules, &luminance);
-    let factory_alignments =
-        align_all_modules(&inputs, reference_index, &options.align, options.threads)?;
+    let factory_alignments = align_all_modules(
+        &inputs,
+        &alignment_pyramids,
+        reference_index,
+        &options.align,
+        options.threads,
+    )?;
     drop(inputs);
     let factory_measured_debug_warps = options
         .debug_dir
@@ -2644,6 +2668,7 @@ pub fn fuse(
         let refined_inputs = alignment_inputs(&modules, &luminance);
         let refined_alignments = align_all_modules(
             &refined_inputs,
+            &alignment_pyramids,
             reference_index,
             &options.align,
             options.threads,

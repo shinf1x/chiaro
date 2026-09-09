@@ -23,22 +23,23 @@ use chiaro::lri::NoiseModel;
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryState};
 use chiaro_hotpixel_core::png16::{
-    PngColor, samples_to_be_bytes, write_png16_streaming_atomic_with_level,
-    write_rgb16_native_atomic,
+    PngColor, write_png16_streaming_atomic_with_level, write_rgb16_native_atomic,
 };
 use std::path::Path;
 
 use crate::align::{ModuleAlignment, Warp, WarpVisibility};
 use crate::cfa::{
-    CfaObservation, HighlightProvenance, JointCfaEstimate, NoiseDependency, Visibility,
-    account_shared_sample_dependence, camera_response, corrected_noise_variance, noise_variance,
-    solve_joint_xyz,
+    CameraResponseBase, CfaObservation, CfaSolverScratch, HighlightProvenance, JointCfaEstimate,
+    NoiseDependency, Visibility, account_shared_sample_dependence_with_scratch,
+    camera_response_base, camera_response_from_base, corrected_noise_variance, noise_variance,
+    solve_joint_xyz_with_scratch,
 };
 use crate::depth::DenseDepthMap;
 use crate::image::Mosaic;
 use crate::resolution::{
-    ResolutionAlignmentReport, ResolutionReconstruction, ResolutionReconstructionReport,
-    ResolutionWarp, edge_aligned_hann_weight, inverse_warp_jacobian, reconstruction_confidence,
+    EdgeAlignedHannGeometry, InverseWarpJacobian, ResolutionAlignmentReport,
+    ResolutionReconstruction, ResolutionReconstructionReport, ResolutionWarp,
+    edge_aligned_hann_weight, inverse_warp_jacobian, reconstruction_confidence,
 };
 
 /// Output colour handling.
@@ -396,19 +397,21 @@ fn select_reconstruction_warp<'a>(
     rx: f32,
     ry: f32,
 ) -> Option<&'a Warp> {
-    if !reference && base.visibility(rx, ry).blocks_sampling() {
+    let base_sample = base.sample(rx, ry);
+    if !reference && base_sample.visibility.blocks_sampling() {
         return None;
     }
     if let Some(refined) = refined {
         let warp = &refined.warp;
-        if !reference && warp.visibility(rx, ry).blocks_sampling() {
+        let sample = warp.sample(rx, ry);
+        if !reference && sample.visibility.blocks_sampling() {
             return None;
         }
-        if warp.confidence(rx, ry) > 0.0 && warp.map(rx, ry).is_some() {
+        if sample.confidence > 0.0 && sample.mapped.is_some() {
             return Some(warp);
         }
     }
-    base.map(rx, ry).map(|_| base)
+    base_sample.mapped.map(|_| base)
 }
 
 fn reconstruction_warp_at<'s>(source: &'s SynthSource<'_>, rx: f32, ry: f32) -> Option<&'s Warp> {
@@ -419,6 +422,33 @@ fn reconstruction_warp_at<'s>(source: &'s SynthSource<'_>, rx: f32, ry: f32) -> 
         rx,
         ry,
     )
+}
+
+#[derive(Clone, Copy)]
+struct ReconstructionGeometry<'a> {
+    warp: &'a Warp,
+    q: [f32; 2],
+    inverse: InverseWarpJacobian,
+    local_confidence: f32,
+    visibility: WarpVisibility,
+}
+
+fn reconstruction_geometry_at<'a>(
+    source: &'a SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+) -> Option<ReconstructionGeometry<'a>> {
+    let warp = reconstruction_warp_at(source, rx, ry)?;
+    let sample = warp.sample(rx, ry);
+    let q = sample.mapped?;
+    let inverse = inverse_warp_jacobian(warp, rx, ry)?;
+    Some(ReconstructionGeometry {
+        warp,
+        q,
+        inverse,
+        local_confidence: sample.confidence,
+        visibility: sample.visibility,
+    })
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -477,6 +507,49 @@ struct SourceCounters {
     resolution_contributor: std::sync::atomic::AtomicUsize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalSourceCounters {
+    visibility_checked: usize,
+    visibility_suppressed: usize,
+    sampled: usize,
+    luminance_owner: usize,
+    color_owner: usize,
+    luminance_weight_micro: u64,
+    color_weight_micro: u64,
+    focus_suppressed: usize,
+    color_sampled: usize,
+    chroma_suppressed: usize,
+    resolution_candidate: usize,
+    resolution_contributor: usize,
+}
+
+impl SourceCounters {
+    fn merge(&self, local: &LocalSourceCounters) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.visibility_checked
+            .fetch_add(local.visibility_checked, Relaxed);
+        self.visibility_suppressed
+            .fetch_add(local.visibility_suppressed, Relaxed);
+        self.sampled.fetch_add(local.sampled, Relaxed);
+        self.luminance_owner
+            .fetch_add(local.luminance_owner, Relaxed);
+        self.color_owner.fetch_add(local.color_owner, Relaxed);
+        self.luminance_weight_micro
+            .fetch_add(local.luminance_weight_micro, Relaxed);
+        self.color_weight_micro
+            .fetch_add(local.color_weight_micro, Relaxed);
+        self.focus_suppressed
+            .fetch_add(local.focus_suppressed, Relaxed);
+        self.color_sampled.fetch_add(local.color_sampled, Relaxed);
+        self.chroma_suppressed
+            .fetch_add(local.chroma_suppressed, Relaxed);
+        self.resolution_candidate
+            .fetch_add(local.resolution_candidate, Relaxed);
+        self.resolution_contributor
+            .fetch_add(local.resolution_contributor, Relaxed);
+    }
+}
+
 #[derive(Default)]
 struct ResolutionCounters {
     candidates: std::sync::atomic::AtomicUsize,
@@ -485,6 +558,31 @@ struct ResolutionCounters {
     cameras_milli: std::sync::atomic::AtomicUsize,
     phase_spread_micro: std::sync::atomic::AtomicUsize,
     confidence_micro: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalResolutionCounters {
+    candidates: usize,
+    phase_supported: usize,
+    reconstructed: usize,
+    cameras_milli: usize,
+    phase_spread_micro: usize,
+    confidence_micro: usize,
+}
+
+impl ResolutionCounters {
+    fn merge(&self, local: &LocalResolutionCounters) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.candidates.fetch_add(local.candidates, Relaxed);
+        self.phase_supported
+            .fetch_add(local.phase_supported, Relaxed);
+        self.reconstructed.fetch_add(local.reconstructed, Relaxed);
+        self.cameras_milli.fetch_add(local.cameras_milli, Relaxed);
+        self.phase_spread_micro
+            .fetch_add(local.phase_spread_micro, Relaxed);
+        self.confidence_micro
+            .fetch_add(local.confidence_micro, Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -501,6 +599,52 @@ struct JointCfaCounters {
     residual_micro: std::sync::atomic::AtomicUsize,
     in_sample_baseline_micro: std::sync::atomic::AtomicUsize,
     in_sample_affine_micro: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalJointCfaCounters {
+    attempted: usize,
+    solver_attempted: usize,
+    structure_skipped: usize,
+    reconstructed: usize,
+    observations: usize,
+    cameras: usize,
+    phase_spread_micro: usize,
+    application_weight_micro: usize,
+    iterations: usize,
+    residual_micro: usize,
+    in_sample_baseline_micro: usize,
+    in_sample_affine_micro: usize,
+}
+
+impl JointCfaCounters {
+    fn merge(&self, local: &LocalJointCfaCounters) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.attempted.fetch_add(local.attempted, Relaxed);
+        self.solver_attempted
+            .fetch_add(local.solver_attempted, Relaxed);
+        self.structure_skipped
+            .fetch_add(local.structure_skipped, Relaxed);
+        self.reconstructed.fetch_add(local.reconstructed, Relaxed);
+        self.observations.fetch_add(local.observations, Relaxed);
+        self.cameras.fetch_add(local.cameras, Relaxed);
+        self.phase_spread_micro
+            .fetch_add(local.phase_spread_micro, Relaxed);
+        self.application_weight_micro
+            .fetch_add(local.application_weight_micro, Relaxed);
+        self.iterations.fetch_add(local.iterations, Relaxed);
+        self.residual_micro.fetch_add(local.residual_micro, Relaxed);
+        self.in_sample_baseline_micro
+            .fetch_add(local.in_sample_baseline_micro, Relaxed);
+        self.in_sample_affine_micro
+            .fetch_add(local.in_sample_affine_micro, Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
+struct JointCfaScratch {
+    observations: Vec<CfaObservation>,
+    solver: CfaSolverScratch,
 }
 
 #[derive(Clone, Copy)]
@@ -893,6 +1037,18 @@ pub fn synthesize(
     let source_counters = (0..usable.len())
         .map(|_| SourceCounters::default())
         .collect::<Vec<_>>();
+    let camera_response_bases = sources
+        .iter()
+        .map(|source| camera_response_base(&source.color))
+        .collect::<Vec<_>>();
+    let source_to_usable = sources
+        .iter()
+        .map(|source| {
+            usable
+                .iter()
+                .position(|(_, usable_source)| std::ptr::eq(source, *usable_source))
+        })
+        .collect::<Vec<_>>();
 
     write_png16_streaming_atomic_with_level(
         output,
@@ -902,11 +1058,17 @@ pub fn synthesize(
         options.threads,
         options.png_level,
         |rows, bytes| {
-            let mut band = vec![0u16; rows.len() * width * 3];
+            bytes.fill(0);
             let mut band_covered = 0usize;
+            let mut local_source_counters =
+                vec![LocalSourceCounters::default(); source_counters.len()];
+            let mut local_resolution_counters = LocalResolutionCounters::default();
+            let mut local_joint_cfa_counters = LocalJointCfaCounters::default();
+            let mut joint_cfa_scratch = JointCfaScratch::default();
             let mut band_edge_checked = 0usize;
             let mut band_edge_rejected = 0usize;
-            let mut per_source_weights = vec![[0.0f32; 2]; source_counters.len()];
+            let mut per_source_weights = vec![[0.0f32; 2]; local_source_counters.len()];
+            let mut reconstruction_geometries = vec![None; usable.len()];
             // Modules whose footprint can reach this band. Narrow modules
             // cover a small part of the canvas, so most bands skip them.
             let band_sources = usable
@@ -917,21 +1079,26 @@ pub fn synthesize(
                 let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
                 for u in 0..width {
                     per_source_weights.fill([0.0; 2]);
+                    reconstruction_geometries.fill(None);
                     let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
-                    let reference_luminance = band_sources
+                    let reference_source = band_sources
                         .iter()
                         .find(|(_, source)| source.reference)
-                        .and_then(|(_, source)| source_luminance(source, rx, ry, options));
-                    let reference_structure = band_sources
-                        .iter()
-                        .find(|(_, source)| source.reference)
-                        .and_then(|(_, source)| {
-                            source_log_luminance_structure(source, rx, ry, options)
-                        });
-                    let reference_color = band_sources
-                        .iter()
-                        .find(|(_, source)| source.reference)
-                        .and_then(|(_, source)| source_xyz(source, rx, ry, options));
+                        .map(|(_, source)| *source);
+                    let reference_photometric = reference_source
+                        .and_then(|source| source_photometric(source, rx, ry, options));
+                    let reference_luminance = reference_photometric.map(|sample| sample.0);
+                    let reference_color = reference_photometric.and_then(|sample| sample.1);
+                    let reference_structure = reference_source.and_then(|source| {
+                        source_log_luminance_structure_with_centre(
+                            source,
+                            rx,
+                            ry,
+                            reference_luminance?,
+                            options,
+                        )
+                    });
+                    let needs_source_structure = structure_needs_source_sample(reference_structure);
                     let scene_depth = depth_map
                         .and_then(|map| map.sample_nearest(rx, ry))
                         .and_then(|node| node.depth.map(|depth| (depth, node.confidence)));
@@ -956,18 +1123,13 @@ pub fn synthesize(
                             continue;
                         }
                         let source_index = *source_index;
-                        let Some(q) = source.alignment.warp.map(rx, ry) else {
+                        let warp_sample = source.alignment.warp.sample(rx, ry);
+                        let Some(q) = warp_sample.mapped else {
                             continue;
                         };
-                        source_counters[source_index]
-                            .visibility_checked
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if !source.reference
-                            && source.alignment.warp.visibility(rx, ry).blocks_sampling()
-                        {
-                            source_counters[source_index]
-                                .visibility_suppressed
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        local_source_counters[source_index].visibility_checked += 1;
+                        if !source.reference && warp_sample.visibility.blocks_sampling() {
+                            local_source_counters[source_index].visibility_suppressed += 1;
                             continue;
                         }
                         let mosaic = source.mosaic;
@@ -980,16 +1142,14 @@ pub fn synthesize(
                             .min((mosaic.width - 1) as f32 - q[0])
                             .min((mosaic.height - 1) as f32 - q[1]);
                         let feather = smoothstep(border / options.feather_px.max(1.0));
-                        let local_confidence = source.alignment.warp.confidence(rx, ry);
+                        let local_confidence = warp_sample.confidence;
                         if feather <= 0.0 || local_confidence <= 0.0 {
                             continue;
                         }
                         if source.reference {
                             reference_source_index = Some(source_index);
                         }
-                        source_counters[source_index]
-                            .sampled
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        local_source_counters[source_index].sampled += 1;
                         let base_weight = feather
                             * local_confidence
                             * source.magnification
@@ -1002,19 +1162,29 @@ pub fn synthesize(
                             source.reference,
                         );
                         if focus_weight < 0.5 {
-                            source_counters[source_index]
-                                .focus_suppressed
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_source_counters[source_index].focus_suppressed += 1;
                         }
                         let gain = source.alignment.gain;
                         let offset = source.alignment.offset;
                         let field = source
                             .gain_field
                             .at(q[0], q[1], mosaic.width, mosaic.height);
+                        let reconstruction_geometry = options
+                            .resolution_reconstruction
+                            .uses_resolution_warps()
+                            .then(|| reconstruction_geometry_at(source, rx, ry))
+                            .flatten();
+                        if let Some(geometry) = reconstruction_geometry {
+                            reconstruction_geometries[source_index] = Some(geometry);
+                        }
                         if mosaic.is_mono() || !source.color.calibrated {
                             let y = (gain * (rgb[1] - offset)).max(0.0) * field[1];
-                            let sample_structure = (!source.reference)
-                                .then(|| source_log_luminance_structure(source, rx, ry, options))
+                            let sample_structure = (!source.reference && needs_source_structure)
+                                .then(|| {
+                                    source_log_luminance_structure_with_centre(
+                                        source, rx, ry, y, options,
+                                    )
+                                })
                                 .flatten();
                             let mut edge_weight =
                                 edge_consistency_weight(reference_luminance, y, source.reference)
@@ -1038,19 +1208,16 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
-                            if options.resolution_reconstruction.uses_resolution_warps()
-                                && let Some(projected) = projected_camera_luminance(
+                            if let Some(geometry) = reconstruction_geometry
+                                && let Some(projected) = projected_camera_luminance_from_geometry(
                                     source,
-                                    rx,
-                                    ry,
+                                    geometry,
                                     scale,
                                     reference_structure,
                                     options,
                                 )
                             {
-                                source_counters[source_index]
-                                    .resolution_candidate
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                local_source_counters[source_index].resolution_candidate += 1;
                                 resolution.add(
                                     source_index,
                                     projected,
@@ -1096,8 +1263,12 @@ pub fn synthesize(
                             for c in 0..3 {
                                 matched[c] *= field[c];
                             }
-                            let sample_structure = (!source.reference)
-                                .then(|| source_log_luminance_structure(source, rx, ry, options))
+                            let sample_structure = (!source.reference && needs_source_structure)
+                                .then(|| {
+                                    source_log_luminance_structure_with_centre(
+                                        source, rx, ry, matched[1], options,
+                                    )
+                                })
                                 .flatten();
                             let mut edge_weight = edge_consistency_weight(
                                 reference_luminance,
@@ -1123,19 +1294,16 @@ pub fn synthesize(
                                 band_edge_rejected += usize::from(rejected);
                             }
                             edge_weight *= focus_weight;
-                            if options.resolution_reconstruction.uses_resolution_warps()
-                                && let Some(projected) = projected_camera_luminance(
+                            if let Some(geometry) = reconstruction_geometry
+                                && let Some(projected) = projected_camera_luminance_from_geometry(
                                     source,
-                                    rx,
-                                    ry,
+                                    geometry,
                                     scale,
                                     reference_structure,
                                     options,
                                 )
                             {
-                                source_counters[source_index]
-                                    .resolution_candidate
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                local_source_counters[source_index].resolution_candidate += 1;
                                 resolution.add(
                                     source_index,
                                     projected,
@@ -1157,13 +1325,9 @@ pub fn synthesize(
                                 Some(matched),
                                 source.reference,
                             );
-                            source_counters[source_index]
-                                .color_sampled
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_source_counters[source_index].color_sampled += 1;
                             if chroma_weight < 0.5 {
-                                source_counters[source_index]
-                                    .chroma_suppressed
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                local_source_counters[source_index].chroma_suppressed += 1;
                             }
                             let color_source_weight = base_weight * edge_weight * chroma_weight;
                             per_source_weights[source_index] =
@@ -1226,8 +1390,7 @@ pub fn synthesize(
                             color_owner = Some((reference_index, reference_color_weight));
                         }
                     }
-                    let pixel =
-                        &mut band[(row_offset * width + u) * 3..(row_offset * width + u) * 3 + 3];
+                    let pixel_byte_offset = (row_offset * width + u) * 6;
                     if luminance_weight > 0.0 {
                         band_covered += 1;
                         let color_other_scale = if reference_color_weight > 0.0 {
@@ -1240,31 +1403,21 @@ pub fn synthesize(
                             let luminance_share = weights[0]
                                 * if is_reference { 1.0 } else { other_scale }
                                 / luminance_weight;
-                            source_counters[source_index]
-                                .luminance_weight_micro
-                                .fetch_add(
-                                    (luminance_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                            local_source_counters[source_index].luminance_weight_micro +=
+                                (luminance_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
                             if color_weight > 0.0 {
                                 let color_share = weights[1]
                                     * if is_reference { 1.0 } else { color_other_scale }
                                     / color_weight;
-                                source_counters[source_index].color_weight_micro.fetch_add(
-                                    (color_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                local_source_counters[source_index].color_weight_micro +=
+                                    (color_share.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
                             }
                         }
                         if let Some((owner, _)) = luminance_owner {
-                            source_counters[owner]
-                                .luminance_owner
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_source_counters[owner].luminance_owner += 1;
                         }
                         if let Some((owner, _)) = color_owner {
-                            source_counters[owner]
-                                .color_owner
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_source_counters[owner].color_owner += 1;
                         }
                         if !luminance_ownership.is_empty()
                             && u % OWNERSHIP_STEP == OWNERSHIP_STEP / 2
@@ -1285,13 +1438,9 @@ pub fn synthesize(
                         }
                         let mut target_luminance = luminance / luminance_weight;
                         if let Some(reconstructed) = resolution.finish() {
-                            resolution_counters
-                                .candidates
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_resolution_counters.candidates += 1;
                             if reconstructed.sampling_supported {
-                                resolution_counters
-                                    .phase_supported
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                local_resolution_counters.phase_supported += 1;
                             }
                             if reconstructed.confidence > 0.0 {
                                 // Only a fine-minus-coarse coefficient is added;
@@ -1317,30 +1466,20 @@ pub fn synthesize(
                                 {
                                     baseline_only_luminance = true;
                                 }
-                                resolution_counters
-                                    .reconstructed
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                resolution_counters.cameras_milli.fetch_add(
-                                    reconstructed.cameras.saturating_mul(1_000),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                resolution_counters.phase_spread_micro.fetch_add(
-                                    (reconstructed.phase_spread.min(16.0) * 1_000_000.0) as usize,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                resolution_counters.confidence_micro.fetch_add(
-                                    (reconstructed.confidence * 1_000_000.0) as usize,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                for (source_index, counters) in source_counters
-                                    .iter()
+                                local_resolution_counters.reconstructed += 1;
+                                local_resolution_counters.cameras_milli +=
+                                    reconstructed.cameras.saturating_mul(1_000);
+                                local_resolution_counters.phase_spread_micro +=
+                                    (reconstructed.phase_spread.min(16.0) * 1_000_000.0) as usize;
+                                local_resolution_counters.confidence_micro +=
+                                    (reconstructed.confidence * 1_000_000.0) as usize;
+                                for (source_index, counters) in local_source_counters
+                                    .iter_mut()
                                     .enumerate()
                                     .take(usable.len().min(u32::BITS as usize))
                                 {
                                     if reconstructed.contributors & (1u32 << source_index) != 0 {
-                                        counters
-                                            .resolution_contributor
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        counters.resolution_contributor += 1;
                                     }
                                 }
                             }
@@ -1363,12 +1502,18 @@ pub fn synthesize(
                             || options.resolution_reconstruction
                                 == ResolutionReconstruction::JointCfa;
                         if joint_candidate {
-                            joint_cfa_counters
-                                .attempted
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_joint_cfa_counters.attempted += 1;
                         }
                         let structure_gate = joint_candidate.then(|| {
-                            joint_cfa_structure_gate(sources, rx, ry, reference_structure, options)
+                            joint_cfa_structure_gate(
+                                sources,
+                                rx,
+                                ry,
+                                reference_structure,
+                                reference_color,
+                                validation_sample,
+                                options,
+                            )
                         });
                         // Validation and the explicit diagnostic mode retain
                         // flat-field solver statistics. Ordinary rendering can
@@ -1380,18 +1525,17 @@ pub fn synthesize(
                                 || options.joint_cfa_solve_flat
                         });
                         if attempt_solver {
-                            joint_cfa_counters
-                                .solver_attempted
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_joint_cfa_counters.solver_attempted += 1;
                         } else if joint_candidate {
-                            joint_cfa_counters
-                                .structure_skipped
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            local_joint_cfa_counters.structure_skipped += 1;
                         }
                         let joint_estimate = attempt_solver
                             .then(|| {
                                 joint_cfa_at(
                                     sources,
+                                    &camera_response_bases,
+                                    &source_to_usable,
+                                    &reconstruction_geometries,
                                     rx,
                                     ry,
                                     scale,
@@ -1404,49 +1548,33 @@ pub fn synthesize(
                                     structure_gate
                                         .expect("solver attempt has a structure gate")
                                         .application_weight,
+                                    validation_sample,
                                     options,
+                                    &mut joint_cfa_scratch,
                                 )
                             })
                             .flatten();
                         if let Some(estimate) = joint_estimate {
-                            joint_cfa_counters
-                                .reconstructed
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            joint_cfa_counters.observations.fetch_add(
-                                estimate.report.observations,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.cameras.fetch_add(
-                                estimate.report.cameras,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.phase_spread_micro.fetch_add(
-                                (estimate.report.phase_spread.min(16.0) * 1_000_000.0) as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.application_weight_micro.fetch_add(
-                                (estimate.application_weight * 1_000_000.0) as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.iterations.fetch_add(
-                                estimate.report.iterations,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.residual_micro.fetch_add(
+                            local_joint_cfa_counters.reconstructed += 1;
+                            local_joint_cfa_counters.observations += estimate.report.observations;
+                            local_joint_cfa_counters.cameras += estimate.report.cameras;
+                            local_joint_cfa_counters.phase_spread_micro +=
+                                (estimate.report.phase_spread.min(16.0) * 1_000_000.0) as usize;
+                            local_joint_cfa_counters.application_weight_micro +=
+                                (estimate.application_weight * 1_000_000.0) as usize;
+                            local_joint_cfa_counters.iterations += estimate.report.iterations;
+                            local_joint_cfa_counters.residual_micro +=
                                 (estimate.report.weighted_residual.min(64.0) * 1_000_000.0)
-                                    as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.in_sample_baseline_micro.fetch_add(
-                                (estimate.report.in_sample_baseline_loss.min(1_000.0) * 1_000_000.0)
-                                    as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            joint_cfa_counters.in_sample_affine_micro.fetch_add(
+                                    as usize;
+                            local_joint_cfa_counters.in_sample_baseline_micro += (estimate
+                                .report
+                                .in_sample_baseline_loss
+                                .min(1_000.0)
+                                * 1_000_000.0)
+                                as usize;
+                            local_joint_cfa_counters.in_sample_affine_micro +=
                                 (estimate.report.in_sample_affine_loss.min(1_000.0) * 1_000_000.0)
-                                    as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                                    as usize;
                             if options.resolution_reconstruction
                                 == ResolutionReconstruction::JointCfa
                             {
@@ -1456,6 +1584,7 @@ pub fn synthesize(
                         if validation_sample {
                             evaluate_held_out_cfa(
                                 sources,
+                                &camera_response_bases,
                                 rx,
                                 ry,
                                 scale,
@@ -1471,15 +1600,21 @@ pub fn synthesize(
                         }
                         let rgb = color.apply(blended, options.color);
                         for c in 0..3 {
-                            pixel[c] = (rgb[c].clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            let sample = (rgb[c].clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            let offset = pixel_byte_offset + c * 2;
+                            bytes[offset..offset + 2].copy_from_slice(&sample.to_be_bytes());
                         }
                     }
                 }
             }
+            for (global, local) in source_counters.iter().zip(&local_source_counters) {
+                global.merge(local);
+            }
+            resolution_counters.merge(&local_resolution_counters);
+            joint_cfa_counters.merge(&local_joint_cfa_counters);
             covered.fetch_add(band_covered, std::sync::atomic::Ordering::Relaxed);
             edge_checked.fetch_add(band_edge_checked, std::sync::atomic::Ordering::Relaxed);
             edge_rejected.fetch_add(band_edge_rejected, std::sync::atomic::Ordering::Relaxed);
-            samples_to_be_bytes(&band, bytes);
         },
     )?;
 
@@ -1871,13 +2006,23 @@ fn projected_camera_luminance(
     reference_structure: Option<[f32; 3]>,
     options: &SynthOptions,
 ) -> Option<ProjectedCameraSample> {
-    let warp = reconstruction_warp_at(source, rx, ry)?;
-    let local_confidence = warp.confidence(rx, ry);
+    let geometry = reconstruction_geometry_at(source, rx, ry)?;
+    projected_camera_luminance_from_geometry(source, geometry, scale, reference_structure, options)
+}
+
+fn projected_camera_luminance_from_geometry(
+    source: &SynthSource<'_>,
+    geometry: ReconstructionGeometry<'_>,
+    scale: f32,
+    reference_structure: Option<[f32; 3]>,
+    options: &SynthOptions,
+) -> Option<ProjectedCameraSample> {
+    let local_confidence = geometry.local_confidence;
     if local_confidence <= 0.0 {
         return None;
     }
-    let q = warp.map(rx, ry)?;
-    let inverse = inverse_warp_jacobian(warp, rx, ry)?;
+    let q = geometry.q;
+    let inverse = geometry.inverse;
     let transfer_mid_band = source.magnification > 1.35;
     // The steered kernel extends up to 1.5x along a strong edge. Magnified
     // modules also restore a lower-frequency optical band that would otherwise
@@ -1893,6 +2038,7 @@ fn projected_camera_luminance(
     }
     let centre_x = q[0].round() as isize;
     let centre_y = q[1].round() as isize;
+    let kernel_geometry = EdgeAlignedHannGeometry::new(reference_structure);
     let mut fine_luminance = 0.0f32;
     let mut fine_weight = 0.0f32;
     let mut coarse_luminance = 0.0f32;
@@ -1911,20 +2057,10 @@ fn projected_camera_luminance(
             let displacement = inverse.map(sx as f32 - q[0], sy as f32 - q[1]);
             let output_dx = displacement[0] * scale;
             let output_dy = displacement[1] * scale;
-            let broad_kernel = transfer_mid_band.then(|| {
-                edge_aligned_hann_weight(
-                    output_dx,
-                    output_dy,
-                    RECONSTRUCTION_BROAD_RADIUS,
-                    reference_structure,
-                )
-            });
-            let coarse_kernel = edge_aligned_hann_weight(
-                output_dx,
-                output_dy,
-                RECONSTRUCTION_COARSE_RADIUS,
-                reference_structure,
-            );
+            let broad_kernel = transfer_mid_band
+                .then(|| kernel_geometry.weight(output_dx, output_dy, RECONSTRUCTION_BROAD_RADIUS));
+            let coarse_kernel =
+                kernel_geometry.weight(output_dx, output_dy, RECONSTRUCTION_COARSE_RADIUS);
             if coarse_kernel <= 0.0 && broad_kernel.unwrap_or(0.0) <= 0.0 {
                 continue;
             }
@@ -1939,12 +2075,7 @@ fn projected_camera_luminance(
                 broad_luminance += broad_kernel * luminance;
                 broad_weight += broad_kernel;
             }
-            let fine_kernel = edge_aligned_hann_weight(
-                output_dx,
-                output_dy,
-                RECONSTRUCTION_RADIUS,
-                reference_structure,
-            );
+            let fine_kernel = kernel_geometry.weight(output_dx, output_dy, RECONSTRUCTION_RADIUS);
             if fine_kernel > 0.0 {
                 fine_luminance += fine_kernel * luminance;
                 fine_weight += fine_kernel;
@@ -1982,14 +2113,29 @@ fn joint_cfa_structure_gate(
     rx: f32,
     ry: f32,
     reference_structure: Option<[f32; 3]>,
+    reference_color: Option<[f32; 3]>,
+    need_magnitude_diagnostic: bool,
     options: &SynthOptions,
 ) -> JointCfaStructureGate {
     let luminance_structure =
         reference_structure.map_or(0.0, |value| value[0].hypot(value[1]).max(value[2].abs()));
+    // Once the luminance gate is saturated, chroma cannot change the rendered
+    // application weight. Validation still evaluates it for the independent
+    // reference-structure diagnostic.
+    if luminance_structure >= 0.045 && !need_magnitude_diagnostic {
+        return JointCfaStructureGate {
+            magnitude: luminance_structure,
+            application_weight: 1.0,
+        };
+    }
     let chroma_structure = sources
         .iter()
         .find(|source| source.reference)
-        .and_then(|source| source_chroma_structure(source, rx, ry, options))
+        .and_then(|source| {
+            reference_color.and_then(|centre| {
+                source_chroma_structure_with_centre(source, rx, ry, centre, options)
+            })
+        })
         .unwrap_or(0.0);
     JointCfaStructureGate {
         magnitude: luminance_structure.max(chroma_structure),
@@ -2008,6 +2154,9 @@ fn joint_cfa_structure_weight(luminance_structure: f32, chroma_structure: f32) -
 /// The compact support keeps this independently tileable.
 fn joint_cfa_at(
     sources: &[SynthSource<'_>],
+    camera_response_bases: &[Option<CameraResponseBase>],
+    source_to_usable: &[Option<usize>],
+    reconstruction_geometries: &[Option<ReconstructionGeometry<'_>>],
     rx: f32,
     ry: f32,
     scale: f32,
@@ -2018,11 +2167,18 @@ fn joint_cfa_at(
     scene_depth: Option<(f64, f32)>,
     preserve_baseline_luminance: bool,
     structure_weight: f32,
+    include_baseline_diagnostic: bool,
     options: &SynthOptions,
+    scratch: &mut JointCfaScratch,
 ) -> Option<JointCfaEstimate> {
     const SUPPORT_RADIUS: f32 = 1.65;
     const PRIOR_WEIGHT: f32 = 0.025;
-    let mut observations = Vec::with_capacity(sources.len() * 12);
+    scratch.observations.clear();
+    if scratch.observations.capacity() < sources.len() * 12 {
+        scratch
+            .observations
+            .reserve(sources.len() * 12 - scratch.observations.capacity());
+    }
     let reference_source = sources.iter().find(|source| source.reference);
     for (camera_index, source) in sources.iter().enumerate() {
         if source.held_out
@@ -2032,15 +2188,21 @@ fn joint_cfa_at(
         {
             continue;
         }
-        let Some(warp) = reconstruction_warp_at(source, rx, ry) else {
+        let geometry = source_to_usable
+            .get(camera_index)
+            .and_then(|index| *index)
+            .and_then(|index| reconstruction_geometries.get(index).copied().flatten())
+            .or_else(|| reconstruction_geometry_at(source, rx, ry));
+        let Some(geometry) = geometry else {
             continue;
         };
+        let warp = geometry.warp;
         let centre_visibility = if source.reference {
             WarpVisibility::Visible
         } else {
-            warp.visibility(rx, ry)
+            geometry.visibility
         };
-        let mut geometry_confidence = warp.confidence(rx, ry) * source.confidence;
+        let mut geometry_confidence = geometry.local_confidence * source.confidence;
         match centre_visibility {
             WarpVisibility::Visible => {
                 if geometry_confidence < 0.35 {
@@ -2058,12 +2220,8 @@ fn joint_cfa_at(
             }
             WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
         }
-        let Some(q) = warp.map(rx, ry) else {
-            continue;
-        };
-        let Some(inverse) = inverse_warp_jacobian(warp, rx, ry) else {
-            continue;
-        };
+        let q = geometry.q;
+        let inverse = geometry.inverse;
         let radius = inverse.source_radius(SUPPORT_RADIUS * 1.5, scale);
         if radius == 0 {
             continue;
@@ -2082,10 +2240,11 @@ fn joint_cfa_at(
                 let output_offset = [displacement[0] * scale, displacement[1] * scale];
                 let sample_rx = rx + displacement[0];
                 let sample_ry = ry + displacement[1];
+                let footprint_warp = warp.sample(sample_rx, sample_ry);
                 let visibility = if source.reference {
                     Visibility::Visible
                 } else {
-                    match warp.visibility(sample_rx, sample_ry) {
+                    match footprint_warp.visibility {
                         WarpVisibility::Visible => Visibility::Visible,
                         WarpVisibility::Unknown => Visibility::Unknown,
                         WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
@@ -2109,23 +2268,39 @@ fn joint_cfa_at(
                     .min((source.mosaic.width - 1) as f32 - sx as f32)
                     .min((source.mosaic.height - 1) as f32 - sy as f32);
                 let feather = smoothstep(border / options.feather_px.max(1.0));
-                let footprint_confidence = warp.confidence(sample_rx, sample_ry);
-                let sample_luminance = source_luminance(source, sample_rx, sample_ry, options);
-                let sample_structure =
-                    source_log_luminance_structure(source, sample_rx, sample_ry, options);
-                let local_reference_luminance = reference_source
-                    .and_then(|reference| {
-                        source_luminance(reference, sample_rx, sample_ry, options)
-                    })
+                let footprint_confidence = footprint_warp.confidence;
+                let sample_photometric = source_photometric(source, sample_rx, sample_ry, options);
+                let sample_luminance = sample_photometric.map(|sample| sample.0);
+                let sample_color = sample_photometric.and_then(|sample| sample.1);
+                let local_reference_photometric = reference_source.and_then(|reference| {
+                    source_photometric(reference, sample_rx, sample_ry, options)
+                });
+                let local_reference_luminance = local_reference_photometric
+                    .map(|sample| sample.0)
                     .or(reference_luminance);
+                let local_reference_color = local_reference_photometric
+                    .and_then(|sample| sample.1)
+                    .or(reference_color);
                 let local_reference_structure = reference_source
                     .and_then(|reference| {
-                        source_log_luminance_structure(reference, sample_rx, sample_ry, options)
+                        local_reference_photometric.and_then(|sample| {
+                            source_log_luminance_structure_with_centre(
+                                reference, sample_rx, sample_ry, sample.0, options,
+                            )
+                        })
                     })
                     .or(reference_structure);
-                let local_reference_color = reference_source
-                    .and_then(|reference| source_xyz(reference, sample_rx, sample_ry, options))
-                    .or(reference_color);
+                let sample_structure = if !source.reference
+                    && structure_needs_source_sample(local_reference_structure)
+                {
+                    sample_luminance.and_then(|centre| {
+                        source_log_luminance_structure_with_centre(
+                            source, sample_rx, sample_ry, centre, options,
+                        )
+                    })
+                } else {
+                    None
+                };
                 let edge_weight = edge_consistency_weight(
                     local_reference_luminance,
                     sample_luminance.unwrap_or_default(),
@@ -2138,7 +2313,7 @@ fn joint_cfa_at(
                 );
                 let chroma_weight = chroma_consistency_weight(
                     local_reference_color,
-                    source_xyz(source, sample_rx, sample_ry, options),
+                    sample_color,
                     source.reference,
                 );
                 let focus_weight = focus_consistency_weight(
@@ -2172,7 +2347,14 @@ fn joint_cfa_at(
                     source.mosaic.width,
                     source.mosaic.height,
                 );
-                let Some(response) = camera_response(&source.color, field, sample.phase) else {
+                let Some(response_base) = camera_response_bases
+                    .get(camera_index)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let Some(response) = camera_response_from_base(response_base, field, sample.phase)
+                else {
                     continue;
                 };
                 let gain = source.alignment.gain;
@@ -2180,18 +2362,22 @@ fn joint_cfa_at(
                 let code_range = source.mosaic.physical_code_range;
                 let variance = corrected_noise_variance(&sample, source.noise_model, code_range)
                     * gain.powi(2);
-                let target_rx = rx + output_offset[0] / scale;
-                let target_ry = ry + output_offset[1] / scale;
-                let baseline_prediction = production_baseline_xyz_at(
-                    sources,
-                    target_rx,
-                    target_ry,
-                    scale,
-                    scene_depth,
-                    options,
-                )
-                .map(|baseline| dot3(response, baseline));
-                observations.push(CfaObservation {
+                let baseline_prediction = include_baseline_diagnostic
+                    .then(|| {
+                        let target_rx = rx + output_offset[0] / scale;
+                        let target_ry = ry + output_offset[1] / scale;
+                        production_baseline_xyz_at(
+                            sources,
+                            target_rx,
+                            target_ry,
+                            scale,
+                            scene_depth,
+                            options,
+                        )
+                        .map(|baseline| dot3(response, baseline))
+                    })
+                    .flatten();
+                scratch.observations.push(CfaObservation {
                     camera_index,
                     camera_id: source.camera_id,
                     sensor_xy: [sx as u16, sy as u16],
@@ -2233,8 +2419,13 @@ fn joint_cfa_at(
             }
         }
     }
-    account_shared_sample_dependence(&mut observations);
-    let mut estimate = solve_joint_xyz(&observations, prior_xyz, PRIOR_WEIGHT)?;
+    account_shared_sample_dependence_with_scratch(&mut scratch.observations, &mut scratch.solver);
+    let mut estimate = solve_joint_xyz_with_scratch(
+        &scratch.observations,
+        prior_xyz,
+        PRIOR_WEIGHT,
+        &mut scratch.solver,
+    )?;
     if estimate.report.cameras < 2 || estimate.report.data_rank < 3 {
         return None;
     }
@@ -2242,25 +2433,24 @@ fn joint_cfa_at(
     Some(estimate)
 }
 
-fn source_chroma_structure(
+fn source_chroma_structure_with_centre(
     source: &SynthSource<'_>,
     rx: f32,
     ry: f32,
+    centre_xyz: [f32; 3],
     options: &SynthOptions,
 ) -> Option<f32> {
     const RADIUS: f32 = 1.5;
-    let chroma = |x, y| {
-        source_xyz(source, x, y, options).map(|xyz| {
-            let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
-            ([xyz[0] / sum, xyz[2] / sum], xyz[1])
-        })
+    let chroma = |xyz: [f32; 3]| {
+        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
+        ([xyz[0] / sum, xyz[2] / sum], xyz[1])
     };
-    let centre = chroma(rx, ry)?;
+    let centre = chroma(centre_xyz);
     let neighbours = [
-        chroma(rx - RADIUS, ry)?,
-        chroma(rx + RADIUS, ry)?,
-        chroma(rx, ry - RADIUS)?,
-        chroma(rx, ry + RADIUS)?,
+        chroma(source_xyz(source, rx - RADIUS, ry, options)?),
+        chroma(source_xyz(source, rx + RADIUS, ry, options)?),
+        chroma(source_xyz(source, rx, ry - RADIUS, options)?),
+        chroma(source_xyz(source, rx, ry + RADIUS, options)?),
     ];
     let minimum_luminance = neighbours
         .iter()
@@ -2271,13 +2461,73 @@ fn source_chroma_structure(
         .into_iter()
         .map(|(value, _)| (value[0] - centre.0[0]).hypot(value[1] - centre.0[1]))
         .fold(0.0_f32, f32::max);
-    // Chromaticity is numerically unstable in shadows. Do not interpret
-    // demosaic noise there as an isoluminant colour edge.
     Some(difference * smoothstep(minimum_luminance / 0.025))
+}
+
+/// Conservative close-side defocus prior. Dense-depth labels describe
+/// residual inverse-depth parallax on top of the global warp, which already
+/// absorbs an unknown dominant scene plane. Treating a label as an absolute
+/// subject distance would therefore be wrong. If autofocus selected that
+/// dominant plane, `focus / residual_depth` is the additional relative
+/// dioptric displacement towards the camera; magnified sources are more
+/// sensitive to it. Image-measured sharpness remains authoritative.
+fn focus_consistency_weight(
+    residual: Option<(f64, f32)>,
+    focus_distance: Option<f64>,
+    magnification: f32,
+    reference: bool,
+) -> f32 {
+    if reference || magnification <= 1.05 {
+        return 1.0;
+    }
+    let (Some((residual_depth, confidence)), Some(focus)) = (residual, focus_distance) else {
+        return 1.0;
+    };
+    if !residual_depth.is_finite() || !focus.is_finite() || residual_depth <= 0.0 || focus <= 0.0 {
+        return 1.0;
+    }
+    let mismatch = (focus / residual_depth) as f32 * (magnification - 1.0);
+    let relative = mismatch / 0.75;
+    let supported = 1.0 / (1.0 + relative.powi(4));
+    1.0 - confidence.clamp(0.0, 1.0) * (1.0 - supported)
+}
+
+/// Compare colour independently of luminance. A defocused chromatic halo may
+/// preserve total luminance and therefore pass the structural checks; D50 XYZ
+/// chromaticity exposes that disagreement without rejecting exposure changes.
+pub(crate) fn chroma_consistency_weight(
+    reference: Option<[f32; 3]>,
+    sample: Option<[f32; 3]>,
+    is_reference: bool,
+) -> f32 {
+    if is_reference {
+        return 1.0;
+    }
+    let (Some(reference), Some(sample)) = (reference, sample) else {
+        return 1.0;
+    };
+    let difference = chroma_distance(reference, sample);
+    let relative = difference / 0.055;
+    let robust = 1.0 / (1.0 + relative.powi(4));
+    let reliability = smoothstep(reference[1].min(sample[1]) / 0.02);
+    1.0 - reliability * (1.0 - robust)
+}
+
+/// D50 XYZ chromaticity distance shared by synthesis rejection and the sparse
+/// array-aware factory-profile selector.
+pub(crate) fn chroma_distance(first: [f32; 3], second: [f32; 3]) -> f32 {
+    let chromaticity = |xyz: [f32; 3]| {
+        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
+        [xyz[0] / sum, xyz[2] / sum]
+    };
+    let first = chromaticity(first);
+    let second = chromaticity(second);
+    (first[0] - second[0]).hypot(first[1] - second[1])
 }
 
 fn evaluate_held_out_cfa(
     sources: &[SynthSource<'_>],
+    camera_response_bases: &[Option<CameraResponseBase>],
     rx: f32,
     ry: f32,
     scale: f32,
@@ -2361,7 +2611,13 @@ fn evaluate_held_out_cfa(
         let field = source
             .gain_field
             .at(sx, sy, source.mosaic.width, source.mosaic.height);
-        let Some(response) = camera_response(&source.color, field, sample.phase) else {
+        let Some(response_base) = camera_response_bases.get(index).and_then(Option::as_ref) else {
+            if let Ok(mut accumulator) = accumulators[index].lock() {
+                accumulator.rejected.uncalibrated_response += 1;
+            }
+            continue;
+        };
+        let Some(response) = camera_response_from_base(response_base, field, sample.phase) else {
             accumulator.rejected.uncalibrated_response += 1;
             continue;
         };
@@ -2453,9 +2709,12 @@ fn production_baseline_xyz_at(
     options: &SynthOptions,
 ) -> Option<[f32; 3]> {
     let reference = sources.iter().find(|source| source.reference)?;
-    let reference_luminance = source_luminance(reference, rx, ry, options);
-    let reference_structure = source_log_luminance_structure(reference, rx, ry, options);
-    let reference_color = source_xyz(reference, rx, ry, options);
+    let reference_photometric = source_photometric(reference, rx, ry, options);
+    let reference_luminance = reference_photometric.map(|sample| sample.0);
+    let reference_color = reference_photometric.and_then(|sample| sample.1);
+    let reference_structure = reference_luminance.and_then(|centre| {
+        source_log_luminance_structure_with_centre(reference, rx, ry, centre, options)
+    });
     let mut xyz = [0.0_f32; 3];
     let mut color_weight = 0.0_f32;
     let mut luminance = 0.0_f32;
@@ -2470,10 +2729,11 @@ fn production_baseline_xyz_at(
         if source.held_out || (!options.include_mono && source.mosaic.is_mono()) {
             continue;
         }
-        if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
+        let warp_sample = source.alignment.warp.sample(rx, ry);
+        if !source.reference && warp_sample.visibility.blocks_sampling() {
             continue;
         }
-        let Some(q) = source.alignment.warp.map(rx, ry) else {
+        let Some(q) = warp_sample.mapped else {
             continue;
         };
         let border = q[0]
@@ -2481,7 +2741,7 @@ fn production_baseline_xyz_at(
             .min((source.mosaic.width - 1) as f32 - q[0])
             .min((source.mosaic.height - 1) as f32 - q[1]);
         let feather = smoothstep(border / options.feather_px.max(1.0));
-        let local_confidence = source.alignment.warp.confidence(rx, ry);
+        let local_confidence = warp_sample.confidence;
         let base_weight =
             feather * local_confidence * source.magnification.powi(2) * source.confidence;
         if base_weight <= 0.0 {
@@ -2493,12 +2753,18 @@ fn production_baseline_xyz_at(
             source.magnification,
             source.reference,
         );
-        let Some(sample_luminance) = source_luminance(source, rx, ry, options) else {
+        let Some(sample_photometric) = source_photometric(source, rx, ry, options) else {
             continue;
         };
-        let sample_structure = (!source.reference)
-            .then(|| source_log_luminance_structure(source, rx, ry, options))
-            .flatten();
+        let sample_luminance = sample_photometric.0;
+        let sample_color = sample_photometric.1;
+        let sample_structure = if !source.reference
+            && structure_needs_source_sample(reference_structure)
+        {
+            source_log_luminance_structure_with_centre(source, rx, ry, sample_luminance, options)
+        } else {
+            None
+        };
         let mut edge_weight =
             edge_consistency_weight(reference_luminance, sample_luminance, source.reference)
                 * detail_consistency_weight(
@@ -2539,7 +2805,7 @@ fn production_baseline_xyz_at(
             reference_luminance_sum += luminance_source_weight * sample_luminance;
             reference_luminance_weight += luminance_source_weight;
         }
-        if let Some(matched) = source_xyz(source, rx, ry, options) {
+        if let Some(matched) = sample_color {
             let chroma_weight =
                 chroma_consistency_weight(reference_color, Some(matched), source.reference);
             let color_source_weight = luminance_source_weight * chroma_weight;
@@ -2675,16 +2941,17 @@ fn source_luminance_at_sensor(
     }
 }
 
-fn source_luminance(
+fn source_photometric(
     source: &SynthSource<'_>,
     rx: f32,
     ry: f32,
     options: &SynthOptions,
-) -> Option<f32> {
-    if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
+) -> Option<(f32, Option<[f32; 3]>)> {
+    let warp_sample = source.alignment.warp.sample(rx, ry);
+    if !source.reference && warp_sample.visibility.blocks_sampling() {
         return None;
     }
-    let q = source.alignment.warp.map(rx, ry)?;
+    let q = warp_sample.mapped?;
     let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
     let gain = source.alignment.gain;
     let offset = source.alignment.offset;
@@ -2692,17 +2959,28 @@ fn source_luminance(
         .gain_field
         .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
     if source.mosaic.is_mono() || !source.color.calibrated {
-        Some((gain * (rgb[1] - offset)).max(0.0) * field[1])
+        Some(((gain * (rgb[1] - offset)).max(0.0) * field[1], None))
     } else {
         let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
         let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
-        Some(
+        let mut xyz =
             source
                 .color
-                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction)[1]
-                * field[1],
-        )
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
+        for channel in 0..3 {
+            xyz[channel] *= field[channel];
+        }
+        Some((xyz[1], Some(xyz)))
     }
+}
+
+fn source_luminance(
+    source: &SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+    options: &SynthOptions,
+) -> Option<f32> {
+    source_photometric(source, rx, ry, options).map(|sample| sample.0)
 }
 
 fn source_xyz(
@@ -2711,112 +2989,22 @@ fn source_xyz(
     ry: f32,
     options: &SynthOptions,
 ) -> Option<[f32; 3]> {
-    if source.mosaic.is_mono() || !source.color.calibrated {
-        return None;
-    }
-    if !source.reference && source.alignment.warp.visibility(rx, ry).blocks_sampling() {
-        return None;
-    }
-    let q = source.alignment.warp.map(rx, ry)?;
-    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(q[0], q[1])?;
-    let gain = source.alignment.gain;
-    let offset = source.alignment.offset;
-    let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
-    let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
-    let mut xyz =
-        source
-            .color
-            .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
-    let field = source
-        .gain_field
-        .at(q[0], q[1], source.mosaic.width, source.mosaic.height);
-    for channel in 0..3 {
-        xyz[channel] *= field[channel];
-    }
-    Some(xyz)
+    source_photometric(source, rx, ry, options)?.1
 }
 
-/// Conservative close-side defocus prior. Dense-depth labels describe
-/// residual inverse-depth parallax on top of the global warp, which already
-/// absorbs an unknown dominant scene plane. Treating a label as an absolute
-/// subject distance would therefore be wrong. If autofocus selected that
-/// dominant plane, `focus / residual_depth` is the additional relative
-/// dioptric displacement towards the camera; magnified sources are more
-/// sensitive to it. Image-measured sharpness remains authoritative.
-fn focus_consistency_weight(
-    residual: Option<(f64, f32)>,
-    focus_distance: Option<f64>,
-    magnification: f32,
-    reference: bool,
-) -> f32 {
-    if reference || magnification <= 1.05 {
-        return 1.0;
-    }
-    let (Some((residual_depth, confidence)), Some(focus)) = (residual, focus_distance) else {
-        return 1.0;
-    };
-    if !residual_depth.is_finite() || !focus.is_finite() || residual_depth <= 0.0 || focus <= 0.0 {
-        return 1.0;
-    }
-    let mismatch = (focus / residual_depth) as f32 * (magnification - 1.0);
-    let relative = mismatch / 0.75;
-    let supported = 1.0 / (1.0 + relative.powi(4));
-    1.0 - confidence.clamp(0.0, 1.0) * (1.0 - supported)
-}
-
-/// Compare colour independently of luminance. A defocused chromatic halo may
-/// preserve total luminance and therefore pass the structural checks; D50 XYZ
-/// chromaticity exposes that disagreement without rejecting exposure changes.
-pub(crate) fn chroma_consistency_weight(
-    reference: Option<[f32; 3]>,
-    sample: Option<[f32; 3]>,
-    is_reference: bool,
-) -> f32 {
-    if is_reference {
-        return 1.0;
-    }
-    let (Some(reference), Some(sample)) = (reference, sample) else {
-        return 1.0;
-    };
-    let difference = chroma_distance(reference, sample);
-    let relative = difference / 0.055;
-    let robust = 1.0 / (1.0 + relative.powi(4));
-    // Chroma is unstable in deep shadows. Fade the decision in using the
-    // darker of the two samples instead of manufacturing coloured speckle.
-    let reliability = smoothstep(reference[1].min(sample[1]) / 0.02);
-    1.0 - reliability * (1.0 - robust)
-}
-
-/// D50 XYZ chromaticity distance used by both synthesis rejection and the
-/// sparse array-aware factory-profile selector. Sharing this definition keeps
-/// profile selection aligned with the disagreement the final fusion observes.
-pub(crate) fn chroma_distance(first: [f32; 3], second: [f32; 3]) -> f32 {
-    let chromaticity = |xyz: [f32; 3]| {
-        let sum = (xyz[0] + xyz[1] + xyz[2]).max(1.0e-5);
-        [xyz[0] / sum, xyz[2] / sum]
-    };
-    let first = chromaticity(first);
-    let second = chromaticity(second);
-    (first[0] - second[0]).hypot(first[1] - second[1])
-}
-
-/// Reference-space log-luminance structure sampled through one module's warp.
-/// Mapping all four neighbours independently accounts for local scale,
-/// rotation, and distortion instead of assuming sensor axes match the canvas.
-/// The third component is centre-surround contrast: unlike a gradient, it is
-/// strong at the middle of a one-pixel dark twig surrounded by bright sky.
-fn source_log_luminance_structure(
+fn source_log_luminance_structure_with_centre(
     source: &SynthSource<'_>,
     rx: f32,
     ry: f32,
+    centre_luminance: f32,
     options: &SynthOptions,
 ) -> Option<[f32; 3]> {
     const RADIUS: f32 = 1.5;
     let log_sample = |x, y| {
         source_luminance(source, x, y, options).map(|value| (1.0 + 64.0 * value.max(0.0)).ln())
     };
-    let (centre, left, right, above, below) = (
-        log_sample(rx, ry)?,
+    let centre = (1.0 + 64.0 * centre_luminance.max(0.0)).ln();
+    let (left, right, above, below) = (
         log_sample(rx - RADIUS, ry)?,
         log_sample(rx + RADIUS, ry)?,
         log_sample(rx, ry - RADIUS)?,
@@ -2827,6 +3015,11 @@ fn source_log_luminance_structure(
         (below - above) / (2.0 * RADIUS),
         (left + right + above + below) * 0.25 - centre,
     ])
+}
+
+#[inline]
+fn structure_needs_source_sample(reference: Option<[f32; 3]>) -> bool {
+    reference.is_some_and(|value| value[0].hypot(value[1]).max(value[2].abs()) >= 0.01)
 }
 
 /// Preserve reference detail while still accepting genuinely sharper samples.

@@ -37,6 +37,152 @@ pub struct CameraRefinement {
     pub sensor_offset_px: Option<Vec2>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedCameraTemplate {
+    name: String,
+    width: usize,
+    height: usize,
+    base_k: Mat3,
+    distortion: Option<PolynomialDistortion>,
+    flip_around_x: Option<bool>,
+    pose: PoseTemplate,
+    focus_distance: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+enum PoseTemplate {
+    Canonical {
+        rotation_wc: Mat3,
+        rotation_cw: Mat3,
+        translation_wc: Vec3,
+        center: Vec3,
+    },
+    Mirror {
+        real_cw: Mat3,
+        rotation_axis: Vec3,
+        factory_angle_degrees: f64,
+        mirror_normal_zero: Vec3,
+        point_on_rotation_axis: Vec3,
+        mirror_plane_distance: f64,
+        real_camera_location: Vec3,
+    },
+}
+
+impl ResolvedCameraTemplate {
+    pub fn new(
+        calibration: &CameraCalibration,
+        state: &ModuleState,
+        mode: IntrinsicsMode,
+    ) -> Result<Self> {
+        let base_k = calibration.k_for_hall(state.lens_hall, mode)?;
+        let pose = if let Some(canonical) = calibration.canonical_pose.as_ref() {
+            PoseTemplate::Canonical {
+                rotation_wc: canonical.rotation_wc,
+                rotation_cw: transpose(&canonical.rotation_wc),
+                translation_wc: canonical.translation_wc,
+                center: canonical.center_world(),
+            }
+        } else if let Some(mirror) = calibration.mirror.as_ref() {
+            PoseTemplate::Mirror {
+                real_cw: mirror.real_camera_orientation_cw,
+                rotation_axis: mirror.rotation_axis,
+                factory_angle_degrees: mirror.actuator.angle_for_hall(state.mirror_hall)?,
+                mirror_normal_zero: mirror.mirror_normal_zero,
+                point_on_rotation_axis: mirror.point_on_rotation_axis,
+                mirror_plane_distance: mirror.mirror_plane_distance,
+                real_camera_location: mirror.real_camera_location,
+            }
+        } else {
+            bail!(
+                "{} has neither a canonical pose nor a mirror model",
+                calibration.name
+            );
+        };
+        Ok(Self {
+            name: calibration.name.clone(),
+            width: state.width,
+            height: state.height,
+            base_k,
+            distortion: calibration.distortion.clone(),
+            flip_around_x: calibration.mirror.as_ref().map(|m| m.flip_img_around_x),
+            pose,
+            focus_distance: calibration.focus_distance_for_hall(state.lens_hall, mode),
+        })
+    }
+
+    pub fn resolve(&self, refinement: &CameraRefinement) -> Result<ResolvedCamera> {
+        let sensor_offset = refinement.sensor_offset_px.unwrap_or([0.0; 2]);
+        let mut k = self.base_k;
+        k[0][2] += sensor_offset[0];
+        k[1][2] += sensor_offset[1];
+        let k_inverse = math::inverse(&k).context("singular intrinsic matrix")?;
+        let center_offset = refinement.center_offset_world.unwrap_or([0.0; 3]);
+        let pose = match &self.pose {
+            PoseTemplate::Canonical {
+                rotation_wc,
+                rotation_cw,
+                translation_wc,
+                center,
+            } => Pose::Canonical {
+                rotation_wc: *rotation_wc,
+                rotation_cw: *rotation_cw,
+                translation_wc: sub(*translation_wc, mul_vec(rotation_wc, center_offset)),
+                center: add(*center, center_offset),
+            },
+            PoseTemplate::Mirror {
+                real_cw,
+                rotation_axis,
+                factory_angle_degrees,
+                mirror_normal_zero,
+                point_on_rotation_axis,
+                mirror_plane_distance,
+                real_camera_location,
+            } => {
+                let angle = factory_angle_degrees + refinement.mirror_angle_offset_degrees;
+                let rotation = math::rotation_about_axis(*rotation_axis, angle.to_radians());
+                let normal = normalize(mul_vec(&rotation, *mirror_normal_zero));
+                let plane_point = add(
+                    *point_on_rotation_axis,
+                    scale(normal, *mirror_plane_distance),
+                );
+                let reflect = reflection(normal);
+                let distance = math::dot(normal, sub(*real_camera_location, plane_point));
+                let virtual_center = add(
+                    sub(*real_camera_location, scale(normal, 2.0 * distance)),
+                    center_offset,
+                );
+                Pose::Mirror {
+                    real_cw: *real_cw,
+                    reflect,
+                    virtual_center,
+                }
+            }
+        };
+        let orientation_correction = refinement
+            .orientation_offset_degrees
+            .map(|v| math::rotation_from_axis_angle(scale(v, std::f64::consts::PI / 180.0)))
+            .unwrap_or(IDENTITY);
+        let mut distortion = self.distortion.clone();
+        if let Some(distortion) = distortion.as_mut() {
+            distortion.center[0] += sensor_offset[0];
+            distortion.center[1] += sensor_offset[1];
+        }
+        Ok(ResolvedCamera {
+            name: self.name.clone(),
+            width: self.width,
+            height: self.height,
+            k,
+            k_inverse,
+            distortion,
+            flip_around_x: self.flip_around_x,
+            pose,
+            orientation_correction,
+            focal_px: k[0][0],
+            focus_distance: self.focus_distance,
+        })
+    }
+}
+
 /// A module with its calibration resolved for one capture.
 #[derive(Clone, Debug)]
 pub struct ResolvedCamera {
@@ -86,71 +232,7 @@ impl ResolvedCamera {
         mode: IntrinsicsMode,
         refinement: &CameraRefinement,
     ) -> Result<Self> {
-        let sensor_offset = refinement.sensor_offset_px.unwrap_or([0.0; 2]);
-        let mut k = calibration.k_for_hall(state.lens_hall, mode)?;
-        k[0][2] += sensor_offset[0];
-        k[1][2] += sensor_offset[1];
-        let k_inverse = math::inverse(&k).context("singular intrinsic matrix")?;
-        let center_offset = refinement.center_offset_world.unwrap_or([0.0; 3]);
-        let pose = if let Some(canonical) = calibration.canonical_pose.as_ref() {
-            let center = add(canonical.center_world(), center_offset);
-            Pose::Canonical {
-                rotation_wc: canonical.rotation_wc,
-                rotation_cw: transpose(&canonical.rotation_wc),
-                translation_wc: sub(
-                    canonical.translation_wc,
-                    mul_vec(&canonical.rotation_wc, center_offset),
-                ),
-                center,
-            }
-        } else if let Some(mirror) = calibration.mirror.as_ref() {
-            let angle = mirror.actuator.angle_for_hall(state.mirror_hall)?
-                + refinement.mirror_angle_offset_degrees;
-            let rotation = math::rotation_about_axis(mirror.rotation_axis, angle.to_radians());
-            let normal = normalize(mul_vec(&rotation, mirror.mirror_normal_zero));
-            let plane_point = add(
-                mirror.point_on_rotation_axis,
-                scale(normal, mirror.mirror_plane_distance),
-            );
-            let reflect = reflection(normal);
-            let distance = math::dot(normal, sub(mirror.real_camera_location, plane_point));
-            let virtual_center = add(
-                sub(mirror.real_camera_location, scale(normal, 2.0 * distance)),
-                center_offset,
-            );
-            Pose::Mirror {
-                real_cw: mirror.real_camera_orientation_cw,
-                reflect,
-                virtual_center,
-            }
-        } else {
-            bail!(
-                "{} has neither a canonical pose nor a mirror model",
-                calibration.name
-            );
-        };
-        let orientation_correction = refinement
-            .orientation_offset_degrees
-            .map(|v| math::rotation_from_axis_angle(scale(v, std::f64::consts::PI / 180.0)))
-            .unwrap_or(IDENTITY);
-        let mut distortion = calibration.distortion.clone();
-        if let Some(distortion) = distortion.as_mut() {
-            distortion.center[0] += sensor_offset[0];
-            distortion.center[1] += sensor_offset[1];
-        }
-        Ok(Self {
-            name: calibration.name.clone(),
-            width: state.width,
-            height: state.height,
-            k,
-            k_inverse,
-            distortion,
-            flip_around_x: calibration.mirror.as_ref().map(|m| m.flip_img_around_x),
-            pose,
-            orientation_correction,
-            focal_px: k[0][0],
-            focus_distance: calibration.focus_distance_for_hall(state.lens_hall, mode),
-        })
+        ResolvedCameraTemplate::new(calibration, state, mode)?.resolve(refinement)
     }
 
     /// Optical centre in world (calibration) coordinates.

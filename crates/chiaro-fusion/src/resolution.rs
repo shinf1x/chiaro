@@ -185,6 +185,54 @@ pub(crate) fn hann_weight(dx: f32, dy: f32, radius: f32) -> f32 {
     0.5 + 0.5 * (std::f32::consts::PI * distance / radius).cos()
 }
 
+/// Geometry shared by several edge-aligned Hann radii at the same output
+/// point. Preparing it once avoids recomputing gradient strength, steering,
+/// and edge direction for the fine/coarse/broad reconstruction kernels.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdgeAlignedHannGeometry {
+    normal: Option<[f32; 2]>,
+    steering: f32,
+}
+
+impl EdgeAlignedHannGeometry {
+    #[inline]
+    pub(crate) fn new(reference_structure: Option<[f32; 3]>) -> Self {
+        let Some([gx, gy, _]) = reference_structure else {
+            return Self {
+                normal: None,
+                steering: 0.0,
+            };
+        };
+        let gradient = gx.hypot(gy);
+        if !gradient.is_finite() || gradient <= 1.0e-6 {
+            return Self {
+                normal: None,
+                steering: 0.0,
+            };
+        }
+        Self {
+            normal: Some([gx / gradient, gy / gradient]),
+            steering: smoothstep((gradient - 0.02) / 0.08),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn weight(self, dx: f32, dy: f32, radius: f32) -> f32 {
+        let Some(normal) = self.normal else {
+            return hann_weight(dx, dy, radius);
+        };
+        let across_radius = radius * (1.0 - 0.28 * self.steering);
+        let along_radius = radius * (1.0 + 0.50 * self.steering);
+        let across = dx * normal[0] + dy * normal[1];
+        let along = -dx * normal[1] + dy * normal[0];
+        let normalized = (across / across_radius).hypot(along / along_radius);
+        if !normalized.is_finite() || normalized >= 1.0 {
+            return 0.0;
+        }
+        0.5 + 0.5 * (std::f32::consts::PI * normalized).cos()
+    }
+}
+
 /// Compact Hann window steered by the reference image's local edge. Near a
 /// strong edge, support is narrow in the gradient direction and wider along
 /// the edge. This gathers more agreeing samples without averaging across a
@@ -196,28 +244,7 @@ pub(crate) fn edge_aligned_hann_weight(
     radius: f32,
     reference_structure: Option<[f32; 3]>,
 ) -> f32 {
-    let Some([gx, gy, _]) = reference_structure else {
-        return hann_weight(dx, dy, radius);
-    };
-    let gradient = gx.hypot(gy);
-    if !gradient.is_finite() || gradient <= 1.0e-6 {
-        return hann_weight(dx, dy, radius);
-    }
-
-    // Fade in steering so noise in nominally flat areas cannot pick an
-    // arbitrary kernel direction. The structure signal is log-luminance per
-    // reference pixel; 0.02 begins steering and 0.10 is a decisive edge.
-    let steering = smoothstep((gradient - 0.02) / 0.08);
-    let across_radius = radius * (1.0 - 0.28 * steering);
-    let along_radius = radius * (1.0 + 0.50 * steering);
-    let normal = [gx / gradient, gy / gradient];
-    let across = dx * normal[0] + dy * normal[1];
-    let along = -dx * normal[1] + dy * normal[0];
-    let normalized = (across / across_radius).hypot(along / along_radius);
-    if !normalized.is_finite() || normalized >= 1.0 {
-        return 0.0;
-    }
-    0.5 + 0.5 * (std::f32::consts::PI * normalized).cos()
+    EdgeAlignedHannGeometry::new(reference_structure).weight(dx, dy, radius)
 }
 
 /// Confidence from both independent camera count and sampling-phase spread.

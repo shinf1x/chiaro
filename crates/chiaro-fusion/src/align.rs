@@ -75,7 +75,48 @@ pub struct Warp {
     pub visibility: Vec<WarpVisibility>,
 }
 
+/// All synthesis-facing values from one warp grid cell. Computing these
+/// together avoids repeating the same grid coordinate, floor, and index work
+/// for map/confidence/visibility queries at the same output location.
+#[derive(Clone, Copy, Debug)]
+pub struct WarpSample {
+    pub mapped: Option<[f32; 2]>,
+    pub confidence: f32,
+    pub visibility: WarpVisibility,
+}
+
+#[derive(Clone, Copy)]
+struct WarpCell {
+    c0: usize,
+    r0: usize,
+    c1: usize,
+    r1: usize,
+    tx: f32,
+    ty: f32,
+}
+
 impl Warp {
+    #[inline]
+    fn cell(&self, x: f32, y: f32) -> Option<WarpCell> {
+        if self.step == 0 || self.columns == 0 || self.rows == 0 {
+            return None;
+        }
+        let fx = x / self.step as f32;
+        let fy = y / self.step as f32;
+        if fx < 0.0 || fy < 0.0 {
+            return None;
+        }
+        let c0 = (fx.floor() as usize).min(self.columns - 1);
+        let r0 = (fy.floor() as usize).min(self.rows - 1);
+        Some(WarpCell {
+            c0,
+            r0,
+            c1: (c0 + 1).min(self.columns - 1),
+            r1: (r0 + 1).min(self.rows - 1),
+            tx: fx - c0 as f32,
+            ty: fy - r0 as f32,
+        })
+    }
     /// Sample the mapping by evaluating `map` on a `step`-spaced grid that
     /// covers `0..=width` x `0..=height` of the reference raster.
     pub fn from_fn(
@@ -119,86 +160,128 @@ impl Warp {
         }
     }
 
-    /// Target coordinates for a reference pixel; `None` where undefined.
+    /// Sample mapping, confidence, and visibility using one shared grid-cell lookup.
     #[inline]
-    pub fn map(&self, x: f32, y: f32) -> Option<[f32; 2]> {
-        let fx = x / self.step as f32;
-        let fy = y / self.step as f32;
-        if fx < 0.0 || fy < 0.0 {
-            return None;
-        }
-        let c0 = (fx.floor() as usize).min(self.columns - 1);
-        let r0 = (fy.floor() as usize).min(self.rows - 1);
-        let c1 = (c0 + 1).min(self.columns - 1);
-        let r1 = (r0 + 1).min(self.rows - 1);
-        let tx = fx - c0 as f32;
-        let ty = fy - r0 as f32;
+    pub fn sample(&self, x: f32, y: f32) -> WarpSample {
+        let Some(cell) = self.cell(x, y) else {
+            return WarpSample {
+                mapped: None,
+                confidence: 0.0,
+                visibility: WarpVisibility::Unknown,
+            };
+        };
+        let WarpCell {
+            c0,
+            r0,
+            c1,
+            r1,
+            tx,
+            ty,
+        } = cell;
         let p = |c: usize, r: usize| self.points[r * self.columns + c];
         let (a, b, c, d) = (p(c0, r0), p(c1, r0), p(c0, r1), p(c1, r1));
-        let mut out = [0.0f32; 2];
+        let mut mapped = [0.0f32; 2];
         for k in 0..2 {
             let top = a[k] * (1.0 - tx) + b[k] * tx;
             let bottom = c[k] * (1.0 - tx) + d[k] * tx;
-            out[k] = top * (1.0 - ty) + bottom * ty;
+            mapped[k] = top * (1.0 - ty) + bottom * ty;
         }
-        if out[0].is_nan() || out[1].is_nan() {
-            None
+        let mapped = (!mapped[0].is_nan() && !mapped[1].is_nan()).then_some(mapped);
+
+        let confidence = if self.confidence.len() == self.points.len() {
+            let value = |column: usize, row: usize| self.confidence[row * self.columns + column];
+            let top = value(c0, r0) * (1.0 - tx) + value(c1, r0) * tx;
+            let bottom = value(c0, r1) * (1.0 - tx) + value(c1, r1) * tx;
+            (top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0)
         } else {
-            Some(out)
+            0.0
+        };
+
+        let visibility = if self.visibility.len() == self.points.len() {
+            let values = [
+                self.visibility[r0 * self.columns + c0],
+                self.visibility[r0 * self.columns + c1],
+                self.visibility[r1 * self.columns + c0],
+                self.visibility[r1 * self.columns + c1],
+            ];
+            if values.contains(&WarpVisibility::Boundary) {
+                WarpVisibility::Boundary
+            } else {
+                let occluded = values.contains(&WarpVisibility::Occluded);
+                let visible = values.contains(&WarpVisibility::Visible);
+                let unknown = values.contains(&WarpVisibility::Unknown);
+                if occluded {
+                    if visible || unknown {
+                        WarpVisibility::Boundary
+                    } else {
+                        WarpVisibility::Occluded
+                    }
+                } else if unknown {
+                    WarpVisibility::Unknown
+                } else {
+                    WarpVisibility::Visible
+                }
+            }
+        } else {
+            WarpVisibility::Unknown
+        };
+
+        WarpSample {
+            mapped,
+            confidence,
+            visibility,
         }
+    }
+
+    /// Target coordinates for a reference pixel; `None` where undefined.
+    #[inline]
+    pub fn map(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        let cell = self.cell(x, y)?;
+        let p = |c: usize, r: usize| self.points[r * self.columns + c];
+        let (a, b, c, d) = (
+            p(cell.c0, cell.r0),
+            p(cell.c1, cell.r0),
+            p(cell.c0, cell.r1),
+            p(cell.c1, cell.r1),
+        );
+        let mut out = [0.0f32; 2];
+        for k in 0..2 {
+            let top = a[k] * (1.0 - cell.tx) + b[k] * cell.tx;
+            let bottom = c[k] * (1.0 - cell.tx) + d[k] * cell.tx;
+            out[k] = top * (1.0 - cell.ty) + bottom * cell.ty;
+        }
+        (!out[0].is_nan() && !out[1].is_nan()).then_some(out)
     }
 
     /// Bilinearly interpolated local confidence for synthesis.
     #[inline]
     pub fn confidence(&self, x: f32, y: f32) -> f32 {
-        let fx = x / self.step as f32;
-        let fy = y / self.step as f32;
-        if fx < 0.0 || fy < 0.0 || self.confidence.len() != self.points.len() {
+        let Some(cell) = self.cell(x, y) else {
+            return 0.0;
+        };
+        if self.confidence.len() != self.points.len() {
             return 0.0;
         }
-        let c0 = (fx.floor() as usize).min(self.columns - 1);
-        let r0 = (fy.floor() as usize).min(self.rows - 1);
-        let c1 = (c0 + 1).min(self.columns - 1);
-        let r1 = (r0 + 1).min(self.rows - 1);
-        let tx = fx - c0 as f32;
-        let ty = fy - r0 as f32;
         let value = |column: usize, row: usize| self.confidence[row * self.columns + column];
-        let top = value(c0, r0) * (1.0 - tx) + value(c1, r0) * tx;
-        let bottom = value(c0, r1) * (1.0 - tx) + value(c1, r1) * tx;
-        (top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0)
+        let top = value(cell.c0, cell.r0) * (1.0 - cell.tx) + value(cell.c1, cell.r0) * cell.tx;
+        let bottom = value(cell.c0, cell.r1) * (1.0 - cell.tx) + value(cell.c1, cell.r1) * cell.tx;
+        (top * (1.0 - cell.ty) + bottom * cell.ty).clamp(0.0, 1.0)
     }
 
     /// Conservative categorical visibility at a reference-space position.
-    ///
-    /// Visibility is intentionally *not* bilinearly interpolated. If a grid
-    /// cell straddles an occlusion transition, treating its labels as numeric
-    /// values would manufacture a fractional state and could blend two scene
-    /// surfaces. Instead a mixed cell becomes `Boundary` and is suppressed by
-    /// physical-sample reconstruction until a future two-layer model can
-    /// represent both surfaces explicitly.
     #[inline]
     pub fn visibility(&self, x: f32, y: f32) -> WarpVisibility {
-        if self.step == 0
-            || self.columns == 0
-            || self.rows == 0
-            || self.visibility.len() != self.points.len()
-        {
+        let Some(cell) = self.cell(x, y) else {
+            return WarpVisibility::Unknown;
+        };
+        if self.visibility.len() != self.points.len() {
             return WarpVisibility::Unknown;
         }
-        let fx = x / self.step as f32;
-        let fy = y / self.step as f32;
-        if fx < 0.0 || fy < 0.0 {
-            return WarpVisibility::Unknown;
-        }
-        let c0 = (fx.floor() as usize).min(self.columns - 1);
-        let r0 = (fy.floor() as usize).min(self.rows - 1);
-        let c1 = (c0 + 1).min(self.columns - 1);
-        let r1 = (r0 + 1).min(self.rows - 1);
         let values = [
-            self.visibility[r0 * self.columns + c0],
-            self.visibility[r0 * self.columns + c1],
-            self.visibility[r1 * self.columns + c0],
-            self.visibility[r1 * self.columns + c1],
+            self.visibility[cell.r0 * self.columns + cell.c0],
+            self.visibility[cell.r0 * self.columns + cell.c1],
+            self.visibility[cell.r1 * self.columns + cell.c0],
+            self.visibility[cell.r1 * self.columns + cell.c1],
         ];
         if values.contains(&WarpVisibility::Boundary) {
             return WarpVisibility::Boundary;
@@ -394,6 +477,33 @@ pub struct AlignmentSeed<'a> {
     pub name: &'static str,
 }
 
+/// Reusable luminance pyramid for repeated alignment passes. Building down to
+/// the smallest alignment scale once lets each call borrow the prefix it
+/// needs instead of repeatedly cloning/downsampling the same module.
+#[derive(Clone, Debug)]
+pub struct AlignPyramidCache {
+    levels: Vec<Plane>,
+}
+
+impl AlignPyramidCache {
+    pub fn new(luminance: &Plane) -> Self {
+        Self {
+            levels: luminance.pyramid(16),
+        }
+    }
+
+    fn levels_for(&self, min_size: usize) -> &[Plane] {
+        let minimum = min_size.max(8);
+        let count = self
+            .levels
+            .iter()
+            .take_while(|plane| plane.width.min(plane.height) >= minimum)
+            .count()
+            .max(1);
+        &self.levels[..count.min(self.levels.len())]
+    }
+}
+
 /// Depth used for the rotation-only initialisation (calibration units).
 const FAR_DEPTH: f64 = 1.0e8;
 
@@ -415,6 +525,26 @@ pub fn align_module_seeded(
     target: &AlignInput<'_>,
     options: &AlignOptions,
     seed: Option<AlignmentSeed<'_>>,
+) -> Result<ModuleAlignment> {
+    let reference_pyramid = AlignPyramidCache::new(reference.luminance);
+    let target_pyramid = AlignPyramidCache::new(target.luminance);
+    align_module_seeded_cached(
+        reference,
+        target,
+        options,
+        seed,
+        &reference_pyramid,
+        &target_pyramid,
+    )
+}
+
+pub fn align_module_seeded_cached(
+    reference: &AlignInput<'_>,
+    target: &AlignInput<'_>,
+    options: &AlignOptions,
+    seed: Option<AlignmentSeed<'_>>,
+    reference_pyramid: &AlignPyramidCache,
+    target_pyramid: &AlignPyramidCache,
 ) -> Result<ModuleAlignment> {
     let (width, height) = (reference.width, reference.height);
     let mut report = AlignmentReport {
@@ -463,7 +593,14 @@ pub fn align_module_seeded(
                 (target.width as f64 - 1.0) / 2.0,
                 (target.height as f64 - 1.0) / 2.0,
             );
-            let shift = coarse_global_shift(reference, target, scale, options)?;
+            let shift = coarse_global_shift(
+                reference,
+                target,
+                scale,
+                options,
+                reference_pyramid,
+                target_pyramid,
+            )?;
             Warp::from_fn(width, height, 8, |p| {
                 Some([
                     (p[0] - cx) * scale + tx + shift[0],
@@ -482,8 +619,8 @@ pub fn align_module_seeded(
     let mut finest_residuals: Vec<f32> = Vec::new();
     let mut correspondences = Vec::new();
     if options.refine {
-        let reference_pyramid = reference.luminance.pyramid(96);
-        let target_pyramid = target.luminance.pyramid(48);
+        let reference_pyramid = reference_pyramid.levels_for(96);
+        let target_pyramid = target_pyramid.levels_for(48);
         // Magnification of the module relative to the reference: how many
         // target luminance pixels one reference luminance pixel covers.
         let magnification = {
@@ -721,17 +858,19 @@ fn rendered_covered(rendered: &Plane, x: usize, y: usize, size: usize) -> bool {
 /// Exhaustive translation search at a coarse level for the no-calibration
 /// fallback. Returns the shift in target raster pixels.
 fn coarse_global_shift(
-    reference: &AlignInput<'_>,
-    target: &AlignInput<'_>,
+    _reference: &AlignInput<'_>,
+    _target: &AlignInput<'_>,
     scale: f64,
     options: &AlignOptions,
+    reference_pyramid: &AlignPyramidCache,
+    target_pyramid: &AlignPyramidCache,
 ) -> Result<Vec2> {
     // Downsample the reference to ~64 px wide and the target to the same
     // angular density, then slide the smaller over the larger.
-    let reference_pyramid = reference.luminance.pyramid(32);
+    let reference_pyramid = reference_pyramid.levels_for(32);
     let reference_plane = reference_pyramid.last().unwrap();
     let reference_scale = (1usize << (reference_pyramid.len() - 1)) as f64;
-    let target_pyramid = target.luminance.pyramid(16);
+    let target_pyramid = target_pyramid.levels_for(16);
     let wanted = reference_scale * scale;
     let target_level = (wanted.log2().round().max(0.0) as usize).min(target_pyramid.len() - 1);
     let target_plane = &target_pyramid[target_level];
@@ -1040,6 +1179,31 @@ mod tests {
 
         warp.visibility.fill(WarpVisibility::Occluded);
         assert_eq!(warp.visibility(4.0, 4.0), WarpVisibility::Occluded);
+    }
+
+    #[test]
+    fn combined_warp_sample_matches_individual_accessors() {
+        let mut warp = Warp::from_fn(16, 16, 8, |point| {
+            Some([point[0] * 1.25 + 2.0, point[1] * 0.75 - 1.0])
+        });
+        for (index, confidence) in warp.confidence.iter_mut().enumerate() {
+            *confidence = index as f32 / (warp.points.len() - 1) as f32;
+        }
+        warp.visibility.fill(WarpVisibility::Visible);
+        warp.visibility[0] = WarpVisibility::Occluded;
+
+        for point in [
+            [0.0, 0.0],
+            [3.25, 6.75],
+            [8.0, 8.0],
+            [15.9, 1.2],
+            [-1.0, 4.0],
+        ] {
+            let sample = warp.sample(point[0], point[1]);
+            assert_eq!(sample.mapped, warp.map(point[0], point[1]));
+            assert_eq!(sample.confidence, warp.confidence(point[0], point[1]));
+            assert_eq!(sample.visibility, warp.visibility(point[0], point[1]));
+        }
     }
 
     #[test]

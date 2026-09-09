@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::{
     align::ModuleAlignment,
     calibration::{CameraCalibration, IntrinsicsMode, ModuleState},
-    geometry::{CameraRefinement, ResolvedCamera},
+    geometry::{CameraRefinement, ResolvedCamera, ResolvedCameraTemplate},
     image::Plane,
     math::{self, Mat3, Vec2, Vec3, add, cross, dot, mul_vec, norm, scale, sub},
 };
@@ -542,6 +542,13 @@ struct TrackObservation {
     local_scale: f64,
     structure: f64,
     depth_reliability: Option<f64>,
+    prepared: std::sync::OnceLock<ObservationPrepared>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObservationPrepared {
+    sigma: f64,
+    inverse_covariance: [[f64; 2]; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -872,21 +879,15 @@ pub fn refine_capture_rig(
     // Obtain a fit-only epipolar initialization before alternating
     // triangulation and physical parameter updates. Validation tracks never
     // enter either optimization objective.
-    let (angular_candidate, _, initialization_iterations) = coordinate_optimize(
+    let (angular_candidate, _, initialization_iterations) = coordinate_optimize_rig(
         factory_parameters.clone(),
         &specs,
         options.max_iterations.min(4),
-        |parameters| {
-            epipolar_objective(
-                parameters,
-                &specs,
-                cameras,
-                reference_index,
-                &initial_fit,
-                intrinsics_mode,
-                options,
-            )
-        },
+        cameras,
+        &initial_fit,
+        intrinsics_mode,
+        options,
+        IncrementalObjectiveMode::Epipolar { reference_index },
     );
     // Retain the epipolar candidate only when it also improves the actual
     // finite-depth fit objective; otherwise the factory rig is the better BA
@@ -904,17 +905,16 @@ pub fn refine_capture_rig(
     } else {
         vec![0.0; specs.len()]
     };
-    let (mut parameters, _, bundle_iterations) =
-        coordinate_optimize(initialized, &specs, options.max_iterations, |parameters| {
-            objective(
-                parameters,
-                &specs,
-                cameras,
-                &initial_fit,
-                intrinsics_mode,
-                options,
-            )
-        });
+    let (mut parameters, _, bundle_iterations) = coordinate_optimize_rig(
+        initialized,
+        &specs,
+        options.max_iterations,
+        cameras,
+        &initial_fit,
+        intrinsics_mode,
+        options,
+        IncrementalObjectiveMode::Bundle,
+    );
     drop(initial_fit);
     let mut iterations = initialization_iterations + bundle_iterations;
     let mut membership_iterations = 0usize;
@@ -950,17 +950,16 @@ pub fn refine_capture_rig(
             };
         }
         let current_fit = fit_tracks.iter().collect::<Vec<_>>();
-        let (next_parameters, _, next_iterations) =
-            coordinate_optimize(parameters, &specs, options.max_iterations, |parameters| {
-                objective(
-                    parameters,
-                    &specs,
-                    cameras,
-                    &current_fit,
-                    intrinsics_mode,
-                    options,
-                )
-            });
+        let (next_parameters, _, next_iterations) = coordinate_optimize_rig(
+            parameters,
+            &specs,
+            options.max_iterations,
+            cameras,
+            &current_fit,
+            intrinsics_mode,
+            options,
+            IncrementalObjectiveMode::Bundle,
+        );
         parameters = next_parameters;
         iterations += next_iterations;
     }
@@ -1210,6 +1209,7 @@ struct PhysicalViewMatch {
     /// physical depth locus. Search/refinement bounds are relative to this
     /// proposal, not relative to the uncorrected factory projection.
     residual_proposal: Vec2,
+    epipolar_tangent: Option<Vec2>,
     local_scale: f64,
 }
 
@@ -1284,38 +1284,181 @@ fn sensor_to_luminance_coordinate(pixel: f64, level: usize) -> f32 {
     ((pixel - first_sensor_centre) * scale) as f32
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReferencePatchRays {
+    centre: crate::geometry::Ray,
+    left: crate::geometry::Ray,
+    right: crate::geometry::Ray,
+    above: crate::geometry::Ray,
+    below: crate::geometry::Ray,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReferenceZnccSample {
+    point: Vec2,
+    value: f32,
+    weight: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ReferenceZnccPatch {
+    samples: Vec<ReferenceZnccSample>,
+    weight_sum: f32,
+    sum_reference: f32,
+    sum_reference_sq: f32,
+}
+
+#[derive(Debug)]
+struct ResidualGrid {
+    values: [Vec2; 25],
+    len: usize,
+}
+
+impl ResidualGrid {
+    fn new() -> Self {
+        Self {
+            values: [[0.0; 2]; 25],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, value: Vec2) {
+        self.values[self.len] = value;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[Vec2] {
+        &self.values[..self.len]
+    }
+}
+
+#[derive(Debug, Default)]
+struct PhysicalMatchScratch {
+    sum_target: Vec<f32>,
+    sum_target_sq: Vec<f32>,
+    sum_product: Vec<f32>,
+    valid: Vec<bool>,
+}
+
+impl PhysicalMatchScratch {
+    fn prepare(&mut self, count: usize) {
+        self.sum_target.resize(count, 0.0);
+        self.sum_target_sq.resize(count, 0.0);
+        self.sum_product.resize(count, 0.0);
+        self.valid.resize(count, true);
+        self.sum_target.fill(0.0);
+        self.sum_target_sq.fill(0.0);
+        self.sum_product.fill(0.0);
+        self.valid.fill(true);
+    }
+}
+
+fn reference_patch_rays(reference_camera: &ResolvedCamera, centre: Vec2) -> ReferencePatchRays {
+    const DERIVATIVE_STEP: f64 = 2.0;
+    ReferencePatchRays {
+        centre: reference_camera.pixel_to_ray(centre),
+        left: reference_camera.pixel_to_ray([centre[0] - DERIVATIVE_STEP, centre[1]]),
+        right: reference_camera.pixel_to_ray([centre[0] + DERIVATIVE_STEP, centre[1]]),
+        above: reference_camera.pixel_to_ray([centre[0], centre[1] - DERIVATIVE_STEP]),
+        below: reference_camera.pixel_to_ray([centre[0], centre[1] + DERIVATIVE_STEP]),
+    }
+}
+
+fn prepare_reference_zncc_patch(
+    reference: &Plane,
+    centre: Vec2,
+    radius: usize,
+    pyramid_level: usize,
+) -> Option<ReferenceZnccPatch> {
+    let centre_reference = reference.sample(
+        sensor_to_luminance_coordinate(centre[0], pyramid_level),
+        sensor_to_luminance_coordinate(centre[1], pyramid_level),
+    )?;
+    let sensor_step = 1.0 / luminance_level_scale(pyramid_level);
+    let sigma = (radius as f32 * 0.75).max(1.0);
+    let mut samples = Vec::with_capacity((radius * 2 + 1).pow(2));
+    let mut weight_sum = 0.0f32;
+    let mut sum_reference = 0.0f32;
+    let mut sum_reference_sq = 0.0f32;
+    for dy in -(radius as isize)..=radius as isize {
+        for dx in -(radius as isize)..=radius as isize {
+            let point = [
+                centre[0] + dx as f64 * sensor_step,
+                centre[1] + dy as f64 * sensor_step,
+            ];
+            let value = reference.sample(
+                sensor_to_luminance_coordinate(point[0], pyramid_level),
+                sensor_to_luminance_coordinate(point[1], pyramid_level),
+            )?;
+            let distance_sq = (dx * dx + dy * dy) as f32;
+            let spatial = (-distance_sq / (2.0 * sigma * sigma)).exp();
+            let range = (-1.2 * (value - centre_reference).abs()).exp();
+            let weight = spatial * range;
+            weight_sum += weight;
+            sum_reference += weight * value;
+            sum_reference_sq += weight * value * value;
+            samples.push(ReferenceZnccSample {
+                point,
+                value,
+                weight,
+            });
+        }
+    }
+    (weight_sum > 1.0e-6).then_some(ReferenceZnccPatch {
+        samples,
+        weight_sum,
+        sum_reference,
+        sum_reference_sq,
+    })
+}
+
+#[inline]
+fn project_ray_to_surface(
+    ray: crate::geometry::Ray,
+    surface_point: Vec3,
+    surface_normal: Vec3,
+    target_camera: &ResolvedCamera,
+) -> Option<Vec2> {
+    let denominator = dot(ray.direction, surface_normal);
+    if denominator.abs() <= 1.0e-9 {
+        return None;
+    }
+    let distance = dot(sub(surface_point, ray.origin), surface_normal) / denominator;
+    if !distance.is_finite() || distance <= 0.0 {
+        return None;
+    }
+    target_camera.project(add(ray.origin, scale(ray.direction, distance)))
+}
+
+#[inline]
+fn project_reference_centre_at_depth(
+    centre_ray: crate::geometry::Ray,
+    target_camera: &ResolvedCamera,
+    depth: f64,
+) -> Option<Vec2> {
+    target_camera.project(add(centre_ray.origin, scale(centre_ray.direction, depth)))
+}
+
 /// A candidate depth is the correspondence model.  The source patch is lifted
 /// onto the local scene plane implied by that depth, then projected through the
 /// complete target camera model.  Unlike the legacy aligner, no homography or
 /// pre-existing image warp defines the match locus.
 fn physical_patch_projection(
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
+    rays: &ReferencePatchRays,
     centre: Vec2,
+    target_camera: &ResolvedCamera,
     depth: f64,
 ) -> Option<PhysicalPatchProjection> {
     const DERIVATIVE_STEP: f64 = 2.0;
-    let centre_ray = reference_camera.pixel_to_ray(centre);
-    let surface_point = add(centre_ray.origin, scale(centre_ray.direction, depth));
-    let surface_normal = centre_ray.direction;
-    let project = |point: Vec2| -> Option<Vec2> {
-        let ray = reference_camera.pixel_to_ray(point);
-        let denominator = dot(ray.direction, surface_normal);
-        if denominator.abs() <= 1.0e-9 {
-            return None;
-        }
-        let distance = dot(sub(surface_point, ray.origin), surface_normal) / denominator;
-        if !distance.is_finite() || distance <= 0.0 {
-            return None;
-        }
-        target_camera.project(add(ray.origin, scale(ray.direction, distance)))
-    };
-
-    let target_centre = project(centre)?;
-    let left = project([centre[0] - DERIVATIVE_STEP, centre[1]])?;
-    let right = project([centre[0] + DERIVATIVE_STEP, centre[1]])?;
-    let above = project([centre[0], centre[1] - DERIVATIVE_STEP])?;
-    let below = project([centre[0], centre[1] + DERIVATIVE_STEP])?;
+    let surface_point = add(rays.centre.origin, scale(rays.centre.direction, depth));
+    let surface_normal = rays.centre.direction;
+    let target_centre = project_reference_centre_at_depth(rays.centre, target_camera, depth)?;
+    let left = project_ray_to_surface(rays.left, surface_point, surface_normal, target_camera)?;
+    let right = project_ray_to_surface(rays.right, surface_point, surface_normal, target_camera)?;
+    let above = project_ray_to_surface(rays.above, surface_point, surface_normal, target_camera)?;
+    let below = project_ray_to_surface(rays.below, surface_point, surface_normal, target_camera)?;
     let derivative_scale = 1.0 / (2.0 * DERIVATIVE_STEP);
     Some(PhysicalPatchProjection {
         centre,
@@ -1337,69 +1480,102 @@ fn physical_patch_projection(
 /// target-camera observation that must triangulate coherently with the other
 /// views.
 fn physical_patch_zncc(
-    reference: &Plane,
     target: &Plane,
     projection: PhysicalPatchProjection,
-    centre: Vec2,
+    reference_patch: &ReferenceZnccPatch,
     residual: Vec2,
-    radius: usize,
     pyramid_level: usize,
 ) -> Option<f32> {
-    let centre_reference = reference.sample(
-        sensor_to_luminance_coordinate(centre[0], pyramid_level),
-        sensor_to_luminance_coordinate(centre[1], pyramid_level),
-    )?;
-    let sensor_step = 1.0 / luminance_level_scale(pyramid_level);
-    let sigma = (radius as f32 * 0.75).max(1.0);
-    let mut weight_sum = 0.0f32;
-    let mut sum_reference = 0.0f32;
     let mut sum_target = 0.0f32;
-    let mut sum_reference_sq = 0.0f32;
     let mut sum_target_sq = 0.0f32;
     let mut sum_product = 0.0f32;
-
-    for dy in -(radius as isize)..=radius as isize {
-        for dx in -(radius as isize)..=radius as isize {
-            let point = [
-                centre[0] + dx as f64 * sensor_step,
-                centre[1] + dy as f64 * sensor_step,
-            ];
-            let reference_value = reference.sample(
-                sensor_to_luminance_coordinate(point[0], pyramid_level),
-                sensor_to_luminance_coordinate(point[1], pyramid_level),
-            )?;
-            let mapped = projection.map(point);
-            let target_value = target.sample(
-                sensor_to_luminance_coordinate(mapped[0] + residual[0], pyramid_level),
-                sensor_to_luminance_coordinate(mapped[1] + residual[1], pyramid_level),
-            )?;
-            let distance_sq = (dx * dx + dy * dy) as f32;
-            let spatial = (-distance_sq / (2.0 * sigma * sigma)).exp();
-            let range = (-1.2 * (reference_value - centre_reference).abs()).exp();
-            let weight = spatial * range;
-            weight_sum += weight;
-            sum_reference += weight * reference_value;
-            sum_target += weight * target_value;
-            sum_reference_sq += weight * reference_value * reference_value;
-            sum_target_sq += weight * target_value * target_value;
-            sum_product += weight * reference_value * target_value;
-        }
+    for sample in &reference_patch.samples {
+        let mapped = projection.map(sample.point);
+        let target_value = target.sample(
+            sensor_to_luminance_coordinate(mapped[0] + residual[0], pyramid_level),
+            sensor_to_luminance_coordinate(mapped[1] + residual[1], pyramid_level),
+        )?;
+        sum_target += sample.weight * target_value;
+        sum_target_sq += sample.weight * target_value * target_value;
+        sum_product += sample.weight * sample.value * target_value;
     }
-    if weight_sum <= 1.0e-6 {
-        return None;
-    }
-    let covariance = sum_product - sum_reference * sum_target / weight_sum;
-    let reference_variance =
-        (sum_reference_sq - sum_reference * sum_reference / weight_sum).max(0.0);
-    let target_variance = (sum_target_sq - sum_target * sum_target / weight_sum).max(0.0);
+    let covariance =
+        sum_product - reference_patch.sum_reference * sum_target / reference_patch.weight_sum;
+    let reference_variance = (reference_patch.sum_reference_sq
+        - reference_patch.sum_reference * reference_patch.sum_reference
+            / reference_patch.weight_sum)
+        .max(0.0);
+    let target_variance =
+        (sum_target_sq - sum_target * sum_target / reference_patch.weight_sum).max(0.0);
     let denominator = (reference_variance * target_variance).sqrt();
     (denominator > 1.0e-8).then_some((covariance / denominator).clamp(-1.0, 1.0))
 }
 
+fn search_physical_patch_zncc(
+    target: &Plane,
+    projection: PhysicalPatchProjection,
+    reference_patch: &ReferenceZnccPatch,
+    proposal: Vec2,
+    offsets: &[Vec2],
+    pyramid_level: usize,
+    residual_radius: f64,
+    scratch: &mut PhysicalMatchScratch,
+) -> Option<(f32, f32, Vec2)> {
+    scratch.prepare(offsets.len());
+    for sample in &reference_patch.samples {
+        let mapped = projection.map(sample.point);
+        for (index, offset) in offsets.iter().enumerate() {
+            if !scratch.valid[index] {
+                continue;
+            }
+            let residual = [proposal[0] + offset[0], proposal[1] + offset[1]];
+            let Some(target_value) = target.sample(
+                sensor_to_luminance_coordinate(mapped[0] + residual[0], pyramid_level),
+                sensor_to_luminance_coordinate(mapped[1] + residual[1], pyramid_level),
+            ) else {
+                scratch.valid[index] = false;
+                continue;
+            };
+            scratch.sum_target[index] += sample.weight * target_value;
+            scratch.sum_target_sq[index] += sample.weight * target_value * target_value;
+            scratch.sum_product[index] += sample.weight * sample.value * target_value;
+        }
+    }
+    let reference_variance = (reference_patch.sum_reference_sq
+        - reference_patch.sum_reference * reference_patch.sum_reference
+            / reference_patch.weight_sum)
+        .max(0.0);
+    let mut best: Option<(f32, f32, Vec2)> = None;
+    for (index, offset) in offsets.iter().enumerate() {
+        if !scratch.valid[index] {
+            continue;
+        }
+        let sum_target = scratch.sum_target[index];
+        let covariance = scratch.sum_product[index]
+            - reference_patch.sum_reference * sum_target / reference_patch.weight_sum;
+        let target_variance = (scratch.sum_target_sq[index]
+            - sum_target * sum_target / reference_patch.weight_sum)
+            .max(0.0);
+        let denominator = (reference_variance * target_variance).sqrt();
+        if denominator <= 1.0e-8 {
+            continue;
+        }
+        let score = (covariance / denominator).clamp(-1.0, 1.0);
+        let penalty = ((offset[0] * offset[0] + offset[1] * offset[1]).sqrt()
+            / residual_radius.max(1.0)) as f32
+            * 0.001;
+        let objective = score - penalty;
+        let residual = [proposal[0] + offset[0], proposal[1] + offset[1]];
+        if best.is_none_or(|(best_objective, _, _)| objective > best_objective) {
+            best = Some((objective, score, residual));
+        }
+    }
+    best
+}
+
 fn physical_epipolar_tangent(
-    reference_camera: &ResolvedCamera,
+    centre_ray: crate::geometry::Ray,
     target_camera: &ResolvedCamera,
-    centre: Vec2,
     depth: f64,
     options: &RigRefinementOptions,
 ) -> Option<Vec2> {
@@ -1410,35 +1586,18 @@ fn physical_epipolar_tangent(
         / (options.physical_match_planes.saturating_sub(1).max(1) as f64);
     let a_inverse = (inverse - inverse_step).clamp(min_inverse, max_inverse);
     let b_inverse = (inverse + inverse_step).clamp(min_inverse, max_inverse);
-    match (
-        physical_patch_projection(reference_camera, target_camera, centre, 1.0 / a_inverse),
-        physical_patch_projection(reference_camera, target_camera, centre, 1.0 / b_inverse),
-    ) {
-        (Some(a), Some(b)) => {
-            let delta = [
-                b.target_centre[0] - a.target_centre[0],
-                b.target_centre[1] - a.target_centre[1],
-            ];
-            let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
-            (length > 1.0e-6).then_some([delta[0] / length, delta[1] / length])
-        }
-        _ => None,
-    }
+    let a = project_reference_centre_at_depth(centre_ray, target_camera, 1.0 / a_inverse)?;
+    let b = project_reference_centre_at_depth(centre_ray, target_camera, 1.0 / b_inverse)?;
+    let delta = [b[0] - a[0], b[1] - a[1]];
+    let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+    (length > 1.0e-6).then_some([delta[0] / length, delta[1] / length])
 }
 
-fn physical_localization_covariance(
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
-    centre: Vec2,
-    depth: f64,
-    options: &RigRefinementOptions,
-) -> [[f64; 2]; 2] {
+fn physical_localization_covariance(tangent: Option<Vec2>) -> [[f64; 2]; 2] {
     // The initial matcher deliberately has more freedom along the physical
     // depth locus than perpendicular to it. Preserve that anisotropy in the
     // persistent observation so BA does not treat both axes as equally known.
-    let Some(tangent) =
-        physical_epipolar_tangent(reference_camera, target_camera, centre, depth, options)
-    else {
+    let Some(tangent) = tangent else {
         return [[1.0, 0.0], [0.0, 1.0]];
     };
     let normal = [-tangent[1], tangent[0]];
@@ -1452,27 +1611,15 @@ fn physical_localization_covariance(
     })
 }
 
-fn epipolar_residual_grid(
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
-    centre: Vec2,
-    depth: f64,
-    radius: f64,
-    options: &RigRefinementOptions,
-) -> Vec<Vec2> {
+fn epipolar_residual_grid(tangent: Option<Vec2>, radius: f64) -> ResidualGrid {
+    let mut offsets = ResidualGrid::new();
     if !radius.is_finite() || radius <= 0.0 {
-        return vec![[0.0, 0.0]];
+        offsets.push([0.0, 0.0]);
+        return offsets;
     }
-    let tangent =
-        physical_epipolar_tangent(reference_camera, target_camera, centre, depth, options);
     let Some(tangent) = tangent else {
-        // At effectively infinite depth the epipolar curve can collapse to a
-        // point. Those observations still constrain orientation, so search a
-        // small 2-D bootstrap box rather than arbitrarily choosing one normal
-        // direction.
         let half = radius * 0.5;
         let coordinates = [-radius, -half, 0.0, half, radius];
-        let mut offsets = Vec::with_capacity(25);
         offsets.push([0.0, 0.0]);
         for dy in coordinates {
             for dx in coordinates {
@@ -1487,7 +1634,6 @@ fn epipolar_residual_grid(
     let tangential_tolerance = (radius / 8.0).clamp(1.0, 4.0);
     let normal_offsets = [-radius, -radius * 0.5, 0.0, radius * 0.5, radius];
     let tangent_offsets = [-tangential_tolerance, 0.0, tangential_tolerance];
-    let mut offsets = Vec::with_capacity(normal_offsets.len() * tangent_offsets.len());
     offsets.push([0.0, 0.0]);
     for normal_distance in normal_offsets {
         for tangent_distance in tangent_offsets {
@@ -1510,12 +1656,9 @@ fn epipolar_residual_grid(
 /// parallax signal that the physical matcher is meant to estimate.
 fn measured_epipolar_residual_proposal(
     alignment: &ModuleAlignment,
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
     projection: PhysicalPatchProjection,
     centre: Vec2,
-    depth: f64,
-    options: &RigRefinementOptions,
+    tangent: Option<Vec2>,
 ) -> Vec2 {
     let Some(measured) = alignment.warp.map(centre[0] as f32, centre[1] as f32) else {
         return [0.0, 0.0];
@@ -1527,8 +1670,6 @@ fn measured_epipolar_residual_proposal(
     if !delta[0].is_finite() || !delta[1].is_finite() {
         return [0.0, 0.0];
     }
-    let tangent =
-        physical_epipolar_tangent(reference_camera, target_camera, centre, depth, options);
     perpendicular_residual_proposal(delta, tangent)
 }
 
@@ -1545,9 +1686,9 @@ fn perpendicular_residual_proposal(delta: Vec2, tangent: Option<Vec2>) -> Vec2 {
 }
 
 fn match_physical_view_at_depth(
-    reference: &Plane,
     target: &Plane,
-    reference_camera: &ResolvedCamera,
+    reference_rays: &ReferencePatchRays,
+    reference_patch: &ReferenceZnccPatch,
     target_camera: &ResolvedCamera,
     measured_alignment: &ModuleAlignment,
     target_index: usize,
@@ -1555,57 +1696,26 @@ fn match_physical_view_at_depth(
     depth: f64,
     pyramid_level: usize,
     options: &RigRefinementOptions,
+    scratch: &mut PhysicalMatchScratch,
 ) -> Option<PhysicalViewMatch> {
-    let projection = physical_patch_projection(reference_camera, target_camera, centre, depth)?;
-    let measured_proposal = measured_epipolar_residual_proposal(
-        measured_alignment,
-        reference_camera,
-        target_camera,
-        projection,
-        centre,
-        depth,
-        options,
-    );
-    let offsets = epipolar_residual_grid(
-        reference_camera,
-        target_camera,
-        centre,
-        depth,
-        options.physical_match_residual_radius_px,
-        options,
-    );
-    let search = |proposal: Vec2| {
-        let mut best: Option<(f32, f32, Vec2)> = None;
-        for &offset in &offsets {
-            let residual = [proposal[0] + offset[0], proposal[1] + offset[1]];
-            let Some(score) = physical_patch_zncc(
-                reference,
-                target,
-                projection,
-                centre,
-                residual,
-                options.physical_match_patch_radius,
-                pyramid_level,
-            ) else {
-                continue;
-            };
-            // Equal-score plateaus prefer the active proposal rather than the
-            // edge of its local bootstrap search band.
-            let penalty = ((offset[0] * offset[0] + offset[1] * offset[1]).sqrt()
-                / options.physical_match_residual_radius_px.max(1.0))
-                as f32
-                * 0.001;
-            let objective = score - penalty;
-            if best.is_none_or(|(best_objective, _, _)| objective > best_objective) {
-                best = Some((objective, score, residual));
-            }
-        }
-        best
+    let projection = physical_patch_projection(reference_rays, centre, target_camera, depth)?;
+    let tangent = physical_epipolar_tangent(reference_rays.centre, target_camera, depth, options);
+    let measured_proposal =
+        measured_epipolar_residual_proposal(measured_alignment, projection, centre, tangent);
+    let offsets = epipolar_residual_grid(tangent, options.physical_match_residual_radius_px);
+    let mut search = |proposal: Vec2| {
+        search_physical_patch_zncc(
+            target,
+            projection,
+            reference_patch,
+            proposal,
+            offsets.as_slice(),
+            pyramid_level,
+            options.physical_match_residual_radius_px,
+            scratch,
+        )
     };
 
-    // Preserve the original factory-centred result whenever it is already a
-    // supported match. The measured proposal is additive recovery for views
-    // outside that band, never a replacement for known-good factory evidence.
     let factory = search([0.0, 0.0]);
     let (score, residual, residual_proposal) = if let Some((_, score, residual)) = factory
         && score >= options.physical_match_min_score
@@ -1627,24 +1737,24 @@ fn match_physical_view_at_depth(
         ],
         residual,
         residual_proposal,
+        epipolar_tangent: tangent,
         local_scale: projection.local_scale(),
     })
 }
 
 fn refine_physical_view_match(
-    reference_input: &RigCameraInput<'_>,
     target_input: &RigCameraInput<'_>,
-    reference_camera: &ResolvedCamera,
+    reference_rays: &ReferencePatchRays,
+    reference_patch: &ReferenceZnccPatch,
     target_camera: &ResolvedCamera,
     centre: Vec2,
     depth: f64,
     mut matched: PhysicalViewMatch,
     options: &RigRefinementOptions,
 ) -> PhysicalViewMatch {
-    let (Some(reference), Some(target), Some(projection)) = (
-        reference_input.luminance,
+    let (Some(target), Some(projection)) = (
         target_input.luminance,
-        physical_patch_projection(reference_camera, target_camera, centre, depth),
+        physical_patch_projection(reference_rays, centre, target_camera, depth),
     ) else {
         return matched;
     };
@@ -1662,15 +1772,8 @@ fn refine_physical_view_match(
             {
                 continue;
             }
-            let Some(score) = physical_patch_zncc(
-                reference,
-                target,
-                projection,
-                centre,
-                residual,
-                options.physical_match_patch_radius,
-                0,
-            ) else {
+            let Some(score) = physical_patch_zncc(target, projection, reference_patch, residual, 0)
+            else {
                 continue;
             };
             if score > matched.score {
@@ -1723,18 +1826,19 @@ fn evaluate_physical_depth_candidate(
     reference_index: usize,
     resolved: &[ResolvedCamera],
     measured_alignments: &[ModuleAlignment],
+    reference_rays: &ReferencePatchRays,
+    reference_patch: &ReferenceZnccPatch,
     centre: Vec2,
     label: usize,
     inverse_depth: f64,
     pyramid_level: usize,
     options: &RigRefinementOptions,
+    scratch: &mut PhysicalMatchScratch,
 ) -> Option<PhysicalDepthCandidate> {
     if !inverse_depth.is_finite() || inverse_depth <= 0.0 {
         return None;
     }
     let depth = 1.0 / inverse_depth;
-    let reference =
-        pyramids[reference_index].level(cameras[reference_index].luminance, pyramid_level)?;
     let mut matches = Vec::new();
     for target_index in 0..cameras.len() {
         if target_index == reference_index
@@ -1751,9 +1855,9 @@ fn evaluate_physical_depth_candidate(
             continue;
         };
         if let Some(matched) = match_physical_view_at_depth(
-            reference,
             target,
-            &resolved[reference_index],
+            reference_rays,
+            reference_patch,
             &resolved[target_index],
             &measured_alignments[target_index],
             target_index,
@@ -1761,6 +1865,7 @@ fn evaluate_physical_depth_candidate(
             depth,
             pyramid_level,
             options,
+            scratch,
         ) {
             matches.push(matched);
         }
@@ -1863,17 +1968,35 @@ fn prune_track_observations(
         return None;
     }
     let original_observations = track.observations.len();
+    let mut rays = Vec::with_capacity(track.observations.len());
+    fill_observation_rays(&track.observations, cameras, &mut rays);
+    let mut terms = track
+        .observations
+        .iter()
+        .zip(&rays)
+        .map(|(observation, &ray)| triangulation_normal_term(observation, ray))
+        .collect::<Vec<_>>();
+    let mut normal = [[0.0; 3]; 3];
+    let mut rhs = [0.0; 3];
+    for ((observation, &term), _) in track.observations.iter().zip(&terms).zip(&rays) {
+        add_triangulation_term(
+            &mut normal,
+            &mut rhs,
+            term,
+            observation_balance(observation, track.observations.len()),
+        );
+    }
     loop {
-        let triangulated = triangulate(&track.observations, cameras, options)?;
-        if !triangulation_has_positive_depth(&track.observations, cameras, triangulated.point) {
+        let triangulated = triangulate_normal_system(&rays, normal, rhs, options)?;
+        if !triangulation_has_positive_depth_with_rays(&rays, triangulated.point) {
             return None;
         }
         let mut all_consistent = true;
         let mut worst_target: Option<(usize, f64)> = None;
-        for (index, observation) in track.observations.iter().enumerate() {
-            let projected = project_observation(
+        for (index, (observation, &ray)) in track.observations.iter().zip(&rays).enumerate() {
+            let projected = project_observation_with_ray(
                 &cameras[observation.camera],
-                observation,
+                ray,
                 triangulated.point,
             )?;
             let pixel_residual = [
@@ -1899,7 +2022,20 @@ fn prune_track_observations(
             return None;
         }
         let (worst_index, _) = worst_target?;
+
+        // Target observations always carry unit balance. Removing one also
+        // reduces every fixed-gauge observation's balance by exactly one, so
+        // update the accumulated 3x3 triangulation system instead of rebuilding
+        // it from all remaining observations.
+        add_triangulation_term(&mut normal, &mut rhs, terms[worst_index], -1.0);
+        for (index, observation) in track.observations.iter().enumerate() {
+            if index != worst_index && observation.fixed_gauge {
+                add_triangulation_term(&mut normal, &mut rhs, terms[index], -1.0);
+            }
+        }
         track.observations.remove(worst_index);
+        rays.remove(worst_index);
+        terms.remove(worst_index);
     }
 }
 
@@ -1940,6 +2076,7 @@ fn update_fit_track_membership(
 /// refined back to the native matching level. A bounded residual band
 /// bootstraps capture-specific calibration error, but no homography controls
 /// the search or decides which observations are legal.
+#[cfg(test)]
 fn maximum_projected_depth_step(
     cameras: &[RigCameraInput<'_>],
     reference_index: usize,
@@ -1998,27 +2135,79 @@ fn physical_depth_refinement_levels(
 ) -> (usize, f64) {
     let min_inverse = 1.0 / options.physical_match_far_depth;
     let max_inverse = 1.0 / options.physical_match_near_depth;
-    let mut levels = 0usize;
     let maximum = available_levels.min(options.physical_match_max_depth_refinements);
-    loop {
-        let intervals = options
-            .physical_match_planes
-            .saturating_sub(1)
-            .saturating_mul(1usize << levels);
-        let projected_step = maximum_projected_depth_step(
-            cameras,
-            reference_index,
-            resolved,
-            centre,
-            intervals,
-            min_inverse,
-            max_inverse,
-        );
-        if projected_step <= options.physical_match_max_projected_step_px || levels >= maximum {
-            return (levels, projected_step);
-        }
-        levels += 1;
+    let coarse_intervals = options.physical_match_planes.saturating_sub(1);
+    if coarse_intervals == 0 {
+        return (0, f64::INFINITY);
     }
+    let reference_ray = resolved[reference_index].pixel_to_ray(centre);
+    let active_targets = (0..cameras.len())
+        .filter(|&target_index| {
+            target_index != reference_index
+                && cameras[target_index].match_evidence_enabled
+                && cameras[target_index].luminance.is_some()
+                && cameras[target_index].calibration.is_some()
+                && cameras[target_index].state.is_some()
+        })
+        .collect::<Vec<_>>();
+
+    let project = |target_index: usize, t: f64| {
+        let inverse_depth = min_inverse + t * (max_inverse - min_inverse);
+        let point = add(
+            reference_ray.origin,
+            scale(reference_ray.direction, 1.0 / inverse_depth),
+        );
+        resolved[target_index]
+            .project(point)
+            .filter(|pixel| resolved[target_index].contains(*pixel))
+    };
+
+    // Start with the coarse grid, then insert only the new midpoint samples at
+    // each refinement. Previously projected depth hypotheses are retained.
+    let mut target_samples = active_targets
+        .iter()
+        .map(|&target_index| {
+            (0..=coarse_intervals)
+                .map(|index| project(target_index, index as f64 / coarse_intervals as f64))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut intervals = coarse_intervals;
+    for level in 0..=maximum {
+        let mut maximum_step = 0.0f64;
+        for samples in &target_samples {
+            let mut previous: Option<Vec2> = None;
+            for &sample in samples {
+                if let (Some(a), Some(b)) = (previous, sample) {
+                    let delta = [b[0] - a[0], b[1] - a[1]];
+                    maximum_step = maximum_step.max(dot2(delta, delta).sqrt());
+                }
+                previous = sample;
+            }
+        }
+        if maximum_step <= options.physical_match_max_projected_step_px || level >= maximum {
+            return (level, maximum_step);
+        }
+
+        let next_intervals = intervals.saturating_mul(2);
+        for (target_slot, &target_index) in active_targets.iter().enumerate() {
+            let old = std::mem::take(&mut target_samples[target_slot]);
+            let mut refined = Vec::with_capacity(next_intervals + 1);
+            for (index, sample) in old.into_iter().enumerate() {
+                refined.push(sample);
+                if index < intervals {
+                    let midpoint_index = index * 2 + 1;
+                    refined.push(project(
+                        target_index,
+                        midpoint_index as f64 / next_intervals as f64,
+                    ));
+                }
+            }
+            target_samples[target_slot] = refined;
+        }
+        intervals = next_intervals;
+    }
+    unreachable!("refinement loop always returns at maximum level")
 }
 
 fn separated_depth_beam(
@@ -2047,9 +2236,12 @@ fn hierarchical_physical_depth_candidates(
     reference_index: usize,
     resolved: &[ResolvedCamera],
     measured_alignments: &[ModuleAlignment],
+    reference_rays: &ReferencePatchRays,
+    reference_patches: &[Option<ReferenceZnccPatch>],
     centre: Vec2,
     available_levels: usize,
     options: &RigRefinementOptions,
+    scratch: &mut PhysicalMatchScratch,
 ) -> (Vec<PhysicalDepthCandidate>, usize, usize, f64) {
     let (refinement_levels, final_projected_step) = physical_depth_refinement_levels(
         cameras,
@@ -2064,6 +2256,14 @@ fn hierarchical_physical_depth_candidates(
     let coarse_intervals = options.physical_match_planes - 1;
     let mut evaluated = 0usize;
     let mut candidates = Vec::with_capacity(options.physical_match_planes);
+    let Some(reference_patch) = reference_patches[refinement_levels].as_ref() else {
+        return (
+            Vec::new(),
+            evaluated,
+            refinement_levels,
+            final_projected_step,
+        );
+    };
     for label in 0..=coarse_intervals {
         let t = label as f64 / coarse_intervals as f64;
         let inverse_depth = min_inverse + t * (max_inverse - min_inverse);
@@ -2074,11 +2274,14 @@ fn hierarchical_physical_depth_candidates(
             reference_index,
             resolved,
             measured_alignments,
+            reference_rays,
+            reference_patch,
             centre,
             label,
             inverse_depth,
             refinement_levels,
             options,
+            scratch,
         ) {
             candidates.push(candidate);
         }
@@ -2095,18 +2298,26 @@ fn hierarchical_physical_depth_candidates(
             );
         }
         let intervals = coarse_intervals.saturating_mul(1usize << refinement);
-        let mut labels = BTreeMap::<usize, ()>::new();
+        let mut labels = Vec::<usize>::with_capacity(beam.len() * 5);
         for candidate in beam {
             let centre_label = candidate.label.saturating_mul(2);
             let first = centre_label.saturating_sub(2);
             let last = centre_label.saturating_add(2).min(intervals);
-            for label in first..=last {
-                labels.insert(label, ());
-            }
+            labels.extend(first..=last);
         }
+        labels.sort_unstable();
+        labels.dedup();
         candidates = Vec::with_capacity(labels.len());
         let pyramid_level = refinement_levels - refinement;
-        for label in labels.into_keys() {
+        let Some(reference_patch) = reference_patches[pyramid_level].as_ref() else {
+            return (
+                Vec::new(),
+                evaluated,
+                refinement_levels,
+                final_projected_step,
+            );
+        };
+        for label in labels {
             let t = label as f64 / intervals as f64;
             let inverse_depth = min_inverse + t * (max_inverse - min_inverse);
             evaluated += 1;
@@ -2116,11 +2327,14 @@ fn hierarchical_physical_depth_candidates(
                 reference_index,
                 resolved,
                 measured_alignments,
+                reference_rays,
+                reference_patch,
                 centre,
                 label,
                 inverse_depth,
                 pyramid_level,
                 options,
+                scratch,
             ) {
                 candidates.push(candidate);
             }
@@ -2161,8 +2375,28 @@ fn build_physical_track_chunk(
     let mut rejected_insufficient_views = 0usize;
     let mut rejected_observations = 0usize;
     let mut rejected_tracks = 0usize;
+    let mut match_scratch = PhysicalMatchScratch::default();
 
     for &(centre, structure) in candidates {
+        let reference_rays = reference_patch_rays(reference_camera, centre);
+        let reference_patches = (0..=available_pyramid_levels)
+            .map(|level| {
+                pyramids[reference_index]
+                    .level(cameras[reference_index].luminance, level)
+                    .and_then(|reference| {
+                        prepare_reference_zncc_patch(
+                            reference,
+                            centre,
+                            options.physical_match_patch_radius,
+                            level,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if reference_patches.first().and_then(Option::as_ref).is_none() {
+            rejected_no_supported_depth += 1;
+            continue;
+        }
         let (mut depth_candidates, evaluated, refinement_levels, projected_step) =
             hierarchical_physical_depth_candidates(
                 cameras,
@@ -2170,9 +2404,12 @@ fn build_physical_track_chunk(
                 reference_index,
                 resolved,
                 measured_alignments,
+                &reference_rays,
+                &reference_patches,
                 centre,
                 available_pyramid_levels,
                 options,
+                &mut match_scratch,
             );
         depth_hypotheses += evaluated;
         max_depth_refinement_levels = max_depth_refinement_levels.max(refinement_levels);
@@ -2208,12 +2445,15 @@ fn build_physical_track_chunk(
             local_scale: 1.0,
             structure: f64::from(structure),
             depth_reliability: Some(f64::from(depth_reliability)),
+            prepared: Default::default(),
         });
         for matched in best.matches {
             let matched = refine_physical_view_match(
-                &cameras[reference_index],
                 &cameras[matched.camera],
-                reference_camera,
+                &reference_rays,
+                reference_patches[0]
+                    .as_ref()
+                    .expect("native reference patch prepared"),
                 &resolved[matched.camera],
                 centre,
                 best.depth,
@@ -2229,18 +2469,13 @@ fn build_physical_track_chunk(
                 camera: matched.camera,
                 pixel: matched.target_pixel,
                 bootstrap_residual_proposal: matched.residual_proposal,
-                localization_covariance: physical_localization_covariance(
-                    reference_camera,
-                    &resolved[matched.camera],
-                    centre,
-                    best.depth,
-                    options,
-                ),
+                localization_covariance: physical_localization_covariance(matched.epipolar_tangent),
                 fixed_gauge: false,
                 confidence: f64::from(matched.score),
                 local_scale: matched.local_scale,
                 structure: f64::from(structure),
                 depth_reliability: Some(f64::from(depth_reliability)),
+                prepared: Default::default(),
             });
         }
         if track_observations.len() < options.physical_match_min_views.max(2) {
@@ -2281,6 +2516,32 @@ fn build_physical_track_chunk(
         rejected_observations,
         rejected_tracks,
     }
+}
+
+fn merge_physical_track_build(combined: &mut PhysicalTrackBuild, mut chunk: PhysicalTrackBuild) {
+    combined.tracks.append(&mut chunk.tracks);
+    combined.observations += chunk.observations;
+    combined.candidates += chunk.candidates;
+    combined.depth_hypotheses += chunk.depth_hypotheses;
+    combined.max_depth_refinement_levels = combined
+        .max_depth_refinement_levels
+        .max(chunk.max_depth_refinement_levels);
+    if combined.depth_refinement_histogram.len() < chunk.depth_refinement_histogram.len() {
+        combined
+            .depth_refinement_histogram
+            .resize(chunk.depth_refinement_histogram.len(), 0);
+    }
+    for (level, count) in chunk.depth_refinement_histogram.into_iter().enumerate() {
+        combined.depth_refinement_histogram[level] += count;
+    }
+    combined.observed_max_projected_step_px = combined
+        .observed_max_projected_step_px
+        .max(chunk.observed_max_projected_step_px);
+    combined.rejected_no_supported_depth += chunk.rejected_no_supported_depth;
+    combined.rejected_ambiguous_depth += chunk.rejected_ambiguous_depth;
+    combined.rejected_insufficient_views += chunk.rejected_insufficient_views;
+    combined.rejected_observations += chunk.rejected_observations;
+    combined.rejected_tracks += chunk.rejected_tracks;
 }
 
 fn build_physical_tracks(
@@ -2343,23 +2604,36 @@ fn build_physical_tracks(
         options.threads.min(automatic)
     }
     .clamp(1, candidates.len());
-    let chunk_size = candidates.len().div_ceil(workers);
+    let dynamic_chunk = 32usize.min(candidates.len()).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let pyramids = &pyramids;
     let chunks = thread::scope(|scope| {
-        candidates
-            .chunks(chunk_size)
-            .map(|chunk| {
+        (0..workers)
+            .map(|_| {
+                let next = &next;
+                let candidates = &candidates;
                 scope.spawn(move || {
-                    build_physical_track_chunk(
-                        chunk,
-                        cameras,
-                        pyramids,
-                        reference_index,
-                        resolved,
-                        measured_alignments,
-                        available_pyramid_levels,
-                        options,
-                    )
+                    let mut local = PhysicalTrackBuild::default();
+                    loop {
+                        let start =
+                            next.fetch_add(dynamic_chunk, std::sync::atomic::Ordering::Relaxed);
+                        if start >= candidates.len() {
+                            break;
+                        }
+                        let end = (start + dynamic_chunk).min(candidates.len());
+                        let chunk = build_physical_track_chunk(
+                            &candidates[start..end],
+                            cameras,
+                            pyramids,
+                            reference_index,
+                            resolved,
+                            measured_alignments,
+                            available_pyramid_levels,
+                            options,
+                        );
+                        merge_physical_track_build(&mut local, chunk);
+                    }
+                    local
                 })
             })
             .collect::<Vec<_>>()
@@ -2368,31 +2642,15 @@ fn build_physical_tracks(
             .collect::<Vec<_>>()
     });
     let mut combined = PhysicalTrackBuild::default();
-    for mut chunk in chunks {
-        combined.tracks.append(&mut chunk.tracks);
-        combined.observations += chunk.observations;
-        combined.candidates += chunk.candidates;
-        combined.depth_hypotheses += chunk.depth_hypotheses;
-        combined.max_depth_refinement_levels = combined
-            .max_depth_refinement_levels
-            .max(chunk.max_depth_refinement_levels);
-        if combined.depth_refinement_histogram.len() < chunk.depth_refinement_histogram.len() {
-            combined
-                .depth_refinement_histogram
-                .resize(chunk.depth_refinement_histogram.len(), 0);
-        }
-        for (level, count) in chunk.depth_refinement_histogram.into_iter().enumerate() {
-            combined.depth_refinement_histogram[level] += count;
-        }
-        combined.observed_max_projected_step_px = combined
-            .observed_max_projected_step_px
-            .max(chunk.observed_max_projected_step_px);
-        combined.rejected_no_supported_depth += chunk.rejected_no_supported_depth;
-        combined.rejected_ambiguous_depth += chunk.rejected_ambiguous_depth;
-        combined.rejected_insufficient_views += chunk.rejected_insufficient_views;
-        combined.rejected_observations += chunk.rejected_observations;
-        combined.rejected_tracks += chunk.rejected_tracks;
+    for chunk in chunks {
+        merge_physical_track_build(&mut combined, chunk);
     }
+    // Dynamic scheduling changes completion order only. Restore the original
+    // spatial candidate order before any deterministic fit/validation split or
+    // floating-point accumulation consumes the tracks.
+    combined
+        .tracks
+        .sort_by_key(|track| (track.key[1], track.key[0]));
     combined
 }
 
@@ -2462,6 +2720,7 @@ fn build_tracks(
                     local_scale: 1.0,
                     structure: f64::from(correspondence.structure),
                     depth_reliability: correspondence.depth_reliability.map(f64::from),
+                    prepared: Default::default(),
                 }]
             });
             if observations
@@ -2478,6 +2737,7 @@ fn build_tracks(
                     local_scale: f64::from(correspondence.local_scale),
                     structure: f64::from(correspondence.structure),
                     depth_reliability: correspondence.depth_reliability.map(f64::from),
+                    prepared: Default::default(),
                 });
             }
         }
@@ -2596,50 +2856,107 @@ fn parameter_name(kind: ParameterKind) -> String {
 /// moving the track point. Unstable gated tracks get a zero derivative while
 /// retaining fixed row correspondence between all parameter columns.
 fn observability_jacobian_column(
-    minus_parameters: &[f64],
-    plus_parameters: &[f64],
+    parameter_index: usize,
     specs: &[ParameterSpec],
     parameter: &ParameterSpec,
     difference_step: f64,
-    inputs: &[RigCameraInput<'_>],
+    _inputs: &[RigCameraInput<'_>],
     tracks: &[&Track],
+    base_cameras: &[ResolvedCamera],
+    base_templates: &[ResolvedCameraTemplate],
     intrinsics_mode: IntrinsicsMode,
     options: &RigRefinementOptions,
 ) -> Option<Vec<f64>> {
-    let minus_refinements = refinements_from_parameters(inputs.len(), minus_parameters, specs);
-    let plus_refinements = refinements_from_parameters(inputs.len(), plus_parameters, specs);
-    let minus_cameras = resolve_cameras(inputs, &minus_refinements, intrinsics_mode)?;
-    let plus_cameras = resolve_cameras(inputs, &plus_refinements, intrinsics_mode)?;
-    let mut column = Vec::new();
+    let zero = vec![0.0; specs.len()];
+    let minus_refinement = refinement_for_camera(
+        parameter.camera,
+        &zero,
+        specs,
+        Some((parameter_index, -difference_step)),
+    );
+    let plus_refinement = refinement_for_camera(
+        parameter.camera,
+        &zero,
+        specs,
+        Some((parameter_index, difference_step)),
+    );
+    let _ = intrinsics_mode;
+    let minus_camera = base_templates[parameter.camera]
+        .resolve(&minus_refinement)
+        .ok()?;
+    let plus_camera = base_templates[parameter.camera]
+        .resolve(&plus_refinement)
+        .ok()?;
+
+    // Preserve fixed row correspondence for correlation testing, but only
+    // evaluate tracks that actually observe the perturbed camera. All other
+    // rows are mathematically zero for this column.
+    let total_observations = tracks
+        .iter()
+        .map(|track| track.observations.len())
+        .sum::<usize>();
+    let mut minus_projected = Vec::<Option<Vec2>>::with_capacity(total_observations);
+    let mut cameras = base_cameras.to_vec();
+    cameras[parameter.camera] = minus_camera;
+    let mut rays = Vec::new();
     for track in tracks {
-        let (Some(minus_point), Some(plus_point)) = (
-            triangulate(&track.observations, &minus_cameras, options),
-            triangulate(&track.observations, &plus_cameras, options),
-        ) else {
-            column.extend(std::iter::repeat_n(0.0, track.observations.len() * 2));
+        if !track
+            .observations
+            .iter()
+            .any(|observation| observation.camera == parameter.camera)
+        {
+            minus_projected.extend(std::iter::repeat_n(None, track.observations.len()));
+            continue;
+        }
+        let Some(triangulated) =
+            triangulate_with_rays(&track.observations, &cameras, options, &mut rays)
+        else {
+            minus_projected.extend(std::iter::repeat_n(None, track.observations.len()));
             continue;
         };
-        for observation in &track.observations {
-            let sigma = observation_sigma(observation).max(1.0e-6);
-            let (Some(minus), Some(plus)) = (
-                project_observation(
-                    &minus_cameras[observation.camera],
-                    observation,
-                    minus_point.point,
-                ),
-                project_observation(
-                    &plus_cameras[observation.camera],
-                    observation,
-                    plus_point.point,
-                ),
-            ) else {
-                column.extend([0.0, 0.0]);
-                continue;
-            };
-            let scale = parameter.prior_sigma / (2.0 * difference_step * sigma);
-            column.push((plus[0] - minus[0]) * scale);
-            column.push((plus[1] - minus[1]) * scale);
+        for (observation, &ray) in track.observations.iter().zip(&rays) {
+            minus_projected.push(project_observation_with_ray(
+                &cameras[observation.camera],
+                ray,
+                triangulated.point,
+            ));
         }
+    }
+
+    cameras[parameter.camera] = plus_camera;
+    let mut column = Vec::with_capacity(total_observations * 2);
+    let mut minus_index = 0usize;
+    for track in tracks {
+        if !track
+            .observations
+            .iter()
+            .any(|observation| observation.camera == parameter.camera)
+        {
+            column.extend(std::iter::repeat_n(0.0, track.observations.len() * 2));
+            minus_index += track.observations.len();
+            continue;
+        }
+        let Some(triangulated) =
+            triangulate_with_rays(&track.observations, &cameras, options, &mut rays)
+        else {
+            column.extend(std::iter::repeat_n(0.0, track.observations.len() * 2));
+            minus_index += track.observations.len();
+            continue;
+        };
+        for (local_index, (observation, &ray)) in track.observations.iter().zip(&rays).enumerate() {
+            let minus = minus_projected[minus_index + local_index];
+            let plus =
+                project_observation_with_ray(&cameras[observation.camera], ray, triangulated.point);
+            let sigma = observation_sigma(observation).max(1.0e-6);
+            if let (Some(minus), Some(plus)) = (minus, plus) {
+                let scale = parameter.prior_sigma / (2.0 * difference_step * sigma);
+                column.push((plus[0] - minus[0]) * scale);
+                column.push((plus[1] - minus[1]) * scale);
+            } else {
+                column.extend([0.0, 0.0]);
+            }
+        }
+        minus_index += track.observations.len();
     }
     (!column.is_empty()).then_some(column)
 }
@@ -2680,22 +2997,47 @@ fn filter_observable_parameter_specs(
         return (Vec::new(), Vec::new());
     }
     let zero = vec![0.0; candidates.len()];
+    let zero_refinements = refinements_from_parameters(inputs.len(), &zero, candidates);
+    let base_templates = inputs
+        .iter()
+        .map(|input| {
+            ResolvedCameraTemplate::new(input.calibration?, input.state?, intrinsics_mode).ok()
+        })
+        .collect::<Option<Vec<_>>>();
+    let base_cameras = base_templates.as_ref().and_then(|templates| {
+        templates
+            .iter()
+            .zip(&zero_refinements)
+            .map(|(template, refinement)| template.resolve(refinement).ok())
+            .collect::<Option<Vec<_>>>()
+    });
+    let (Some(base_templates), Some(base_cameras)) = (base_templates, base_cameras) else {
+        let reports = candidates
+            .iter()
+            .map(|spec| RigParameterObservabilityReport {
+                camera: inputs[spec.camera].name.to_owned(),
+                parameter: parameter_name(spec.kind),
+                sensitivity_rms: 0.0,
+                max_correlation: 0.0,
+                optimized: false,
+                rejection_reason: Some("factory camera model could not be resolved".to_owned()),
+            })
+            .collect();
+        return (Vec::new(), reports);
+    };
     let mut columns = Vec::with_capacity(candidates.len());
     let mut sensitivities = Vec::with_capacity(candidates.len());
     for (index, spec) in candidates.iter().enumerate() {
         let step = spec.difference_step.max(1.0e-6);
-        let mut minus = zero.clone();
-        let mut plus = zero.clone();
-        minus[index] = -step;
-        plus[index] = step;
         let column = observability_jacobian_column(
-            &minus,
-            &plus,
+            index,
             candidates,
             spec,
             step,
             inputs,
             tracks,
+            &base_cameras,
+            &base_templates,
             intrinsics_mode,
             options,
         )
@@ -2834,26 +3176,379 @@ fn refinements_from_parameters(
         .collect()
 }
 
-fn coordinate_optimize(
-    mut parameters: Vec<f64>,
+fn refinement_for_camera(
+    camera: usize,
+    parameters: &[f64],
     specs: &[ParameterSpec],
+    override_parameter: Option<(usize, f64)>,
+) -> CameraRefinement {
+    let mut orientation = [0.0; 3];
+    let mut mirror = 0.0;
+    let mut center = [0.0; 3];
+    let mut sensor = [0.0; 2];
+    for (index, (&stored, spec)) in parameters.iter().zip(specs).enumerate() {
+        if spec.camera != camera {
+            continue;
+        }
+        let value = override_parameter
+            .filter(|(parameter, _)| *parameter == index)
+            .map_or(stored, |(_, value)| value);
+        match spec.kind {
+            ParameterKind::Orientation(axis) => orientation[axis] = value,
+            ParameterKind::Mirror => mirror = value,
+            ParameterKind::Center(axis) => center[axis] = value,
+            ParameterKind::Sensor(axis) => sensor[axis] = value,
+        }
+    }
+    CameraRefinement {
+        mirror_angle_offset_degrees: mirror,
+        orientation_offset_degrees: (orientation != [0.0; 3]).then_some(orientation),
+        center_offset_world: (center != [0.0; 3]).then_some(center),
+        sensor_offset_px: (sensor != [0.0; 2]).then_some(sensor),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IncrementalObjectiveMode {
+    Epipolar { reference_index: usize },
+    Bundle,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrackObjectiveContribution {
+    cost: f64,
+    samples: usize,
+}
+
+fn bundle_track_contribution(
+    track: &Track,
+    cameras: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+    rays: &mut Vec<crate::geometry::Ray>,
+) -> TrackObjectiveContribution {
+    let Some(triangulated) = triangulate_with_rays(&track.observations, cameras, options, rays)
+    else {
+        return TrackObjectiveContribution {
+            cost: 25.0,
+            samples: track.observations.len(),
+        };
+    };
+    let mut result = TrackObjectiveContribution::default();
+    for (observation, &ray) in track.observations.iter().zip(rays.iter()) {
+        if dot(sub(triangulated.point, ray.origin), ray.direction) <= 0.0 {
+            result.cost += 10.0;
+        }
+        let Some(projected) =
+            project_observation_with_ray(&cameras[observation.camera], ray, triangulated.point)
+        else {
+            result.cost += 25.0;
+            result.samples += 1;
+            continue;
+        };
+        let residual = [
+            projected[0] - observation.pixel[0],
+            projected[1] - observation.pixel[1],
+        ];
+        let normalized = normalized_observation_residual(observation, residual);
+        result.cost += observation_balance(observation, track.observations.len())
+            * huber(normalized, options.huber_delta);
+        result.samples += 1;
+    }
+    result
+}
+
+fn epipolar_track_contribution(
+    track: &Track,
+    cameras: &[ResolvedCamera],
+    reference_index: usize,
+    options: &RigRefinementOptions,
+) -> TrackObjectiveContribution {
+    let Some(reference) = track
+        .observations
+        .iter()
+        .find(|observation| observation.camera == reference_index)
+    else {
+        return TrackObjectiveContribution::default();
+    };
+    let reference_ray = cameras[reference_index].pixel_to_ray(reference.pixel);
+    let mut result = TrackObjectiveContribution::default();
+    for observation in track
+        .observations
+        .iter()
+        .filter(|observation| observation.camera != reference_index)
+    {
+        let target_camera = &cameras[observation.camera];
+        let target_ray = target_camera.pixel_to_ray(observation.pixel);
+        let baseline = sub(target_ray.origin, reference_ray.origin);
+        let baseline_length = norm(baseline);
+        if baseline_length <= 1.0e-9 {
+            continue;
+        }
+        let normalised_baseline = math::scale(baseline, 1.0 / baseline_length);
+        let angular_error = dot(
+            normalised_baseline,
+            cross(reference_ray.direction, target_ray.direction),
+        )
+        .abs();
+        let focal = (cameras[reference_index].focal_px * target_camera.focal_px)
+            .abs()
+            .sqrt();
+        let pair_sigma =
+            (observation_sigma(reference).powi(2) + observation_sigma(observation).powi(2)).sqrt();
+        let normalized = angular_error * focal / pair_sigma.max(1.0e-6);
+        result.cost += huber(normalized, options.huber_delta);
+        if !pair_has_positive_depth(reference_ray, target_ray) {
+            result.cost += 10.0;
+        }
+        result.samples += 1;
+    }
+    result
+}
+
+struct RigTrialEvaluation {
+    parameter: usize,
+    value: f64,
+    camera_index: usize,
+    camera: Option<ResolvedCamera>,
+    changed_tracks: Vec<(usize, TrackObjectiveContribution)>,
+    total_cost: f64,
+    total_samples: usize,
+    prior_sum: f64,
+    objective: f64,
+}
+
+struct IncrementalRigObjective<'a> {
+    parameters: Vec<f64>,
+    specs: &'a [ParameterSpec],
+    tracks: &'a [&'a Track],
+    options: &'a RigRefinementOptions,
+    mode: IncrementalObjectiveMode,
+    templates: Vec<ResolvedCameraTemplate>,
+    cameras: Vec<ResolvedCamera>,
+    tracks_by_camera: Vec<Vec<usize>>,
+    contributions: Vec<TrackObjectiveContribution>,
+    total_cost: f64,
+    total_samples: usize,
+    prior_sum: f64,
+    ray_scratch: Vec<crate::geometry::Ray>,
+}
+
+impl<'a> IncrementalRigObjective<'a> {
+    fn new(
+        parameters: Vec<f64>,
+        specs: &'a [ParameterSpec],
+        inputs: &'a [RigCameraInput<'a>],
+        tracks: &'a [&'a Track],
+        intrinsics_mode: IntrinsicsMode,
+        options: &'a RigRefinementOptions,
+        mode: IncrementalObjectiveMode,
+    ) -> Option<Self> {
+        let refinements = refinements_from_parameters(inputs.len(), &parameters, specs);
+        let templates = inputs
+            .iter()
+            .map(|input| {
+                ResolvedCameraTemplate::new(input.calibration?, input.state?, intrinsics_mode).ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let cameras = templates
+            .iter()
+            .zip(&refinements)
+            .map(|(template, refinement)| template.resolve(refinement).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let mut tracks_by_camera = vec![Vec::new(); inputs.len()];
+        for (track_index, track) in tracks.iter().enumerate() {
+            for observation in &track.observations {
+                let entries = &mut tracks_by_camera[observation.camera];
+                if entries.last().copied() != Some(track_index) && !entries.contains(&track_index) {
+                    entries.push(track_index);
+                }
+            }
+        }
+        let mut ray_scratch = Vec::new();
+        let mut contributions = Vec::with_capacity(tracks.len());
+        let mut total_cost = 0.0;
+        let mut total_samples = 0usize;
+        for track in tracks {
+            let contribution = match mode {
+                IncrementalObjectiveMode::Bundle => {
+                    bundle_track_contribution(track, &cameras, options, &mut ray_scratch)
+                }
+                IncrementalObjectiveMode::Epipolar { reference_index } => {
+                    epipolar_track_contribution(track, &cameras, reference_index, options)
+                }
+            };
+            total_cost += contribution.cost;
+            total_samples += contribution.samples;
+            contributions.push(contribution);
+        }
+        let prior_sum = parameters
+            .iter()
+            .zip(specs)
+            .map(|(&value, spec)| (value / spec.prior_sigma).powi(2))
+            .sum();
+        Some(Self {
+            parameters,
+            specs,
+            tracks,
+            options,
+            mode,
+            templates,
+            cameras,
+            tracks_by_camera,
+            contributions,
+            total_cost,
+            total_samples,
+            prior_sum,
+            ray_scratch,
+        })
+    }
+
+    #[inline]
+    fn objective_from_parts(&self, cost: f64, samples: usize, prior_sum: f64) -> f64 {
+        cost / samples.max(1) as f64 + self.options.factory_prior_weight * prior_sum
+    }
+
+    fn current_objective(&self) -> f64 {
+        self.objective_from_parts(self.total_cost, self.total_samples, self.prior_sum)
+    }
+
+    fn evaluate_trial(&mut self, parameter: usize, value: f64) -> RigTrialEvaluation {
+        let spec = self.specs[parameter];
+        let old_value = self.parameters[parameter];
+        let old_prior = (old_value / spec.prior_sigma).powi(2);
+        let new_prior = (value / spec.prior_sigma).powi(2);
+        let prior_sum = self.prior_sum - old_prior + new_prior;
+        if value == old_value {
+            return RigTrialEvaluation {
+                parameter,
+                value,
+                camera_index: spec.camera,
+                camera: None,
+                changed_tracks: Vec::new(),
+                total_cost: self.total_cost,
+                total_samples: self.total_samples,
+                prior_sum,
+                objective: self.objective_from_parts(
+                    self.total_cost,
+                    self.total_samples,
+                    prior_sum,
+                ),
+            };
+        }
+        let refinement = refinement_for_camera(
+            spec.camera,
+            &self.parameters,
+            self.specs,
+            Some((parameter, value)),
+        );
+        let Ok(trial_camera) = self.templates[spec.camera].resolve(&refinement) else {
+            return self.invalid_trial(parameter, value, prior_sum);
+        };
+        let original_camera = std::mem::replace(&mut self.cameras[spec.camera], trial_camera);
+        let mut total_cost = self.total_cost;
+        let mut total_samples = self.total_samples;
+        let affected = &self.tracks_by_camera[spec.camera];
+        let mut changed_tracks = Vec::with_capacity(affected.len());
+        for &track_index in affected {
+            let old = self.contributions[track_index];
+            let track = self.tracks[track_index];
+            let new = match self.mode {
+                IncrementalObjectiveMode::Bundle => bundle_track_contribution(
+                    track,
+                    &self.cameras,
+                    self.options,
+                    &mut self.ray_scratch,
+                ),
+                IncrementalObjectiveMode::Epipolar { reference_index } => {
+                    epipolar_track_contribution(track, &self.cameras, reference_index, self.options)
+                }
+            };
+            total_cost += new.cost - old.cost;
+            total_samples = total_samples - old.samples + new.samples;
+            changed_tracks.push((track_index, new));
+        }
+        let trial_camera = std::mem::replace(&mut self.cameras[spec.camera], original_camera);
+        let objective = self.objective_from_parts(total_cost, total_samples, prior_sum);
+        RigTrialEvaluation {
+            parameter,
+            value,
+            camera_index: spec.camera,
+            camera: Some(trial_camera),
+            changed_tracks,
+            total_cost,
+            total_samples,
+            prior_sum,
+            objective,
+        }
+    }
+
+    fn invalid_trial(&self, parameter: usize, value: f64, prior_sum: f64) -> RigTrialEvaluation {
+        RigTrialEvaluation {
+            parameter,
+            value,
+            camera_index: self.specs[parameter].camera,
+            camera: None,
+            changed_tracks: Vec::new(),
+            total_cost: f64::INFINITY,
+            total_samples: self.total_samples,
+            prior_sum,
+            objective: f64::INFINITY,
+        }
+    }
+
+    fn commit(&mut self, trial: RigTrialEvaluation) {
+        if trial.value == self.parameters[trial.parameter] {
+            return;
+        }
+        let Some(camera) = trial.camera else {
+            return;
+        };
+        self.parameters[trial.parameter] = trial.value;
+        self.cameras[trial.camera_index] = camera;
+        for (track_index, contribution) in trial.changed_tracks {
+            self.contributions[track_index] = contribution;
+        }
+        self.total_cost = trial.total_cost;
+        self.total_samples = trial.total_samples;
+        self.prior_sum = trial.prior_sum;
+    }
+}
+
+fn coordinate_optimize_rig<'a>(
+    parameters: Vec<f64>,
+    specs: &'a [ParameterSpec],
     max_iterations: usize,
-    objective: impl Fn(&[f64]) -> f64,
+    inputs: &'a [RigCameraInput<'a>],
+    tracks: &'a [&'a Track],
+    intrinsics_mode: IntrinsicsMode,
+    options: &'a RigRefinementOptions,
+    mode: IncrementalObjectiveMode,
 ) -> (Vec<f64>, f64, usize) {
-    let mut current_objective = objective(&parameters);
+    let Some(mut objective) = IncrementalRigObjective::new(
+        parameters.clone(),
+        specs,
+        inputs,
+        tracks,
+        intrinsics_mode,
+        options,
+        mode,
+    ) else {
+        return (parameters, f64::INFINITY, 0);
+    };
+    let mut current_objective = objective.current_objective();
     let mut iterations = 0;
     for iteration in 0..max_iterations {
         let sweep_before = current_objective;
-        for parameter in 0..parameters.len() {
+        for parameter in 0..objective.parameters.len() {
             let spec = specs[parameter];
-            let centre = parameters[parameter];
+            let centre = objective.parameters[parameter];
             let step = spec.difference_step;
-            let mut minus = parameters.clone();
-            let mut plus = parameters.clone();
-            minus[parameter] = (centre - step).max(-spec.bound);
-            plus[parameter] = (centre + step).min(spec.bound);
-            let f_minus = objective(&minus);
-            let f_plus = objective(&plus);
+            let minus_value = (centre - step).max(-spec.bound);
+            let plus_value = (centre + step).min(spec.bound);
+            let minus = objective.evaluate_trial(parameter, minus_value);
+            let plus = objective.evaluate_trial(parameter, plus_value);
+            let f_minus = minus.objective;
+            let f_plus = plus.objective;
             let gradient = (f_plus - f_minus) / (2.0 * step);
             let curvature = (f_plus + f_minus - 2.0 * current_objective) / (step * step);
             let update = if curvature.is_finite() && curvature > 1.0e-9 {
@@ -2867,19 +3562,17 @@ fn coordinate_optimize(
             if candidate_value == centre {
                 continue;
             }
-            let mut candidate = parameters.clone();
-            candidate[parameter] = candidate_value;
-            let candidate_objective = objective(&candidate);
-            if candidate_objective < current_objective {
-                parameters = candidate;
-                current_objective = candidate_objective;
+            let candidate = objective.evaluate_trial(parameter, candidate_value);
+            if candidate.objective < current_objective {
+                current_objective = candidate.objective;
+                objective.commit(candidate);
             } else if f_minus < current_objective || f_plus < current_objective {
                 if f_minus <= f_plus {
-                    parameters = minus;
                     current_objective = f_minus;
+                    objective.commit(minus);
                 } else {
-                    parameters = plus;
                     current_objective = f_plus;
+                    objective.commit(plus);
                 }
             }
         }
@@ -2888,79 +3581,7 @@ fn coordinate_optimize(
             break;
         }
     }
-    (parameters, current_objective, iterations)
-}
-
-fn epipolar_objective(
-    parameters: &[f64],
-    specs: &[ParameterSpec],
-    inputs: &[RigCameraInput<'_>],
-    reference_index: usize,
-    tracks: &[&Track],
-    intrinsics_mode: IntrinsicsMode,
-    options: &RigRefinementOptions,
-) -> f64 {
-    let refinements = refinements_from_parameters(inputs.len(), parameters, specs);
-    let Some(cameras) = resolve_cameras(inputs, &refinements, intrinsics_mode) else {
-        return f64::INFINITY;
-    };
-    let mut cost = 0.0;
-    let mut samples = 0;
-    for track in tracks {
-        let Some(reference) = track
-            .observations
-            .iter()
-            .find(|observation| observation.camera == reference_index)
-        else {
-            continue;
-        };
-        let reference_ray = cameras[reference_index].pixel_to_ray(reference.pixel);
-        for observation in track
-            .observations
-            .iter()
-            .filter(|observation| observation.camera != reference_index)
-        {
-            let target_camera = &cameras[observation.camera];
-            let target_ray = target_camera.pixel_to_ray(observation.pixel);
-            let baseline = sub(target_ray.origin, reference_ray.origin);
-            let baseline_length = norm(baseline);
-            if baseline_length <= 1.0e-9 {
-                continue;
-            }
-            // Calibrated epipolar error: corresponding world bearings and
-            // their camera baseline must be coplanar. Express the angular
-            // scalar-triple-product error in approximate pixels so the robust
-            // scale remains comparable with the finite-depth objective.
-            let normalised_baseline = math::scale(baseline, 1.0 / baseline_length);
-            let angular_error = dot(
-                normalised_baseline,
-                cross(reference_ray.direction, target_ray.direction),
-            )
-            .abs();
-            let focal = (cameras[reference_index].focal_px * target_camera.focal_px)
-                .abs()
-                .sqrt();
-            let pair_sigma = (observation_sigma(reference).powi(2)
-                + observation_sigma(observation).powi(2))
-            .sqrt();
-            let normalized = angular_error * focal / pair_sigma.max(1.0e-6);
-            cost += huber(normalized, options.huber_delta);
-            if !pair_has_positive_depth(reference_ray, target_ray) {
-                // Epipolar coplanarity alone has a mirror ambiguity. This
-                // discrete cheirality term selects the solution whose closest
-                // ray intersection lies in front of both cameras.
-                cost += 10.0;
-            }
-            samples += 1;
-        }
-    }
-    let data = cost / samples.max(1) as f64;
-    let prior = parameters
-        .iter()
-        .zip(specs)
-        .map(|(&value, spec)| (value / spec.prior_sigma).powi(2))
-        .sum::<f64>();
-    data + options.factory_prior_weight * prior
+    (objective.parameters, current_objective, iterations)
 }
 
 fn pair_has_positive_depth(first: crate::geometry::Ray, second: crate::geometry::Ray) -> bool {
@@ -2975,6 +3596,11 @@ fn pair_has_positive_depth(first: crate::geometry::Ray, second: crate::geometry:
     let first_depth = (cosine * second_origin - first_origin) / denominator;
     let second_depth = (second_origin - cosine * first_origin) / denominator;
     first_depth > 0.0 && second_depth > 0.0
+}
+
+fn triangulation_has_positive_depth_with_rays(rays: &[crate::geometry::Ray], point: Vec3) -> bool {
+    rays.iter()
+        .all(|ray| dot(sub(point, ray.origin), ray.direction) > 0.0)
 }
 
 fn triangulation_has_positive_depth(
@@ -3050,23 +3676,21 @@ fn evaluate(
     retain_residuals: bool,
 ) -> Evaluation {
     let mut evaluation = Evaluation::default();
+    let mut rays = Vec::new();
     for track in tracks {
-        let Some(triangulated) = triangulate(&track.observations, cameras, options) else {
+        let Some(triangulated) =
+            triangulate_with_rays(&track.observations, cameras, options, &mut rays)
+        else {
             continue;
         };
         evaluation.tracks += 1;
-        if track.observations.iter().all(|observation| {
-            let ray = cameras[observation.camera].pixel_to_ray(observation.pixel);
-            dot(sub(triangulated.point, ray.origin), ray.direction) > 0.0
-        }) {
+        if triangulation_has_positive_depth_with_rays(&rays, triangulated.point) {
             evaluation.positive_depth_tracks += 1;
         }
-        for observation in &track.observations {
-            let Some(projected) = project_observation(
-                &cameras[observation.camera],
-                observation,
-                triangulated.point,
-            ) else {
+        for (observation, &ray) in track.observations.iter().zip(&rays) {
+            let Some(projected) =
+                project_observation_with_ray(&cameras[observation.camera], ray, triangulated.point)
+            else {
                 continue;
             };
             let residual = [
@@ -3077,9 +3701,7 @@ fn evaluate(
             evaluation.samples += 1;
             if retain_residuals {
                 let sensor_pixels = dot2(residual, residual).sqrt();
-                let observed_direction = cameras[observation.camera]
-                    .pixel_to_ray(observation.pixel)
-                    .direction;
+                let observed_direction = ray.direction;
                 let projected_direction = cameras[observation.camera]
                     .pixel_to_ray(projected)
                     .direction;
@@ -3107,18 +3729,54 @@ struct Triangulated {
     max_ray_angle_degrees: f64,
 }
 
-fn triangulate(
-    observations: &[TrackObservation],
-    cameras: &[ResolvedCamera],
+#[derive(Clone, Copy)]
+struct TriangulationNormalTerm {
+    normal: Mat3,
+    rhs: Vec3,
+}
+
+fn triangulation_normal_term(
+    observation: &TrackObservation,
+    ray: crate::geometry::Ray,
+) -> TriangulationNormalTerm {
+    let sigma = observation_sigma(observation);
+    let inverse_variance = 1.0 / (sigma * sigma);
+    let projector: Mat3 = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            let identity = f64::from(row == column);
+            identity - ray.direction[row] * ray.direction[column]
+        })
+    });
+    TriangulationNormalTerm {
+        normal: projector.map(|row| row.map(|value| value * inverse_variance)),
+        rhs: projector.map(|row| dot(row, ray.origin) * inverse_variance),
+    }
+}
+
+#[inline]
+fn add_triangulation_term(
+    normal: &mut Mat3,
+    rhs: &mut Vec3,
+    term: TriangulationNormalTerm,
+    scale: f64,
+) {
+    for row in 0..3 {
+        rhs[row] += term.rhs[row] * scale;
+        for column in 0..3 {
+            normal[row][column] += term.normal[row][column] * scale;
+        }
+    }
+}
+
+fn triangulate_normal_system(
+    rays: &[crate::geometry::Ray],
+    normal: Mat3,
+    rhs: Vec3,
     options: &RigRefinementOptions,
 ) -> Option<Triangulated> {
-    if observations.len() < 2 {
+    if rays.len() < 2 {
         return None;
     }
-    let rays = observations
-        .iter()
-        .map(|observation| cameras[observation.camera].pixel_to_ray(observation.pixel))
-        .collect::<Vec<_>>();
     let mut max_sine = 0.0f64;
     for first in 0..rays.len() {
         for second in first + 1..rays.len() {
@@ -3131,24 +3789,6 @@ fn triangulate(
     let max_ray_angle_degrees = max_sine.clamp(0.0, 1.0).asin().to_degrees();
     if max_ray_angle_degrees < options.min_ray_angle_degrees {
         return None;
-    }
-    let mut normal = [[0.0; 3]; 3];
-    let mut rhs = [0.0; 3];
-    for (observation, ray) in observations.iter().zip(&rays) {
-        let sigma = observation_sigma(observation);
-        let weight = observation_balance(observation, observations.len()) / (sigma * sigma);
-        let projector: Mat3 = std::array::from_fn(|row| {
-            std::array::from_fn(|column| {
-                let identity = f64::from(row == column);
-                identity - ray.direction[row] * ray.direction[column]
-            })
-        });
-        for row in 0..3 {
-            rhs[row] += weight * dot(projector[row], ray.origin);
-            for column in 0..3 {
-                normal[row][column] += weight * projector[row][column];
-            }
-        }
     }
     let mut eigenvalues = symmetric_eigenvalues(normal);
     eigenvalues.sort_by(f64::total_cmp);
@@ -3170,17 +3810,73 @@ fn triangulate(
     })
 }
 
+fn fill_observation_rays(
+    observations: &[TrackObservation],
+    cameras: &[ResolvedCamera],
+    rays: &mut Vec<crate::geometry::Ray>,
+) {
+    rays.clear();
+    if rays.capacity() < observations.len() {
+        rays.reserve(observations.len() - rays.capacity());
+    }
+    rays.extend(
+        observations
+            .iter()
+            .map(|observation| cameras[observation.camera].pixel_to_ray(observation.pixel)),
+    );
+}
+
+fn triangulate_with_rays(
+    observations: &[TrackObservation],
+    cameras: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+    rays: &mut Vec<crate::geometry::Ray>,
+) -> Option<Triangulated> {
+    fill_observation_rays(observations, cameras, rays);
+    triangulate_precomputed(observations, rays, options)
+}
+
+fn triangulate_precomputed(
+    observations: &[TrackObservation],
+    rays: &[crate::geometry::Ray],
+    options: &RigRefinementOptions,
+) -> Option<Triangulated> {
+    if observations.len() < 2 || rays.len() != observations.len() {
+        return None;
+    }
+    let mut normal = [[0.0; 3]; 3];
+    let mut rhs = [0.0; 3];
+    for (observation, &ray) in observations.iter().zip(rays) {
+        let term = triangulation_normal_term(observation, ray);
+        add_triangulation_term(
+            &mut normal,
+            &mut rhs,
+            term,
+            observation_balance(observation, observations.len()),
+        );
+    }
+    triangulate_normal_system(rays, normal, rhs, options)
+}
+
+fn triangulate(
+    observations: &[TrackObservation],
+    cameras: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+) -> Option<Triangulated> {
+    let mut rays = Vec::with_capacity(observations.len());
+    triangulate_with_rays(observations, cameras, options, &mut rays)
+}
+
 /// Reproject the triangulated *line* intersection along the observed ray's
 /// forward half-line. Factory angular errors can put the least-squares line
 /// intersection behind a camera before refinement; flipping that camera's
 /// line direction supplies a continuous calibration residual without treating
 /// the non-physical point as valid scene depth.
-fn project_observation(
+fn project_observation_with_ray(
     camera: &ResolvedCamera,
-    observation: &TrackObservation,
+    ray: crate::geometry::Ray,
     point: Vec3,
 ) -> Option<Vec2> {
-    let ray = camera.pixel_to_ray(observation.pixel);
     let displacement = sub(point, ray.origin);
     let forward_point = if dot(displacement, ray.direction) >= 0.0 {
         point
@@ -3188,6 +3884,15 @@ fn project_observation(
         sub(ray.origin, displacement)
     };
     camera.project_unbounded(forward_point)
+}
+
+fn project_observation(
+    camera: &ResolvedCamera,
+    observation: &TrackObservation,
+    point: Vec3,
+) -> Option<Vec2> {
+    let ray = camera.pixel_to_ray(observation.pixel);
+    project_observation_with_ray(camera, ray, point)
 }
 
 fn track_rms(observations: &[TrackObservation], cameras: &[ResolvedCamera], point: Vec3) -> f64 {
@@ -3205,38 +3910,51 @@ fn track_rms(observations: &[TrackObservation], cameras: &[ResolvedCamera], poin
     (sum / samples.max(1) as f64).sqrt()
 }
 
+fn observation_prepared(observation: &TrackObservation) -> &ObservationPrepared {
+    observation.prepared.get_or_init(|| {
+        let score = observation.confidence.clamp(0.0, 1.0);
+        let structure_support = (observation.structure / 0.08).clamp(0.25, 1.0);
+        let depth_support = observation
+            .depth_reliability
+            .unwrap_or(1.0)
+            .clamp(0.25, 1.0);
+        let scale = observation.local_scale.clamp(0.5, 3.0);
+        let sigma = ((0.35 + 1.65 * (1.0 - score)) / (structure_support * depth_support).sqrt()
+            * scale.sqrt())
+        .clamp(0.30, 3.0);
+        let covariance = observation.localization_covariance;
+        let determinant = covariance[0][0] * covariance[1][1] - covariance[0][1] * covariance[1][0];
+        let inverse_covariance = if determinant.is_finite() && determinant > 1.0e-9 {
+            [
+                [
+                    covariance[1][1] / determinant,
+                    -covariance[0][1] / determinant,
+                ],
+                [
+                    -covariance[1][0] / determinant,
+                    covariance[0][0] / determinant,
+                ],
+            ]
+        } else {
+            [[1.0, 0.0], [0.0, 1.0]]
+        };
+        ObservationPrepared {
+            sigma,
+            inverse_covariance,
+        }
+    })
+}
+
 fn observation_sigma(observation: &TrackObservation) -> f64 {
-    let score = observation.confidence.clamp(0.0, 1.0);
-    let structure_support = (observation.structure / 0.08).clamp(0.25, 1.0);
-    let depth_support = observation
-        .depth_reliability
-        .unwrap_or(1.0)
-        .clamp(0.25, 1.0);
-    let scale = observation.local_scale.clamp(0.5, 3.0);
-    ((0.35 + 1.65 * (1.0 - score)) / (structure_support * depth_support).sqrt() * scale.sqrt())
-        .clamp(0.30, 3.0)
+    observation_prepared(observation).sigma
 }
 
 fn normalized_observation_residual(observation: &TrackObservation, residual: Vec2) -> f64 {
-    let covariance = observation.localization_covariance;
-    let determinant = covariance[0][0] * covariance[1][1] - covariance[0][1] * covariance[1][0];
-    let squared = if determinant.is_finite() && determinant > 1.0e-9 {
-        let inverse = [
-            [
-                covariance[1][1] / determinant,
-                -covariance[0][1] / determinant,
-            ],
-            [
-                -covariance[1][0] / determinant,
-                covariance[0][0] / determinant,
-            ],
-        ];
-        residual[0] * (inverse[0][0] * residual[0] + inverse[0][1] * residual[1])
-            + residual[1] * (inverse[1][0] * residual[0] + inverse[1][1] * residual[1])
-    } else {
-        dot2(residual, residual)
-    };
-    squared.max(0.0).sqrt() / observation_sigma(observation).max(1.0e-6)
+    let prepared = observation_prepared(observation);
+    let inverse = prepared.inverse_covariance;
+    let squared = residual[0] * (inverse[0][0] * residual[0] + inverse[0][1] * residual[1])
+        + residual[1] * (inverse[1][0] * residual[0] + inverse[1][1] * residual[1]);
+    squared.max(0.0).sqrt() / prepared.sigma.max(1.0e-6)
 }
 
 fn observation_balance(observation: &TrackObservation, track_size: usize) -> f64 {
@@ -3255,27 +3973,39 @@ fn huber(value: f64, delta: f64) -> f64 {
     }
 }
 
-fn symmetric_eigenvalues(mut matrix: Mat3) -> [f64; 3] {
-    for _ in 0..16 {
-        let pairs = [(0, 1), (0, 2), (1, 2)];
-        let &(p, q) = pairs
-            .iter()
-            .max_by(|&&(ap, aq), &&(bp, bq)| matrix[ap][aq].abs().total_cmp(&matrix[bp][bq].abs()))
-            .expect("three off-diagonal pairs");
-        if matrix[p][q].abs() < 1.0e-14 {
-            break;
-        }
-        let angle = 0.5 * (2.0 * matrix[p][q]).atan2(matrix[q][q] - matrix[p][p]);
-        let (sine, cosine) = angle.sin_cos();
-        let rotation = match (p, q) {
-            (0, 1) => [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
-            (0, 2) => [[cosine, 0.0, -sine], [0.0, 1.0, 0.0], [sine, 0.0, cosine]],
-            (1, 2) => [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]],
-            _ => unreachable!(),
-        };
-        matrix = math::mul(&math::transpose(&rotation), &math::mul(&matrix, &rotation));
+fn symmetric_eigenvalues(matrix: Mat3) -> [f64; 3] {
+    // Closed-form eigenvalues for a real symmetric 3x3 matrix (Kopp/Smith
+    // formulation). Triangulation only needs the spectrum, not eigenvectors.
+    let p1 =
+        matrix[0][1] * matrix[0][1] + matrix[0][2] * matrix[0][2] + matrix[1][2] * matrix[1][2];
+    if p1 <= 1.0e-28 {
+        return [matrix[0][0], matrix[1][1], matrix[2][2]];
     }
-    [matrix[0][0], matrix[1][1], matrix[2][2]]
+    let q = (matrix[0][0] + matrix[1][1] + matrix[2][2]) / 3.0;
+    let a00 = matrix[0][0] - q;
+    let a11 = matrix[1][1] - q;
+    let a22 = matrix[2][2] - q;
+    let p2 = a00 * a00 + a11 * a11 + a22 * a22 + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    if !p.is_finite() || p <= 1.0e-18 {
+        return [q, q, q];
+    }
+    let inv_p = 1.0 / p;
+    let b = [
+        [a00 * inv_p, matrix[0][1] * inv_p, matrix[0][2] * inv_p],
+        [matrix[1][0] * inv_p, a11 * inv_p, matrix[1][2] * inv_p],
+        [matrix[2][0] * inv_p, matrix[2][1] * inv_p, a22 * inv_p],
+    ];
+    let determinant = b[0][0] * (b[1][1] * b[2][2] - b[1][2] * b[2][1])
+        - b[0][1] * (b[1][0] * b[2][2] - b[1][2] * b[2][0])
+        + b[0][2] * (b[1][0] * b[2][1] - b[1][1] * b[2][0]);
+    let r = (determinant * 0.5).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    let two_p = 2.0 * p;
+    let largest = q + two_p * phi.cos();
+    let smallest = q + two_p * (phi + 2.0 * std::f64::consts::PI / 3.0).cos();
+    let middle = 3.0 * q - largest - smallest;
+    [largest, middle, smallest]
 }
 
 fn per_camera_reports(
@@ -3878,6 +4608,7 @@ mod tests {
             target_pixel: [100.0 + camera as f64, 80.0],
             residual: [0.0, 0.0],
             residual_proposal: [0.0, 0.0],
+            epipolar_tangent: None,
             local_scale: 1.0,
         };
         let accidental = physical_depth_candidate(
@@ -4040,6 +4771,7 @@ mod tests {
                 local_scale: 1.0,
                 structure: 0.1,
                 depth_reliability: Some(1.0),
+                prepared: Default::default(),
             })
             .collect::<Vec<_>>();
         observations[3].pixel[0] += 28.0;
@@ -4119,6 +4851,7 @@ mod tests {
                     local_scale: 1.0,
                     structure: 0.1,
                     depth_reliability: Some(1.0),
+                    prepared: Default::default(),
                 }
             })
             .collect();
@@ -4174,6 +4907,7 @@ mod tests {
             local_scale: 1.0,
             structure: 0.1,
             depth_reliability: Some(1.0),
+            prepared: Default::default(),
         };
         let along_uncertain = normalized_observation_residual(&observation, [2.0, 0.0]);
         let across_uncertain = normalized_observation_residual(&observation, [0.0, 2.0]);
