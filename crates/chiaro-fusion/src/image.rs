@@ -12,6 +12,7 @@
 use chiaro::lri::SensorPattern;
 use chiaro_hotpixel_core::demosaic::{DemosaicMethod, demosaic};
 use chiaro_hotpixel_core::highlight::HighlightRecoveryState;
+use std::thread;
 
 use crate::calibration::{CrosstalkMesh, VignettingMesh};
 
@@ -193,40 +194,84 @@ impl Mosaic {
         method: DemosaicMethod,
         threads: usize,
     ) -> anyhow::Result<()> {
-        self.demosaiced_rgb = if self.is_mono() || method == DemosaicMethod::Simple {
+        let demosaiced_rgb = if self.is_mono() || method == DemosaicMethod::Simple {
             None
         } else {
             // The factory mesh mixes the two green phases independently, so
             // apply it while the four CFA lattices are still distinct. Doing
             // this after RGB reconstruction would incorrectly collapse both
-            // green inputs into one value.
+            // green inputs into one value. The prepass is fully row-local, so
+            // run it in parallel just like the demosaicer itself.
             let corrected;
             let input = if let Some(crosstalk) = &self.crosstalk {
                 let (red_row, red_col) = self.red_position();
-                let mut values_out = Vec::with_capacity(self.samples.len());
-                for y in 0..self.height {
-                    for x in 0..self.width {
-                        let values = [
-                            self.bilinear_plane(x as f32, y as f32, red_col, red_row, 2),
-                            self.bilinear_plane(x as f32, y as f32, 1 - red_col, red_row, 2),
-                            self.bilinear_plane(x as f32, y as f32, red_col, 1 - red_row, 2),
-                            self.bilinear_plane(x as f32, y as f32, 1 - red_col, 1 - red_row, 2),
-                        ]
-                        .map(|value| value - self.black_q6);
-                        let phase = match (y & 1 == red_row, x & 1 == red_col) {
-                            (true, true) => 0,
-                            (true, false) => 1,
-                            (false, true) => 2,
-                            (false, false) => 3,
-                        };
-                        let matrix = crosstalk.matrix(x as f32, y as f32, self.width, self.height);
-                        let value = (0..4)
-                            .map(|column| matrix[phase * 4 + column] * values[column])
-                            .sum::<f32>()
-                            + self.black_q6;
-                        values_out.push(value.round().clamp(0.0, 65535.0) as u16);
+                let width = self.width;
+                let height = self.height;
+                let black_q6 = self.black_q6;
+                let mosaic: &Mosaic = &*self;
+                let mut values_out = vec![0u16; self.samples.len()];
+                let automatic = thread::available_parallelism().map_or(1, usize::from);
+                let worker_count =
+                    if threads == 0 { automatic } else { threads }.clamp(1, height.max(1));
+                let rows_per_worker = height.div_ceil(worker_count);
+                let samples_per_worker = rows_per_worker * width;
+                thread::scope(|scope| {
+                    for (chunk_index, chunk) in values_out
+                        .chunks_mut(samples_per_worker.max(width).max(1))
+                        .enumerate()
+                    {
+                        let first_row = chunk_index * rows_per_worker;
+                        scope.spawn(move || {
+                            for (local_y, output_row) in chunk.chunks_mut(width).enumerate() {
+                                let y = first_row + local_y;
+                                for (x, output) in output_row.iter_mut().enumerate() {
+                                    let values = [
+                                        mosaic.bilinear_plane(
+                                            x as f32, y as f32, red_col, red_row, 2,
+                                        ),
+                                        mosaic.bilinear_plane(
+                                            x as f32,
+                                            y as f32,
+                                            1 - red_col,
+                                            red_row,
+                                            2,
+                                        ),
+                                        mosaic.bilinear_plane(
+                                            x as f32,
+                                            y as f32,
+                                            red_col,
+                                            1 - red_row,
+                                            2,
+                                        ),
+                                        mosaic.bilinear_plane(
+                                            x as f32,
+                                            y as f32,
+                                            1 - red_col,
+                                            1 - red_row,
+                                            2,
+                                        ),
+                                    ]
+                                    .map(|value| value - black_q6);
+                                    let phase = match (y & 1 == red_row, x & 1 == red_col) {
+                                        (true, true) => 0,
+                                        (true, false) => 1,
+                                        (false, true) => 2,
+                                        (false, false) => 3,
+                                    };
+                                    let row = crosstalk
+                                        .matrix_row(x as f32, y as f32, width, height, phase);
+                                    let value = row
+                                        .iter()
+                                        .zip(values)
+                                        .map(|(coefficient, value)| coefficient * value)
+                                        .sum::<f32>()
+                                        + black_q6;
+                                    *output = value.round().clamp(0.0, 65535.0) as u16;
+                                }
+                            }
+                        });
                     }
-                }
+                });
                 corrected = values_out;
                 &corrected
             } else {
@@ -241,6 +286,7 @@ impl Mosaic {
                 threads,
             )?)
         };
+        self.demosaiced_rgb = demosaiced_rgb;
         Ok(())
     }
 
@@ -297,12 +343,12 @@ impl Mosaic {
         });
         let phase_index = phase.index();
         let (value, white, crosstalk_row) = if let Some(crosstalk) = &self.crosstalk {
-            let matrix = crosstalk.matrix(x as f32, y as f32, self.width, self.height);
-            let row = &matrix[phase_index * 4..phase_index * 4 + 4];
+            let row =
+                crosstalk.matrix_row(x as f32, y as f32, self.width, self.height, phase_index);
             (
                 row.iter().zip(values).map(|(m, v)| m * v).sum::<f32>(),
                 row.iter().sum::<f32>() * range,
-                [row[0], row[1], row[2], row[3]],
+                row,
             )
         } else {
             let mut row = [0.0; 4];
@@ -409,6 +455,61 @@ impl Mosaic {
                 correct(&mut planes);
             }
             correct(&mut white_planes);
+        }
+        let scale = flat / range;
+        let to_rgb = |values: [f32; 4]| {
+            [
+                (values[0] * scale).max(0.0),
+                ((values[1] + values[2]) * 0.5 * scale).max(0.0),
+                (values[3] * scale).max(0.0),
+            ]
+        };
+        Some((to_rgb(planes), to_rgb(white_planes)))
+    }
+
+    /// Linear RGB and sensor-white response at an exact physical sensor site.
+    /// Advanced demosaicing materialises one RGB value per site, so integer
+    /// reconstruction footprints can bypass bilinear RGB interpolation. Simple
+    /// Bayer mode falls back to the general fractional sampler because its RGB
+    /// value is reconstructed from the four CFA lattices on demand.
+    #[inline]
+    pub fn sample_rgb_with_white_at_sensor(
+        &self,
+        x: usize,
+        y: usize,
+    ) -> Option<([f32; 3], [f32; 3])> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let range = (self.white_q6 - self.black_q6).max(1.0);
+        let xf = x as f32;
+        let yf = y as f32;
+        let flat = self.flat_field(xf, yf);
+        if self.is_mono() {
+            let value =
+                ((self.at_index(y * self.width + x) - self.black_q6) / range).max(0.0) * flat;
+            return Some(([value; 3], [flat; 3]));
+        }
+        let Some(rgb) = &self.demosaiced_rgb else {
+            return self.sample_rgb_with_white(xf, yf);
+        };
+        let base = (y * self.width + x) * 3;
+        let planes = [
+            f32::from(rgb[base]) - self.black_q6,
+            f32::from(rgb[base + 1]) - self.black_q6,
+            f32::from(rgb[base + 1]) - self.black_q6,
+            f32::from(rgb[base + 2]) - self.black_q6,
+        ];
+        let mut white_planes = [range; 4];
+        if let Some(crosstalk) = &self.crosstalk {
+            let matrix = crosstalk.matrix(xf, yf, self.width, self.height);
+            let input = white_planes;
+            for (row, value) in white_planes.iter_mut().enumerate() {
+                *value = matrix[row * 4] * input[0]
+                    + matrix[row * 4 + 1] * input[1]
+                    + matrix[row * 4 + 2] * input[2]
+                    + matrix[row * 4 + 3] * input[3];
+            }
         }
         let scale = flat / range;
         let to_rgb = |values: [f32; 4]| {
@@ -982,6 +1083,54 @@ mod tests {
         let (mosaic, highlight) = cfa_test_mosaic([1.0, 0.0, 0.0, 0.0]);
         let sample = mosaic.corrected_cfa_site(2, 2, &highlight).unwrap();
         assert_eq!(sample.highlight_confidence, 255);
+    }
+
+    #[test]
+    fn exact_sensor_rgb_sampler_matches_fractional_integer_sampling() {
+        let width = 4;
+        let height = 3;
+        let mut matrix = vec![0.0f32; 16];
+        for row in 0..4 {
+            for column in 0..4 {
+                matrix[row * 4 + column] = if row == column {
+                    0.9 + row as f32 * 0.01
+                } else {
+                    0.01 * (row + column + 1) as f32
+                };
+            }
+        }
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for index in 0..width * height {
+            rgb.extend([
+                1000 + index as u16 * 7,
+                2000 + index as u16 * 5,
+                3000 + index as u16 * 3,
+            ]);
+        }
+        let mosaic = Mosaic {
+            width,
+            height,
+            pattern: SensorPattern::Rggb,
+            samples: vec![0; width * height],
+            black_q6: 64.0,
+            white_q6: 4096.0,
+            physical_code_range: 63.0,
+            vignetting: None,
+            crosstalk: Some(CrosstalkMesh {
+                columns: 2,
+                rows: 2,
+                matrices: matrix.repeat(4),
+            }),
+            demosaiced_rgb: Some(rgb),
+        };
+        for y in 0..height {
+            for x in 0..width {
+                let fractional = mosaic.sample_rgb_with_white(x as f32, y as f32).unwrap();
+                let exact = mosaic.sample_rgb_with_white_at_sensor(x, y).unwrap();
+                assert_eq!(fractional.0.map(f32::to_bits), exact.0.map(f32::to_bits));
+                assert_eq!(fractional.1.map(f32::to_bits), exact.1.map(f32::to_bits));
+            }
+        }
     }
 
     #[test]

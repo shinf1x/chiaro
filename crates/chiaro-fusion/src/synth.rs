@@ -39,7 +39,7 @@ use crate::image::Mosaic;
 use crate::resolution::{
     EdgeAlignedHannGeometry, InverseWarpJacobian, ResolutionAlignmentReport,
     ResolutionReconstruction, ResolutionReconstructionReport, ResolutionWarp,
-    edge_aligned_hann_weight, inverse_warp_jacobian, reconstruction_confidence,
+    inverse_warp_jacobian, reconstruction_confidence,
 };
 
 /// Output colour handling.
@@ -418,14 +418,14 @@ pub struct SynthSource<'a> {
 /// boundary state on the base depth warp always wins. An unsupported
 /// resolution-warp cell falls back to that physical base mapping instead of
 /// turning into an unmapped hole.
-fn select_reconstruction_warp<'a>(
+fn select_reconstruction_warp_sample<'a>(
     base: &'a Warp,
     refined: Option<&'a ResolutionWarp>,
     reference: bool,
     rx: f32,
     ry: f32,
-) -> Option<&'a Warp> {
-    let base_sample = base.sample(rx, ry);
+    base_sample: WarpSample,
+) -> Option<(&'a Warp, WarpSample)> {
     if !reference && base_sample.visibility.blocks_sampling() {
         return None;
     }
@@ -436,20 +436,23 @@ fn select_reconstruction_warp<'a>(
             return None;
         }
         if sample.confidence > 0.0 && sample.mapped.is_some() {
-            return Some(warp);
+            return Some((warp, sample));
         }
     }
-    base_sample.mapped.map(|_| base)
+    base_sample.mapped.map(|_| (base, base_sample))
 }
 
-fn reconstruction_warp_at<'s>(source: &'s SynthSource<'_>, rx: f32, ry: f32) -> Option<&'s Warp> {
-    select_reconstruction_warp(
-        &source.alignment.warp,
-        source.resolution_warp,
-        source.reference,
-        rx,
-        ry,
-    )
+#[cfg(test)]
+fn select_reconstruction_warp<'a>(
+    base: &'a Warp,
+    refined: Option<&'a ResolutionWarp>,
+    reference: bool,
+    rx: f32,
+    ry: f32,
+) -> Option<&'a Warp> {
+    let base_sample = base.sample(rx, ry);
+    select_reconstruction_warp_sample(base, refined, reference, rx, ry, base_sample)
+        .map(|(warp, _)| warp)
 }
 
 #[derive(Clone, Copy)]
@@ -461,13 +464,20 @@ struct ReconstructionGeometry<'a> {
     visibility: WarpVisibility,
 }
 
-fn reconstruction_geometry_at<'a>(
+fn reconstruction_geometry_from_base_sample<'a>(
     source: &'a SynthSource<'_>,
     rx: f32,
     ry: f32,
+    base_sample: WarpSample,
 ) -> Option<ReconstructionGeometry<'a>> {
-    let warp = reconstruction_warp_at(source, rx, ry)?;
-    let sample = warp.sample(rx, ry);
+    let (warp, sample) = select_reconstruction_warp_sample(
+        &source.alignment.warp,
+        source.resolution_warp,
+        source.reference,
+        rx,
+        ry,
+        base_sample,
+    )?;
     let q = sample.mapped?;
     let inverse = inverse_warp_jacobian(warp, rx, ry)?;
     Some(ReconstructionGeometry {
@@ -477,6 +487,15 @@ fn reconstruction_geometry_at<'a>(
         local_confidence: sample.confidence,
         visibility: sample.visibility,
     })
+}
+
+fn reconstruction_geometry_at<'a>(
+    source: &'a SynthSource<'_>,
+    rx: f32,
+    ry: f32,
+) -> Option<ReconstructionGeometry<'a>> {
+    let base_sample = source.alignment.warp.sample(rx, ry);
+    reconstruction_geometry_from_base_sample(source, rx, ry, base_sample)
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1237,7 +1256,14 @@ pub fn synthesize(
                         let reconstruction_geometry = options
                             .resolution_reconstruction
                             .uses_resolution_warps()
-                            .then(|| reconstruction_geometry_at(source, rx, ry))
+                            .then(|| {
+                                reconstruction_geometry_from_base_sample(
+                                    source,
+                                    rx,
+                                    ry,
+                                    warp_sample,
+                                )
+                            })
                             .flatten();
                         if let Some(geometry) = reconstruction_geometry {
                             reconstruction_geometries[source_index] = Some(geometry);
@@ -1533,14 +1559,18 @@ pub fn synthesize(
                                 // bounded coefficient still prevents overshoot.
                                 let blend = (reconstructed.confidence.sqrt() * 1.10).min(1.0);
                                 target_luminance = (target_luminance + blend * delta).max(0.0);
-                                if reconstructed.contributors != 0
-                                    && usable.iter().enumerate().any(|(index, (_, source))| {
-                                        index < u32::BITS as usize
-                                            && reconstructed.contributors & (1_u32 << index) != 0
-                                            && (source.mosaic.is_mono() || !source.fusion_enabled)
-                                    })
-                                {
-                                    baseline_only_luminance = true;
+                                if reconstructed.contributors != 0 {
+                                    let mut contributors = reconstructed.contributors;
+                                    while contributors != 0 {
+                                        let source_index = contributors.trailing_zeros() as usize;
+                                        contributors &= contributors - 1;
+                                        if usable.get(source_index).is_some_and(|(_, source)| {
+                                            source.mosaic.is_mono() || !source.fusion_enabled
+                                        }) {
+                                            baseline_only_luminance = true;
+                                            break;
+                                        }
+                                    }
                                 }
                                 local_resolution_counters.reconstructed += 1;
                                 local_resolution_counters.cameras_milli +=
@@ -1549,12 +1579,13 @@ pub fn synthesize(
                                     (reconstructed.phase_spread.min(16.0) * 1_000_000.0) as usize;
                                 local_resolution_counters.confidence_micro +=
                                     (reconstructed.confidence * 1_000_000.0) as usize;
-                                for (source_index, counters) in local_source_counters
-                                    .iter_mut()
-                                    .enumerate()
-                                    .take(usable.len().min(u32::BITS as usize))
-                                {
-                                    if reconstructed.contributors & (1u32 << source_index) != 0 {
+                                let mut contributors = reconstructed.contributors;
+                                while contributors != 0 {
+                                    let source_index = contributors.trailing_zeros() as usize;
+                                    contributors &= contributors - 1;
+                                    if let Some(counters) =
+                                        local_source_counters.get_mut(source_index)
+                                    {
                                         counters.resolution_contributor += 1;
                                     }
                                 }
@@ -2145,7 +2176,7 @@ fn projected_camera_luminance_from_geometry(
             if coarse_kernel <= 0.0 && broad_kernel.unwrap_or(0.0) <= 0.0 {
                 continue;
             }
-            let luminance = source_luminance_at_sensor(source, sx as f32, sy as f32, options)?;
+            let luminance = source_luminance_at_sensor(source, sx as usize, sy as usize, options)?;
             if coarse_kernel > 0.0 {
                 coarse_luminance += coarse_kernel * luminance;
                 coarse_weight += coarse_kernel;
@@ -2309,6 +2340,23 @@ fn joint_cfa_at(
         }
         let centre_x = q[0].round() as isize;
         let centre_y = q[1].round() as isize;
+        let kernel_geometry = EdgeAlignedHannGeometry::new(reference_structure);
+        let focus_weight = focus_consistency_weight(
+            scene_depth,
+            source.focus_distance,
+            source.magnification,
+            source.reference,
+        );
+        let feather_scale = options.feather_px.max(1.0).recip();
+        let gain = source.alignment.gain;
+        let offset = source.alignment.offset;
+        let code_range = source.mosaic.physical_code_range;
+        let Some(response_base) = camera_response_bases
+            .get(camera_index)
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
         for sy in centre_y - radius as isize..=centre_y + radius as isize {
             if sy < 0 || sy >= source.mosaic.height as isize {
                 continue;
@@ -2331,12 +2379,8 @@ fn joint_cfa_at(
                         WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
                     }
                 };
-                let spatial_weight = edge_aligned_hann_weight(
-                    output_offset[0],
-                    output_offset[1],
-                    SUPPORT_RADIUS,
-                    reference_structure,
-                );
+                let spatial_weight =
+                    kernel_geometry.weight(output_offset[0], output_offset[1], SUPPORT_RADIUS);
                 if spatial_weight <= 0.0 {
                     continue;
                 }
@@ -2348,14 +2392,18 @@ fn joint_cfa_at(
                     .min(sy as f32)
                     .min((source.mosaic.width - 1) as f32 - sx as f32)
                     .min((source.mosaic.height - 1) as f32 - sy as f32);
-                let feather = smoothstep(border / options.feather_px.max(1.0));
+                let feather = smoothstep(border * feather_scale);
                 let footprint_confidence = footprint_warp.confidence;
                 let sample_photometric = source_photometric(source, sample_rx, sample_ry, options);
                 let sample_luminance = sample_photometric.map(|sample| sample.0);
                 let sample_color = sample_photometric.and_then(|sample| sample.1);
-                let local_reference_photometric = reference_source.and_then(|reference| {
-                    source_photometric(reference, sample_rx, sample_ry, options)
-                });
+                let local_reference_photometric = if source.reference {
+                    sample_photometric
+                } else {
+                    reference_source.and_then(|reference| {
+                        source_photometric(reference, sample_rx, sample_ry, options)
+                    })
+                };
                 let local_reference_luminance = local_reference_photometric
                     .map(|sample| sample.0)
                     .or(reference_luminance);
@@ -2397,12 +2445,6 @@ fn joint_cfa_at(
                     sample_color,
                     source.reference,
                 );
-                let focus_weight = focus_consistency_weight(
-                    scene_depth,
-                    source.focus_distance,
-                    source.magnification,
-                    source.reference,
-                );
                 let local_admission = feather
                     * footprint_confidence
                     * edge_weight
@@ -2428,19 +2470,11 @@ fn joint_cfa_at(
                     source.mosaic.width,
                     source.mosaic.height,
                 );
-                let Some(response_base) = camera_response_bases
-                    .get(camera_index)
-                    .and_then(Option::as_ref)
-                else {
-                    continue;
-                };
                 let Some(response) = camera_response_from_base(response_base, field, sample.phase)
                 else {
                     continue;
                 };
-                let gain = source.alignment.gain;
-                let value = (gain * (sample.value - source.alignment.offset)).max(0.0);
-                let code_range = source.mosaic.physical_code_range;
+                let value = (gain * (sample.value - offset)).max(0.0);
                 let variance = corrected_noise_variance(&sample, source.noise_model, code_range)
                     * gain.powi(2);
                 let baseline_prediction = include_baseline_diagnostic
@@ -3063,11 +3097,13 @@ fn prepare_source_sample(
 
 fn source_luminance_at_sensor(
     source: &SynthSource<'_>,
-    x: f32,
-    y: f32,
+    x: usize,
+    y: usize,
     options: &SynthOptions,
 ) -> Option<f32> {
-    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white(x, y)?;
+    let (rgb, sensor_white) = source.mosaic.sample_rgb_with_white_at_sensor(x, y)?;
+    let x = x as f32;
+    let y = y as f32;
     let gain = source.alignment.gain;
     let offset = source.alignment.offset;
     let field = source

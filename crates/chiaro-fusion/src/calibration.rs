@@ -412,6 +412,31 @@ impl CrosstalkMesh {
         }
         out
     }
+
+    /// Bilinearly interpolate one row of the 4x4 crosstalk matrix. Hot paths
+    /// that reconstruct one physical CFA phase need only four coefficients,
+    /// so avoid computing the other twelve matrix entries.
+    #[inline]
+    pub fn matrix_row(&self, x: f32, y: f32, width: usize, height: usize, row: usize) -> [f32; 4] {
+        debug_assert!(row < 4);
+        let fx =
+            (x / (width as f32) * (self.columns - 1) as f32).clamp(0.0, (self.columns - 1) as f32);
+        let fy = (y / (height as f32) * (self.rows - 1) as f32).clamp(0.0, (self.rows - 1) as f32);
+        let c0 = fx.floor() as usize;
+        let r0 = fy.floor() as usize;
+        let c1 = (c0 + 1).min(self.columns - 1);
+        let r1 = (r0 + 1).min(self.rows - 1);
+        let tx = fx - c0 as f32;
+        let ty = fy - r0 as f32;
+        let offset = row * 4;
+        let node = |c: usize, r: usize| &self.matrices[(r * self.columns + c) * 16 + offset..][..4];
+        let (a, b, c, d) = (node(c0, r0), node(c1, r0), node(c0, r1), node(c1, r1));
+        std::array::from_fn(|i| {
+            let top = a[i] * (1.0 - tx) + b[i] * tx;
+            let bottom = c[i] * (1.0 - tx) + d[i] * tx;
+            top * (1.0 - ty) + bottom * ty
+        })
+    }
 }
 
 /// Vignetting calibration: one mesh per mirror Hall code (a single entry for
@@ -1024,6 +1049,26 @@ mod tests {
             camera.focus_distance_for_hall(50.0, IntrinsicsMode::LinearHall),
             Some(500.0)
         );
+    }
+
+    #[test]
+    fn crosstalk_matrix_row_matches_full_matrix() {
+        let mesh = CrosstalkMesh {
+            columns: 3,
+            rows: 2,
+            matrices: (0..3 * 2 * 16)
+                .map(|index| index as f32 * 0.013 - 0.4)
+                .collect(),
+        };
+        for &(x, y) in &[(0.0, 0.0), (127.25, 43.75), (639.0, 479.0)] {
+            let matrix = mesh.matrix(x, y, 640, 480);
+            for row in 0..4 {
+                assert_eq!(
+                    mesh.matrix_row(x, y, 640, 480, row).map(f32::to_bits),
+                    std::array::from_fn(|column| matrix[row * 4 + column].to_bits()),
+                );
+            }
+        }
     }
 
     #[test]

@@ -238,6 +238,7 @@ impl EdgeAlignedHannGeometry {
 /// the edge. This gathers more agreeing samples without averaging across a
 /// branch, cable, or other thin boundary. Flat regions remain isotropic.
 #[inline]
+#[cfg(test)]
 pub(crate) fn edge_aligned_hann_weight(
     dx: f32,
     dy: f32,

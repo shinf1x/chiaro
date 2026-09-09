@@ -410,6 +410,7 @@ struct AggregateEvidence {
     ranking_score: f32,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct PhysicalMember {
     source_index: usize,
@@ -417,6 +418,7 @@ struct PhysicalMember {
     compatibility: f32,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct PhysicalConsensus {
     evidence: AggregateEvidence,
@@ -714,6 +716,27 @@ pub fn refine_multiview_depth(
     selected_depths.sort_by(f64::total_cmp);
     improvements.sort_by(f32::total_cmp);
 
+    // Freeze the pre-dense warps before any target is rewritten. Physical
+    // visibility is one shared scene-surface consensus, so evaluate it once per
+    // node against this immutable snapshot rather than once per target against
+    // a progressively mutated mixture of old and new warps. Warp-seeded mode
+    // also reads from the snapshot so the construction loop has no mutable/read
+    // aliasing and every target sees the same input alignment generation.
+    let alignment_snapshot = alignments.to_vec();
+    let physical_scoring = geometry_mode.is_physical().then(|| {
+        physical_visibility_memberships(
+            inputs,
+            reference_index,
+            &alignment_snapshot,
+            &field,
+            &far_supported,
+            columns,
+            rows,
+            step,
+            options,
+        )
+    });
+
     for target_index in 0..alignments.len() {
         if target_index == reference_index
             || inputs[target_index].camera.is_none()
@@ -725,6 +748,7 @@ pub fn refine_multiview_depth(
         let target_camera = inputs[target_index]
             .camera
             .expect("filtered calibrated target camera");
+        let base_alignment = &alignment_snapshot[target_index];
         let target_visibility = geometry_mode.is_physical().then(|| {
             build_target_visibility_buffer(
                 &field,
@@ -733,7 +757,7 @@ pub fn refine_multiview_depth(
                 step,
                 reference_camera,
                 target_camera,
-                &alignments[target_index].warp,
+                &base_alignment.warp,
                 options,
             )
         });
@@ -744,12 +768,14 @@ pub fn refine_multiview_depth(
                 let p = [(column * step) as f64, (row * step) as f64];
                 match geometry_mode {
                     DepthGeometryMode::PhysicalRig => {
-                        let far_q = alignments[target_index]
-                            .warp
-                            .map(p[0] as f32, p[1] as f32)
-                            .filter(|point| {
-                                target_camera.contains([f64::from(point[0]), f64::from(point[1])])
-                            });
+                        let far_q =
+                            base_alignment
+                                .warp
+                                .map(p[0] as f32, p[1] as f32)
+                                .filter(|point| {
+                                    target_camera
+                                        .contains([f64::from(point[0]), f64::from(point[1])])
+                                });
                         let Some(node) = field[index] else {
                             if far_supported[index] {
                                 let Some(far_q) = far_q else {
@@ -789,32 +815,20 @@ pub fn refine_multiview_depth(
                                     }
                                     continue;
                                 }
-                                let far_scores = score_views(
-                                    inputs,
-                                    reference_index,
-                                    alignments,
-                                    p,
-                                    None,
-                                    options,
-                                    DepthGeometryMode::PhysicalRig,
+                                let visible = physical_scoring.as_ref().is_some_and(
+                                    |(memberships, words_per_node)| {
+                                        physical_membership_contains(
+                                            memberships,
+                                            *words_per_node,
+                                            index,
+                                            target_index,
+                                        )
+                                    },
                                 );
-                                let far_consensus =
-                                    aggregate_physical_consensus(&far_scores, options);
-                                let member = far_consensus.as_ref().and_then(|consensus| {
-                                    consensus
-                                        .members
-                                        .iter()
-                                        .find(|member| member.source_index == target_index)
-                                });
-                                let per_view_score_floor =
-                                    (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
-                                if member.is_some_and(|member| {
-                                    member.compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
-                                        && member.score >= per_view_score_floor
-                                }) {
+                                if visible {
                                     decisions.push(NodeWarp::Global {
                                         point: far_q,
-                                        confidence: alignments[target_index]
+                                        confidence: base_alignment
                                             .warp
                                             .confidence(p[0] as f32, p[1] as f32),
                                     });
@@ -844,7 +858,7 @@ pub fn refine_multiview_depth(
                         let Some(mapped) = local_patch_projection(
                             reference_camera,
                             target_camera,
-                            &alignments[target_index].warp,
+                            &base_alignment.warp,
                             p,
                             Some(node.depth),
                             options,
@@ -890,40 +904,26 @@ pub fn refine_multiview_depth(
                             continue;
                         }
 
-                        // Re-evaluate the exact shared depth with every
-                        // calibrated view and keep this camera's membership in
-                        // the same consensus that justified the scene surface.
-                        // Visibility is decided *before* any per-camera local
-                        // residual refinement.
-                        let shared_scores = score_views(
-                            inputs,
-                            reference_index,
-                            alignments,
-                            p,
-                            Some(node.depth),
-                            options,
-                            DepthGeometryMode::PhysicalRig,
+                        // Membership in the shared physical consensus was
+                        // evaluated once for this node from the immutable
+                        // pre-dense warp snapshot. Visibility is decided before
+                        // any per-camera local residual refinement.
+                        let visible = physical_scoring.as_ref().is_some_and(
+                            |(memberships, words_per_node)| {
+                                physical_membership_contains(
+                                    memberships,
+                                    *words_per_node,
+                                    index,
+                                    target_index,
+                                )
+                            },
                         );
-                        let consensus = aggregate_physical_consensus(&shared_scores, options);
-                        let member = consensus.as_ref().and_then(|consensus| {
-                            consensus
-                                .members
-                                .iter()
-                                .find(|member| member.source_index == target_index)
-                                .copied()
-                        });
-                        let per_view_score_floor =
-                            (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
-                        let visible = member.is_some_and(|member| {
-                            member.compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
-                                && member.score >= per_view_score_floor
-                        });
 
                         if visible {
                             if let Some(selected) = refine_one_view_physical(
                                 reference,
                                 &inputs[target_index],
-                                &alignments[target_index].warp,
+                                &base_alignment.warp,
                                 p,
                                 node.depth,
                                 options,
@@ -967,7 +967,7 @@ pub fn refine_multiview_depth(
                         }
                     }
                     DepthGeometryMode::WarpSeeded => {
-                        let Some(fallback_q) = alignments[target_index]
+                        let Some(fallback_q) = base_alignment
                             .warp
                             .map(p[0] as f32, p[1] as f32)
                             .filter(|point| {
@@ -980,7 +980,7 @@ pub fn refine_multiview_depth(
                         let Some(node) = field[index] else {
                             decisions.push(NodeWarp::Global {
                                 point: fallback_q,
-                                confidence: alignments[target_index]
+                                confidence: base_alignment
                                     .warp
                                     .confidence(p[0] as f32, p[1] as f32),
                             });
@@ -989,7 +989,7 @@ pub fn refine_multiview_depth(
                         let selected = refine_one_view_warp_seeded(
                             reference,
                             &inputs[target_index],
-                            &alignments[target_index].warp,
+                            &base_alignment.warp,
                             p,
                             node.depth,
                             inverse_step,
@@ -998,7 +998,7 @@ pub fn refine_multiview_depth(
                         let baseline = score_one_view_warp_seeded(
                             reference,
                             &inputs[target_index],
-                            &alignments[target_index].warp,
+                            &base_alignment.warp,
                             p,
                             None,
                             options.patch_radius,
@@ -1035,7 +1035,7 @@ pub fn refine_multiview_depth(
                         } else {
                             decisions.push(NodeWarp::Global {
                                 point: fallback_q,
-                                confidence: alignments[target_index]
+                                confidence: base_alignment
                                     .warp
                                     .confidence(p[0] as f32, p[1] as f32),
                             });
@@ -1386,6 +1386,14 @@ fn measure_direct_depths(
         patch_radius: (options.patch_radius * 2).max(8),
         ..options.clone()
     };
+    let active_view_indices = (0..inputs.len())
+        .filter(|&index| {
+            index != reference_index
+                && inputs[index].camera.is_some()
+                && inputs[index].depth_evidence_enabled
+                && (geometry_mode.is_physical() || alignments[index].report.accepted)
+        })
+        .collect::<Vec<_>>();
     let chunks = thread::scope(|scope| {
         let handles = (0..rows)
             .step_by(rows_per_worker)
@@ -1393,12 +1401,37 @@ fn measure_direct_depths(
                 let last_row = (first_row + rows_per_worker).min(rows);
                 let direct_options = &direct_options;
                 let wide_options = &wide_options;
+                let active_view_indices = &active_view_indices;
                 scope.spawn(move || {
                     let capacity = (last_row - first_row) * columns;
                     let mut nodes = Vec::with_capacity(capacity);
                     let mut guidance = Vec::with_capacity(capacity);
                     let mut tested = Vec::with_capacity(capacity);
                     let mut far_supported = Vec::with_capacity(capacity);
+
+                    // Reuse all hot-path storage for every node handled by this
+                    // worker. At the final dense grid this avoids millions of
+                    // small allocations and keeps the prepared reference patch
+                    // and per-view scoring buffers resident.
+                    let mut candidates = Vec::with_capacity(40);
+                    let mut scores = Vec::with_capacity(40);
+                    let mut refinement_candidates = Vec::with_capacity(2);
+                    let mut scored_additions = Vec::with_capacity(2);
+                    let mut merge_scratch = Vec::with_capacity(48);
+                    let mut wide_scores = Vec::with_capacity(8);
+                    let mut view_scores = Vec::with_capacity(active_view_indices.len());
+                    let mut aggregate_scratch = AggregateScratch {
+                        ordered: Vec::with_capacity(active_view_indices.len()),
+                        positive_information: Vec::with_capacity(active_view_indices.len()),
+                    };
+                    let mut reference_patch =
+                        PreparedReferencePatch::with_radius(direct_options.patch_radius);
+                    let mut wide_reference_patch =
+                        PreparedReferencePatch::with_radius(wide_options.patch_radius);
+                    let mut far_scores = vec![None; inputs.len()];
+                    let mut wide_far_scores = vec![None; inputs.len()];
+                    let mut depth_information = vec![0.0f32; inputs.len()];
+
                     for row in first_row..last_row {
                         for column in 0..columns {
                             let p = [(column * step) as f64, (row * step) as f64];
@@ -1410,40 +1443,60 @@ fn measure_direct_depths(
                                 coarse_step,
                                 p,
                             );
-                            let mut candidates = direct_depth_candidates(
+                            direct_depth_candidates_into(
                                 seed.map(|node| node.depth),
                                 inverse_step,
                                 direct_options,
+                                &mut candidates,
                             );
-                            let baseline = aggregate(
-                                &score_views(
+                            scores.clear();
+                            scores.reserve(candidates.len());
+
+                            let (prepared_reference, reference_rays) = prepare_physical_score_cache(
+                                inputs,
+                                reference_index,
+                                alignments,
+                                active_view_indices,
+                                p,
+                                direct_options,
+                                geometry_mode,
+                                &mut reference_patch,
+                                &mut far_scores,
+                                &mut depth_information,
+                            );
+                            let baseline = score_prepared_depth(
+                                inputs,
+                                reference_index,
+                                alignments,
+                                active_view_indices,
+                                p,
+                                None,
+                                direct_options,
+                                geometry_mode,
+                                prepared_reference.then_some(&reference_patch),
+                                reference_rays.as_ref(),
+                                &far_scores,
+                                &depth_information,
+                                &mut view_scores,
+                                &mut aggregate_scratch,
+                            );
+                            for &depth in &candidates {
+                                scores.push(score_prepared_depth(
                                     inputs,
                                     reference_index,
                                     alignments,
+                                    active_view_indices,
                                     p,
-                                    None,
+                                    Some(depth),
                                     direct_options,
                                     geometry_mode,
-                                ),
-                                direct_options,
-                                geometry_mode,
-                            );
-                            let mut scores = Vec::with_capacity(candidates.len());
-                            for &depth in &candidates {
-                                let score = aggregate(
-                                    &score_views(
-                                        inputs,
-                                        reference_index,
-                                        alignments,
-                                        p,
-                                        Some(depth),
-                                        direct_options,
-                                        geometry_mode,
-                                    ),
-                                    direct_options,
-                                    geometry_mode,
-                                );
-                                scores.push(score);
+                                    prepared_reference.then_some(&reference_patch),
+                                    reference_rays.as_ref(),
+                                    &far_scores,
+                                    &depth_information,
+                                    &mut view_scores,
+                                    &mut aggregate_scratch,
+                                ));
                             }
                             if geometry_mode.is_physical() {
                                 for _ in 0..DIRECT_MAX_DEPTH_REFINEMENTS {
@@ -1452,39 +1505,42 @@ fn measure_direct_depths(
                                     else {
                                         break;
                                     };
-                                    let additions = direct_depth_refinement_candidates(
+                                    direct_depth_refinement_candidates_into(
                                         inputs,
                                         reference_index,
                                         p,
                                         &candidates,
                                         best,
+                                        &mut refinement_candidates,
                                     );
-                                    if additions.is_empty() {
+                                    if refinement_candidates.is_empty() {
                                         break;
                                     }
-                                    let scored_additions = additions
-                                        .into_iter()
-                                        .map(|depth| {
-                                            let score = aggregate(
-                                                &score_views(
-                                                    inputs,
-                                                    reference_index,
-                                                    alignments,
-                                                    p,
-                                                    Some(depth),
-                                                    direct_options,
-                                                    geometry_mode,
-                                                ),
-                                                direct_options,
-                                                geometry_mode,
-                                            );
-                                            (depth, score)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    merge_depth_scores(
+                                    scored_additions.clear();
+                                    for &depth in &refinement_candidates {
+                                        let score = score_prepared_depth(
+                                            inputs,
+                                            reference_index,
+                                            alignments,
+                                            active_view_indices,
+                                            p,
+                                            Some(depth),
+                                            direct_options,
+                                            geometry_mode,
+                                            prepared_reference.then_some(&reference_patch),
+                                            reference_rays.as_ref(),
+                                            &far_scores,
+                                            &depth_information,
+                                            &mut view_scores,
+                                            &mut aggregate_scratch,
+                                        );
+                                        scored_additions.push((depth, score));
+                                    }
+                                    merge_depth_scores_with_scratch(
                                         &mut candidates,
                                         &mut scores,
-                                        scored_additions,
+                                        &scored_additions,
+                                        &mut merge_scratch,
                                     );
                                 }
                             }
@@ -1509,37 +1565,54 @@ fn measure_direct_depths(
                                 let first = best.saturating_sub(3);
                                 let last = (best + 3).min(candidates.len() - 1);
                                 let wide_candidates = &candidates[first..=last];
-                                let wide_baseline = aggregate(
-                                    &score_views(
+                                let (wide_prepared_reference, wide_reference_rays) =
+                                    prepare_physical_score_cache(
                                         inputs,
                                         reference_index,
                                         alignments,
+                                        active_view_indices,
                                         p,
-                                        None,
                                         wide_options,
                                         geometry_mode,
-                                    ),
+                                        &mut wide_reference_patch,
+                                        &mut wide_far_scores,
+                                        &mut depth_information,
+                                    );
+                                let wide_baseline = score_prepared_depth(
+                                    inputs,
+                                    reference_index,
+                                    alignments,
+                                    active_view_indices,
+                                    p,
+                                    None,
                                     wide_options,
                                     geometry_mode,
+                                    wide_prepared_reference.then_some(&wide_reference_patch),
+                                    wide_reference_rays.as_ref(),
+                                    &wide_far_scores,
+                                    &depth_information,
+                                    &mut view_scores,
+                                    &mut aggregate_scratch,
                                 );
-                                let wide_scores = wide_candidates
-                                    .iter()
-                                    .map(|&depth| {
-                                        aggregate(
-                                            &score_views(
-                                                inputs,
-                                                reference_index,
-                                                alignments,
-                                                p,
-                                                Some(depth),
-                                                wide_options,
-                                                geometry_mode,
-                                            ),
-                                            wide_options,
-                                            geometry_mode,
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
+                                wide_scores.clear();
+                                for &depth in wide_candidates {
+                                    wide_scores.push(score_prepared_depth(
+                                        inputs,
+                                        reference_index,
+                                        alignments,
+                                        active_view_indices,
+                                        p,
+                                        Some(depth),
+                                        wide_options,
+                                        geometry_mode,
+                                        wide_prepared_reference.then_some(&wide_reference_patch),
+                                        wide_reference_rays.as_ref(),
+                                        &wide_far_scores,
+                                        &depth_information,
+                                        &mut view_scores,
+                                        &mut aggregate_scratch,
+                                    ));
+                                }
                                 if wide_baseline.is_some() {
                                     far_evidence = wide_baseline;
                                 }
@@ -1593,10 +1666,277 @@ fn measure_direct_depths(
     }
 }
 
-/// Remove isolated measurements that cannot be reproduced at adjacent image
-/// positions. This is a consistency test, not completion: rejected finite
-/// nodes become unsupported unless the far hypothesis was independently
-/// measured; no missing node receives a depth.
+#[allow(clippy::too_many_arguments)]
+fn prepare_physical_score_cache(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    active_view_indices: &[usize],
+    centre: Vec2,
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+    reference_patch: &mut PreparedReferencePatch,
+    far_scores: &mut [Option<f32>],
+    depth_information: &mut [f32],
+) -> (bool, Option<LocalPatchReferenceRays>) {
+    if !geometry_mode.is_physical() {
+        return (false, None);
+    }
+    far_scores.fill(None);
+    depth_information.fill(0.0);
+    let prepared_reference =
+        prepare_reference_patch(&inputs[reference_index], centre, options, reference_patch);
+    let reference_rays = inputs[reference_index]
+        .camera
+        .map(|camera| local_patch_reference_rays(camera, centre));
+    if prepared_reference
+        && let Some(reference_camera) = inputs[reference_index].camera
+        && let Some(reference_rays) = reference_rays.as_ref()
+    {
+        for &index in active_view_indices {
+            let target = &inputs[index];
+            let Some(target_camera) = target.camera else {
+                continue;
+            };
+            depth_information[index] =
+                physical_depth_information(reference_camera, target_camera, centre);
+            let Some(projection) = local_patch_projection_from_rays(
+                reference_camera,
+                target_camera,
+                &alignments[index].warp,
+                centre,
+                None,
+                options,
+                reference_rays,
+            ) else {
+                continue;
+            };
+            far_scores[index] =
+                projected_patch_zncc_prepared(target, &projection, [0.0, 0.0], reference_patch);
+        }
+    }
+    (prepared_reference, reference_rays)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_prepared_depth(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    active_view_indices: &[usize],
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+    reference_patch: Option<&PreparedReferencePatch>,
+    reference_rays: Option<&LocalPatchReferenceRays>,
+    far_scores: &[Option<f32>],
+    depth_information: &[f32],
+    view_scores: &mut Vec<ViewScore>,
+    aggregate_scratch: &mut AggregateScratch,
+) -> Option<AggregateEvidence> {
+    score_views_prepared_into(
+        inputs,
+        reference_index,
+        alignments,
+        active_view_indices,
+        centre,
+        depth,
+        options,
+        geometry_mode,
+        reference_patch,
+        reference_rays,
+        far_scores,
+        depth_information,
+        view_scores,
+    );
+    aggregate_with_scratch(view_scores, options, geometry_mode, aggregate_scratch)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn physical_visibility_memberships(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    field: &[Option<NodeDepth>],
+    far_supported: &[bool],
+    columns: usize,
+    rows: usize,
+    step: usize,
+    options: &DepthOptions,
+) -> (Vec<u64>, usize) {
+    let words_per_node = inputs.len().div_ceil(u64::BITS as usize).max(1);
+    let active_view_indices = (0..inputs.len())
+        .filter(|&index| {
+            index != reference_index
+                && inputs[index].camera.is_some()
+                && inputs[index].depth_evidence_enabled
+        })
+        .collect::<Vec<_>>();
+    let worker_count = configured_worker_count(options.threads, rows);
+    let rows_per_worker = rows.div_ceil(worker_count);
+    let chunks = thread::scope(|scope| {
+        let handles = (0..rows)
+            .step_by(rows_per_worker)
+            .map(|first_row| {
+                let last_row = (first_row + rows_per_worker).min(rows);
+                let active_view_indices = &active_view_indices;
+                scope.spawn(move || {
+                    let chunk_nodes = (last_row - first_row) * columns;
+                    let mut memberships = vec![0u64; chunk_nodes * words_per_node];
+                    let mut view_scores = Vec::with_capacity(active_view_indices.len());
+                    let mut aggregate_scratch = AggregateScratch {
+                        ordered: Vec::with_capacity(active_view_indices.len()),
+                        positive_information: Vec::with_capacity(active_view_indices.len()),
+                    };
+                    let mut reference_patch =
+                        PreparedReferencePatch::with_radius(options.patch_radius);
+                    let mut far_scores = vec![None; inputs.len()];
+                    let mut depth_information = vec![0.0f32; inputs.len()];
+                    for row in first_row..last_row {
+                        for column in 0..columns {
+                            let global_index = row * columns + column;
+                            let depth = if let Some(node) = field[global_index] {
+                                Some(node.depth)
+                            } else if far_supported[global_index] {
+                                None
+                            } else {
+                                continue;
+                            };
+                            let p = [(column * step) as f64, (row * step) as f64];
+                            let (prepared_reference, reference_rays) = prepare_physical_score_cache(
+                                inputs,
+                                reference_index,
+                                alignments,
+                                active_view_indices,
+                                p,
+                                options,
+                                DepthGeometryMode::PhysicalRig,
+                                &mut reference_patch,
+                                &mut far_scores,
+                                &mut depth_information,
+                            );
+                            score_views_prepared_into(
+                                inputs,
+                                reference_index,
+                                alignments,
+                                active_view_indices,
+                                p,
+                                depth,
+                                options,
+                                DepthGeometryMode::PhysicalRig,
+                                prepared_reference.then_some(&reference_patch),
+                                reference_rays.as_ref(),
+                                &far_scores,
+                                &depth_information,
+                                &mut view_scores,
+                            );
+                            let local_index = (row - first_row) * columns + column;
+                            let bits = &mut memberships
+                                [local_index * words_per_node..(local_index + 1) * words_per_node];
+                            physical_consensus_visibility_bits(
+                                &view_scores,
+                                options,
+                                bits,
+                                &mut aggregate_scratch,
+                            );
+                        }
+                    }
+                    memberships
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("physical visibility worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut memberships = Vec::with_capacity(columns * rows * words_per_node);
+    for chunk in chunks {
+        memberships.extend(chunk);
+    }
+    (memberships, words_per_node)
+}
+
+fn physical_consensus_visibility_bits(
+    scores: &[ViewScore],
+    options: &DepthOptions,
+    bits: &mut [u64],
+    scratch: &mut AggregateScratch,
+) {
+    bits.fill(0);
+    if scores.len() < options.minimum_support {
+        return;
+    }
+    scratch.ordered.clear();
+    scratch
+        .ordered
+        .extend(scores.iter().map(|view| view.compatibility_score));
+    scratch.ordered.sort_by(|left, right| right.total_cmp(left));
+    let anchor_count = options.minimum_support.max(2).min(scratch.ordered.len());
+    let anchor = scratch.ordered[..anchor_count].iter().sum::<f32>() / anchor_count as f32;
+    let threshold = anchor - PHYSICAL_CONSENSUS_BAND;
+
+    scratch.positive_information.clear();
+    scratch.positive_information.extend(
+        scores
+            .iter()
+            .map(|view| view.depth_information)
+            .filter(|value| value.is_finite() && *value > 1.0e-6),
+    );
+    scratch.positive_information.sort_by(f32::total_cmp);
+    let median_information = scratch
+        .positive_information
+        .get(scratch.positive_information.len() / 2)
+        .copied()
+        .unwrap_or(1.0)
+        .max(1.0e-6);
+
+    let per_view_score_floor = (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
+    let mut effective_support = 0.0f32;
+    let mut total_weight = 0.0f32;
+    for view in scores {
+        let x = ((view.compatibility_score - threshold) / PHYSICAL_CONSENSUS_SOFTNESS)
+            .clamp(-20.0, 20.0);
+        let compatibility = 1.0 / (1.0 + (-x).exp());
+        effective_support += compatibility;
+        let relative_information = if view.depth_information > 1.0e-6 {
+            view.depth_information / median_information
+        } else {
+            0.0
+        };
+        let information_weight = relative_information.clamp(
+            PHYSICAL_MIN_INFORMATION_WEIGHT,
+            PHYSICAL_MAX_INFORMATION_WEIGHT,
+        );
+        total_weight += compatibility * (0.75 + 0.25 * information_weight);
+        if compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY && view.score >= per_view_score_floor {
+            let word = view.source_index / u64::BITS as usize;
+            let bit = view.source_index % u64::BITS as usize;
+            if let Some(value) = bits.get_mut(word) {
+                *value |= 1u64 << bit;
+            }
+        }
+    }
+    if effective_support < options.minimum_support as f32 * 0.75 || total_weight <= 1.0e-6 {
+        bits.fill(0);
+    }
+}
+
+#[inline]
+fn physical_membership_contains(
+    memberships: &[u64],
+    words_per_node: usize,
+    node_index: usize,
+    source_index: usize,
+) -> bool {
+    let word = source_index / u64::BITS as usize;
+    let bit = source_index % u64::BITS as usize;
+    memberships
+        .get(node_index * words_per_node + word)
+        .is_some_and(|value| value & (1u64 << bit) != 0)
+}
+
 fn reject_isolated_direct_depths(
     field: &mut [Option<NodeDepth>],
     guidance: &[f32],
@@ -1794,45 +2134,48 @@ fn nearest_coarse_depth(
     coarse[row * columns + column]
 }
 
-fn direct_depth_candidates(
+fn direct_depth_candidates_into(
     seed: Option<f64>,
     inverse_step: f64,
     options: &DepthOptions,
-) -> Vec<f64> {
+    depths: &mut Vec<f64>,
+) {
+    depths.clear();
     let far_inverse = 1.0 / options.far_depth;
     let near_inverse = 1.0 / options.near_depth;
     match seed {
-        Some(depth) => (-6..=6)
-            .map(|offset| {
+        Some(depth) => {
+            for offset in -6..=6 {
                 let inverse = (1.0 / depth + offset as f64 * inverse_step * 0.5)
                     .clamp(far_inverse, near_inverse);
-                1.0 / inverse
-            })
-            .fold(Vec::new(), |mut depths, depth| {
-                if depths
-                    .last()
-                    .is_none_or(|last: &f64| (1.0 / *last - 1.0 / depth).abs() > inverse_step * 0.1)
-                {
-                    depths.push(depth);
+                let candidate = 1.0 / inverse;
+                if depths.last().is_none_or(|last: &f64| {
+                    (1.0 / *last - 1.0 / candidate).abs() > inverse_step * 0.1
+                }) {
+                    depths.push(candidate);
                 }
-                depths
-            }),
+            }
+        }
         None => {
-            let mut depths = inverse_depth_samples(options.near_depth, options.far_depth, 32);
+            depths.extend(inverse_depth_samples(
+                options.near_depth,
+                options.far_depth,
+                32,
+            ));
             depths.reverse();
-            depths
         }
     }
 }
 
-fn direct_depth_refinement_candidates(
+fn direct_depth_refinement_candidates_into(
     inputs: &[AlignInput<'_>],
     reference_index: usize,
     centre: Vec2,
     depths: &[f64],
     best: usize,
-) -> Vec<f64> {
-    let mut additions = Vec::with_capacity(2);
+    additions: &mut Vec<f64>,
+) {
+    additions.clear();
     for neighbour in [
         best.checked_sub(1),
         (best + 1 < depths.len()).then_some(best + 1),
@@ -1856,7 +2199,6 @@ fn direct_depth_refinement_candidates(
             additions.push(depth);
         }
     }
-    additions
 }
 
 fn maximum_projected_depth_motion(
@@ -1888,20 +2230,31 @@ fn maximum_projected_depth_motion(
         .fold(0.0, f64::max)
 }
 
+#[cfg(test)]
 fn merge_depth_scores(
     depths: &mut Vec<f64>,
     scores: &mut Vec<Option<AggregateEvidence>>,
     additions: Vec<(f64, Option<AggregateEvidence>)>,
 ) {
-    let mut paired = depths
-        .drain(..)
-        .zip(scores.drain(..))
-        .chain(additions)
-        .collect::<Vec<_>>();
-    paired.sort_by(|left, right| (1.0 / left.0).total_cmp(&(1.0 / right.0)));
-    paired.dedup_by(|left, right| (1.0 / left.0 - 1.0 / right.0).abs() <= f64::EPSILON);
-    depths.extend(paired.iter().map(|(depth, _)| *depth));
-    scores.extend(paired.into_iter().map(|(_, score)| score));
+    let mut scratch = Vec::with_capacity(depths.len() + additions.len());
+    merge_depth_scores_with_scratch(depths, scores, &additions, &mut scratch);
+}
+
+fn merge_depth_scores_with_scratch(
+    depths: &mut Vec<f64>,
+    scores: &mut Vec<Option<AggregateEvidence>>,
+    additions: &[(f64, Option<AggregateEvidence>)],
+    scratch: &mut Vec<(f64, Option<AggregateEvidence>)>,
+) {
+    scratch.clear();
+    scratch.extend(depths.iter().copied().zip(scores.iter().copied()));
+    scratch.extend_from_slice(additions);
+    scratch.sort_by(|left, right| (1.0 / left.0).total_cmp(&(1.0 / right.0)));
+    scratch.dedup_by(|left, right| (1.0 / left.0 - 1.0 / right.0).abs() <= f64::EPSILON);
+    depths.clear();
+    scores.clear();
+    depths.extend(scratch.iter().map(|(depth, _)| *depth));
+    scores.extend(scratch.iter().map(|(_, score)| *score));
 }
 
 fn select_direct_depth(
@@ -1914,24 +2267,43 @@ fn select_direct_depth(
 ) -> Option<NodeDepth> {
     let far_inverse = 1.0 / options.far_depth;
     let inverse_range = 1.0 / options.near_depth - far_inverse;
-    let mut ranked = depths
-        .iter()
-        .copied()
-        .zip(scores.iter().copied())
-        .enumerate()
-        .filter_map(|(index, (depth, evidence))| {
-            let evidence = evidence?;
-            let near_fraction = ((1.0 / depth - far_inverse) / inverse_range).clamp(0.0, 1.0);
-            let objective = evidence.ranking_score - NEAR_DEPTH_PRIOR * near_fraction as f32;
-            Some((index, depth, evidence.photometric_score, objective))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.3.total_cmp(&left.3));
-    let &(best_index, depth, score, best_objective) = ranked.first()?;
-    let competing = ranked
-        .iter()
-        .find(|(index, _, _, _)| index.abs_diff(best_index) > 1)
-        .map_or(best_objective, |candidate| candidate.3);
+    let objective_at = |index: usize| {
+        let depth = depths[index];
+        let evidence = scores[index]?;
+        let near_fraction = ((1.0 / depth - far_inverse) / inverse_range).clamp(0.0, 1.0);
+        Some(evidence.ranking_score - NEAR_DEPTH_PRIOR * near_fraction as f32)
+    };
+
+    // The previous implementation materialised and sorted every valid finite
+    // hypothesis. Only the best objective and the strongest non-neighbouring
+    // competitor are needed, so two linear scans preserve the same selection
+    // while eliminating a per-node allocation and sort. Ties keep the earliest
+    // candidate, matching stable sort behaviour.
+    let mut best = None::<(usize, f32)>;
+    for index in 0..depths.len() {
+        let Some(objective) = objective_at(index) else {
+            continue;
+        };
+        if best.is_none_or(|(_, current)| objective.total_cmp(&current).is_gt()) {
+            best = Some((index, objective));
+        }
+    }
+    let (best_index, best_objective) = best?;
+    let depth = depths[best_index];
+    let score = scores[best_index]?.photometric_score;
+    let mut competing = None::<f32>;
+    for index in 0..depths.len() {
+        if index.abs_diff(best_index) <= 1 {
+            continue;
+        }
+        let Some(objective) = objective_at(index) else {
+            continue;
+        };
+        if competing.is_none_or(|current| objective.total_cmp(&current).is_gt()) {
+            competing = Some(objective);
+        }
+    }
+    let competing = competing.unwrap_or(best_objective);
     let margin = (best_objective - competing).max(0.0);
     let paired_improvement = scores[best_index]
         .and_then(|evidence| Some(evidence.paired_photometric_score? - evidence.paired_far_score?));
@@ -2581,88 +2953,6 @@ fn score_views_prepared_into(
     }
 }
 
-fn score_views(
-    inputs: &[AlignInput<'_>],
-    reference_index: usize,
-    alignments: &[ModuleAlignment],
-    centre: Vec2,
-    depth: Option<f64>,
-    options: &DepthOptions,
-    geometry_mode: DepthGeometryMode,
-) -> Vec<ViewScore> {
-    (0..inputs.len())
-        .filter(|&index| {
-            index != reference_index
-                && inputs[index].camera.is_some()
-                && inputs[index].depth_evidence_enabled
-                && (geometry_mode.is_physical() || alignments[index].report.accepted)
-        })
-        .filter_map(|index| {
-            let mut view = match geometry_mode {
-                DepthGeometryMode::PhysicalRig => score_one_view_physical(
-                    &inputs[reference_index],
-                    &inputs[index],
-                    &alignments[index].warp,
-                    centre,
-                    depth,
-                    options,
-                ),
-                DepthGeometryMode::WarpSeeded => score_one_view_warp_seeded(
-                    &inputs[reference_index],
-                    &inputs[index],
-                    &alignments[index].warp,
-                    centre,
-                    depth,
-                    options.patch_radius,
-                ),
-            }?;
-            view.source_index = index;
-            Some(view)
-        })
-        .collect()
-}
-
-fn score_one_view_physical(
-    reference: &AlignInput<'_>,
-    target: &AlignInput<'_>,
-    measured_proposal: &Warp,
-    centre: Vec2,
-    depth: Option<f64>,
-    options: &DepthOptions,
-) -> Option<ViewScore> {
-    let reference_camera = reference.camera?;
-    let target_camera = target.camera?;
-    let score = projected_patch_zncc(
-        reference,
-        target,
-        measured_proposal,
-        centre,
-        depth,
-        [0.0, 0.0],
-        options,
-    )?;
-    let far_score = depth.and_then(|_| {
-        projected_patch_zncc(
-            reference,
-            target,
-            measured_proposal,
-            centre,
-            None,
-            [0.0, 0.0],
-            options,
-        )
-    });
-    let compatibility_score =
-        far_score.map_or(score, |baseline| (score - baseline).clamp(-1.0, 1.0));
-    Some(ViewScore {
-        source_index: usize::MAX,
-        score,
-        far_score,
-        compatibility_score,
-        depth_information: physical_depth_information(reference_camera, target_camera, centre),
-    })
-}
-
 /// Refine the shared multiview depth for one target camera, then permit a
 /// tiny image-space residual around the proposal-guided physical projection.
 /// This final residual is deliberately local and only absorbs
@@ -3261,81 +3551,6 @@ fn projected_patch_zncc_from_prepared_rays(
     projected_patch_zncc_prepared(target, &projection, residual, reference_patch)
 }
 
-/// ZNCC for one candidate scene surface. Matching and depth estimation are
-/// deliberately the same operation: the candidate depth induces a local
-/// physically parameterized reference-to-target projection, including
-/// parallax, focal-length differences, distortion, mirror geometry and
-/// capture-rig refinement. Stage 2 supplies only a perpendicular proposal.
-///
-/// `depth == None` is the physical infinity hypothesis. A small residual may
-/// be supplied only by the post-depth per-view refinement above.
-fn projected_patch_zncc(
-    reference: &AlignInput<'_>,
-    target: &AlignInput<'_>,
-    measured_proposal: &Warp,
-    centre: Vec2,
-    depth: Option<f64>,
-    residual: Vec2,
-    options: &DepthOptions,
-) -> Option<f32> {
-    let projection = local_patch_projection(
-        reference.camera?,
-        target.camera?,
-        measured_proposal,
-        centre,
-        depth,
-        options,
-    )?;
-    let centre_reference = reference.luminance.sample(
-        ((centre[0] - 0.5) * 0.5) as f32,
-        ((centre[1] - 0.5) * 0.5) as f32,
-    )?;
-
-    let radius = options.patch_radius;
-    let sigma = (radius as f32 * 0.75).max(1.0);
-    let mut count = 0.0f32;
-    let mut sum_reference = 0.0f32;
-    let mut sum_target = 0.0f32;
-    let mut sum_reference_sq = 0.0f32;
-    let mut sum_target_sq = 0.0f32;
-    let mut sum_product = 0.0f32;
-    for dy in -(radius as isize)..=radius as isize {
-        for dx in -(radius as isize)..=radius as isize {
-            let point = [centre[0] + dx as f64 * 2.0, centre[1] + dy as f64 * 2.0];
-            let reference_value = reference.luminance.sample(
-                ((point[0] - 0.5) * 0.5) as f32,
-                ((point[1] - 0.5) * 0.5) as f32,
-            )?;
-            let mapped = projection.map(point);
-            let mapped = [mapped[0] + residual[0], mapped[1] + residual[1]];
-            let target_value = target.luminance.sample(
-                ((mapped[0] - 0.5) * 0.5) as f32,
-                ((mapped[1] - 0.5) * 0.5) as f32,
-            )?;
-
-            // A larger direct support window can measure a flat interior from
-            // texture elsewhere on the same surface. Reference-domain range
-            // weighting prevents that support from simply crossing a visible
-            // foreground/background edge.
-            let distance_sq = (dx * dx + dy * dy) as f32;
-            let spatial = (-distance_sq / (2.0 * sigma * sigma)).exp();
-            let range = (-1.2 * (reference_value - centre_reference).abs()).exp();
-            let weight = spatial * range;
-            count += weight;
-            sum_reference += weight * reference_value;
-            sum_target += weight * target_value;
-            sum_reference_sq += weight * reference_value * reference_value;
-            sum_target_sq += weight * target_value * target_value;
-            sum_product += weight * reference_value * target_value;
-        }
-    }
-    let covariance = sum_product - sum_reference * sum_target / count;
-    let reference_energy = sum_reference_sq - sum_reference * sum_reference / count;
-    let target_energy = sum_target_sq - sum_target * sum_target / count;
-    let denominator = (reference_energy.max(0.0) * target_energy.max(0.0)).sqrt();
-    (denominator > 1.0e-6).then_some((covariance / denominator).clamp(-1.0, 1.0))
-}
-
 fn aggregate_with_scratch(
     scores: &[ViewScore],
     options: &DepthOptions,
@@ -3473,6 +3688,7 @@ fn aggregate_physical_evidence_with_scratch(
     })
 }
 
+#[cfg(test)]
 fn aggregate(
     scores: &[ViewScore],
     options: &DepthOptions,
@@ -3488,6 +3704,7 @@ fn aggregate(
 
 /// Legacy compatibility aggregation used only when the dense search is still
 /// seeded by the old image-space warp.
+#[cfg(test)]
 fn aggregate_warp_seeded(
     scores: &[ViewScore],
     options: &DepthOptions,
@@ -3515,6 +3732,7 @@ fn aggregate_warp_seeded(
 /// `photometric_score`. Independent baseline-diverse support changes only
 /// `ranking_score`; it never changes the absolute `minimum_score` threshold or
 /// makes a negative correlation look better merely because more views exist.
+#[cfg(test)]
 fn aggregate_physical_consensus(
     scores: &[ViewScore],
     options: &DepthOptions,
@@ -4058,6 +4276,51 @@ mod tests {
         assert!((two.photometric_score - 0.90).abs() < 1.0e-5);
         assert!((ten.photometric_score - 0.90).abs() < 1.0e-5);
         assert!(ten.ranking_score > two.ranking_score);
+    }
+
+    #[test]
+    fn physical_visibility_bits_match_consensus_membership() {
+        let options = DepthOptions {
+            minimum_support: 2,
+            ..DepthOptions::default()
+        };
+        let views = [
+            ViewScore {
+                source_index: 1,
+                score: 0.91,
+                far_score: Some(0.72),
+                compatibility_score: 0.19,
+                depth_information: 0.4,
+            },
+            ViewScore {
+                source_index: 3,
+                score: 0.84,
+                far_score: Some(0.71),
+                compatibility_score: 0.13,
+                depth_information: 1.0,
+            },
+            ViewScore {
+                source_index: 5,
+                score: 0.68,
+                far_score: Some(0.75),
+                compatibility_score: -0.07,
+                depth_information: 2.5,
+            },
+        ];
+        let consensus = aggregate_physical_consensus(&views, &options).expect("consensus");
+        let per_view_score_floor = (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
+        let mut bits = [0u64; 1];
+        let mut scratch = AggregateScratch::default();
+        physical_consensus_visibility_bits(&views, &options, &mut bits, &mut scratch);
+        for view in views {
+            let expected = consensus.members.iter().any(|member| {
+                member.source_index == view.source_index
+                    && member.compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
+                    && member.score >= per_view_score_floor
+            });
+            let actual = bits[0] & (1u64 << view.source_index) != 0;
+            assert_eq!(actual, expected, "source {}", view.source_index);
+        }
     }
 
     #[test]
