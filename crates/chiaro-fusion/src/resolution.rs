@@ -18,8 +18,12 @@ use crate::{
 const LOCAL_WARP_STEP: usize = 32;
 const LOCAL_MATCH_PATCH: usize = 12;
 const LOCAL_MATCH_RADIUS: usize = 2;
-const MAGNIFIED_MATCH_RADIUS: usize = 5;
 const LOCAL_MINIMUM_SCORE: f32 = 0.72;
+// Dense physical geometry must already place a source within the correct CFA
+// neighbourhood. This stage may absorb only a small residual calibration/
+// sampling-phase error; a larger image match is evidence against the physical
+// projection and must not silently replace it.
+const LOCAL_MAXIMUM_CORRECTION_PX: f32 = 2.25;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -296,16 +300,7 @@ pub fn refine_resolution_warp(
         .magnification(centre[0], centre[1])
         .unwrap_or(1.0)
         .clamp(0.5, 4.0);
-    // A tele module's residual disparity is expressed on the reference grid.
-    // The old two-pixel half-resolution search could correct at most four
-    // reference pixels, exactly where several C modules in difficult captures
-    // reached the boundary. Give magnified contributors enough room without
-    // multiplying the cost for same-focal-length modules.
-    let match_radius = if target_magnification > 1.35 {
-        MAGNIFIED_MATCH_RADIUS
-    } else {
-        LOCAL_MATCH_RADIUS
-    };
+    let match_radius = LOCAL_MATCH_RADIUS;
     let mut rendered = Plane::new(reference.width, reference.height);
     for y in 0..rendered.height {
         for x in 0..rendered.width {
@@ -369,8 +364,10 @@ pub fn refine_resolution_warp(
                     match_patch(reference, &rendered, x, y, LOCAL_MATCH_PATCH, match_radius)
                 && found.score >= LOCAL_MINIMUM_SCORE
             {
-                measured[row * columns + column] =
-                    Some(([found.shift[0] * 2.0, found.shift[1] * 2.0], found.score));
+                let correction = [found.shift[0] * 2.0, found.shift[1] * 2.0];
+                if correction[0].hypot(correction[1]) <= LOCAL_MAXIMUM_CORRECTION_PX {
+                    measured[row * columns + column] = Some((correction, found.score));
+                }
             }
         }
     }

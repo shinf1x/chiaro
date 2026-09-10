@@ -497,10 +497,16 @@ fn main() -> Result<()> {
     }
     for module in &report.modules {
         let depth_support = module.depth.as_ref().map(|depth| {
+            let unknown_fraction = if depth.tested_nodes == 0 {
+                0.0
+            } else {
+                depth.unknown_nodes as f32 / depth.tested_nodes as f32
+            };
             format!(
-                ", warp defined {:.1}%/direct {:.1}%",
+                ", warp defined {:.1}%/direct {:.1}%/unknown {:.1}%",
                 depth.defined_fraction * 100.0,
-                depth.directly_supported_fraction * 100.0
+                depth.directly_supported_fraction * 100.0,
+                unknown_fraction * 100.0,
             )
         });
         println!(
@@ -607,6 +613,12 @@ fn main() -> Result<()> {
             joint.mean_solver_iterations,
             joint.mean_weighted_residual,
             joint.in_sample_relative_fit * 100.0,
+        );
+        println!(
+            "  Joint-CFA rejection funnel (of solver attempts): geometry {:.2}%, footprint samples {:.2}%, conditioning {:.2}%",
+            joint.insufficient_geometry_fraction * 100.0,
+            joint.insufficient_samples_fraction * 100.0,
+            joint.solver_rejected_fraction * 100.0,
         );
     }
     for held_out in &report.synthesis.held_out_cfa {

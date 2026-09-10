@@ -1562,13 +1562,20 @@ fn write_pipeline_trace(
         .iter()
         .find_map(|alignment| alignment.report.depth.as_ref())
     {
+        let measured_fraction = if depth.tested_nodes == 0 {
+            0.0
+        } else {
+            depth.measured_nodes as f32 / depth.tested_nodes as f32
+        };
         let _ = writeln!(
             trace,
-            "\nShared reference-space depth\n----------------------------\n{} / {} tested nodes directly measured ({:.2}%); {} regularized.\nDense acceptance funnel: {} direct finite selections -> {} neighbour-consistent -> {} component-consistent; {} nodes directly support the stage-2 output fallback.\nThis one field is projected into every camera, so it is intentionally not a per-camera percentage.",
+            "\nShared reference-space depth\n----------------------------\n{} / {} tested nodes directly measured ({:.2}%); {} regularized ({:.2}% combined finite coverage).\nA measured along-epipolar seed was available at {} tested nodes; it proposes search hypotheses but is not depth evidence.\nDense acceptance funnel: {} direct finite selections -> {} neighbour-consistent -> {} component-consistent; {} nodes directly support the stage-2 output fallback.\nThis one field is projected into every camera, so it is intentionally not a per-camera percentage.",
             depth.measured_nodes,
             depth.tested_nodes,
-            depth.reconstructed_fraction * 100.0,
+            measured_fraction * 100.0,
             depth.regularized_nodes,
+            depth.reconstructed_fraction * 100.0,
+            depth.epipolar_seeded_nodes,
             depth.direct_selected_nodes,
             depth.neighbour_consistent_nodes,
             depth.component_consistent_nodes,
@@ -1639,7 +1646,7 @@ fn write_pipeline_trace(
     trace.push_str("\nPer-camera geometry\n-------------------\n");
     let _ = writeln!(
         trace,
-        "camera  legacy  physical  overlap  warp-defined  direct-support  correction(x,y) px  view-refined  far-fallback  occluded"
+        "camera  legacy  physical  overlap  warp-defined  direct-support  correction(x,y) px  view-refined  far-fallback  unknown  occluded"
     );
     for alignment in alignments {
         let depth = alignment.report.depth.as_ref();
@@ -1651,7 +1658,7 @@ fn write_pipeline_trace(
             .unwrap_or_else(|| "    n/a".to_owned());
         let _ = writeln!(
             trace,
-            "{:<7} {:<7} {:<8} {:>6.2}%    {}        {}       ({:>7.2},{:>7.2})  {:>7.2}%      {:>7}    {:>7}",
+            "{:<7} {:<7} {:<8} {:>6.2}%    {}        {}       ({:>7.2},{:>7.2})  {:>7.2}%      {:>7}  {:>7}  {:>7}",
             alignment.name,
             if alignment.report.accepted {
                 "accept"
@@ -1670,6 +1677,7 @@ fn write_pipeline_trace(
             alignment.report.correction_median_px[1],
             depth.map_or(0.0, |depth| depth.refined_fraction * 100.0),
             depth.map_or(0, |depth| depth.fallback_nodes),
+            depth.map_or(0, |depth| depth.unknown_nodes),
             depth.map_or(0, |depth| depth.occluded_nodes),
         );
     }

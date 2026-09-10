@@ -157,7 +157,12 @@ impl Default for RigRefinementOptions {
             held_out_validation: true,
             min_tracks: 80,
             min_validation_tracks: 20,
-            min_camera_observations: 150,
+            // A camera contributes at most nine physical correction
+            // parameters, and the subsequent finite-difference observability,
+            // robust membership, bounds, and factory priors independently
+            // gate them. Requiring 150 observations excluded every narrow-FOV
+            // C module before those checks even ran on ordinary captures.
+            min_camera_observations: 48,
             validation_fraction: 0.20,
             validation_block_size_px: 256,
             max_iterations: 6,
