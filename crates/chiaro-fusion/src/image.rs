@@ -850,34 +850,45 @@ impl Plane {
 /// Result of matching one patch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PatchMatch {
-    /// Sub-pixel shift `(dx, dy)` of the target patch relative to the reference.
+    /// Sub-pixel shift `(dx, dy)` of the target patch relative to the supplied
+    /// target search origin.
     pub shift: [f32; 2],
     /// Peak normalised cross-correlation in `[-1, 1]`.
     pub score: f32,
+    /// Best non-neighbouring NCC peak. This deliberately excludes the 3x3
+    /// neighbourhood around the winning integer shift so the value measures a
+    /// genuinely competing correspondence rather than curvature of the same
+    /// correlation peak.
+    pub second_score: f32,
+    /// `score - second_score`. Small values indicate repeated/one-dimensional
+    /// structure for which the nominal patch centre is poorly localised.
+    pub peak_margin: f32,
 }
 
 /// Normalised cross-correlation between a `size x size` reference window at
-/// `(rx, ry)` and the same-sized window of `target` displaced by every integer
-/// shift within `radius`. The peak is refined to sub-pixel precision with a
-/// parabola through its neighbours.
+/// `(rx, ry)` and a target window initially placed at `(tx, ty)`, displaced by
+/// every integer shift within `radius`. The peak is refined to sub-pixel
+/// precision with a parabola through its neighbours.
 ///
-/// Returns `None` when either window lacks contrast or leaves the images.
-pub fn match_patch(
+/// `tx != rx` is useful for sparse feature matching when another geometric
+/// model already provides a target-side proposal. `match_patch` below keeps
+/// the historic same-origin API for dense alignment callers.
+pub fn match_patch_at(
     reference: &Plane,
     target: &Plane,
     rx: usize,
     ry: usize,
+    tx: usize,
+    ty: usize,
     size: usize,
     radius: usize,
 ) -> Option<PatchMatch> {
     if rx + size > reference.width
         || ry + size > reference.height
-        || rx < radius
-        || ry < radius
-        || rx + size + radius > target.width
-        || ry + size + radius > target.height
-        || rx + size > target.width
-        || ry + size > target.height
+        || tx < radius
+        || ty < radius
+        || tx + size + radius > target.width
+        || ty + size + radius > target.height
     {
         return None;
     }
@@ -888,6 +899,9 @@ pub fn match_patch(
         ref_values.extend_from_slice(
             &reference.data[y * reference.width + rx..y * reference.width + rx + size],
         );
+    }
+    if ref_values.iter().any(|value| !value.is_finite()) {
+        return None;
     }
     let ref_mean = ref_values.iter().sum::<f32>() / n;
     let ref_std = (ref_values
@@ -905,14 +919,19 @@ pub fn match_patch(
     let mut scores = vec![f32::NEG_INFINITY; span * span];
     for dy in 0..span {
         for dx in 0..span {
-            let tx = rx + dx - radius;
-            let ty = ry + dy - radius;
+            let sx = tx + dx - radius;
+            let sy = ty + dy - radius;
             let mut sum = 0.0f32;
             let mut sum_sq = 0.0f32;
             let mut cross = 0.0f32;
+            let mut valid = true;
             for y in 0..size {
                 let row =
-                    &target.data[(ty + y) * target.width + tx..(ty + y) * target.width + tx + size];
+                    &target.data[(sy + y) * target.width + sx..(sy + y) * target.width + sx + size];
+                if row.iter().any(|value| !value.is_finite()) {
+                    valid = false;
+                    break;
+                }
                 let reference_row = &ref_centered[y * size..(y + 1) * size];
                 for (t, r) in row.iter().zip(reference_row) {
                     sum += t;
@@ -920,12 +939,16 @@ pub fn match_patch(
                     cross += t * r;
                 }
             }
+            if !valid {
+                continue;
+            }
             let mean = sum / n;
             let var = (sum_sq / n - mean * mean).max(0.0);
             if var < 1e-8 {
                 continue;
             }
-            // cross already excludes the reference mean; subtract the target mean term.
+            // cross already excludes the reference mean; subtracting the
+            // target mean is therefore unnecessary because sum(ref-centred)=0.
             let covariance = cross / n;
             scores[dy * span + dx] = covariance / (var.sqrt() * ref_std);
         }
@@ -940,7 +963,7 @@ pub fn match_patch(
     let (bx, by) = (best % span, best / span);
     let refine = |minus: f32, center: f32, plus: f32| -> f32 {
         let denominator = minus - 2.0 * center + plus;
-        if denominator.abs() < 1e-9 {
+        if !minus.is_finite() || !plus.is_finite() || denominator.abs() < 1e-9 {
             0.0
         } else {
             (0.5 * (minus - plus) / denominator).clamp(-0.5, 0.5)
@@ -964,13 +987,45 @@ pub fn match_patch(
     } else {
         0.0
     };
+
+    // A broad NCC ridge is common on railings, beams and silhouettes. Such a
+    // ridge can have a very high winning NCC while providing almost no
+    // information about position along the edge. Measure the strongest peak
+    // outside the immediate 3x3 neighbourhood of the winner.
+    let mut second_score = f32::NEG_INFINITY;
+    for y in 0..span {
+        for x in 0..span {
+            if x.abs_diff(bx) <= 1 && y.abs_diff(by) <= 1 {
+                continue;
+            }
+            second_score = second_score.max(scores[y * span + x]);
+        }
+    }
+    if !second_score.is_finite() {
+        second_score = -1.0;
+    }
+
     Some(PatchMatch {
         shift: [
             bx as f32 - radius as f32 + sub_x,
             by as f32 - radius as f32 + sub_y,
         ],
         score,
+        second_score,
+        peak_margin: score - second_score,
     })
+}
+
+/// Same-origin convenience wrapper used by the existing dense/grid matchers.
+pub fn match_patch(
+    reference: &Plane,
+    target: &Plane,
+    rx: usize,
+    ry: usize,
+    size: usize,
+    radius: usize,
+) -> Option<PatchMatch> {
+    match_patch_at(reference, target, rx, ry, rx, ry, size, radius)
 }
 
 #[cfg(test)]
@@ -989,6 +1044,32 @@ mod tests {
             }
         }
         plane
+    }
+
+    #[test]
+    fn patch_match_at_uses_an_independent_target_proposal() {
+        let reference = textured(200, 160, (0.0, 0.0));
+        let target = textured(200, 160, (3.4, -2.6));
+        // A geometric proposal already accounts for the integer part of the
+        // displacement; the matcher should recover only the residual.
+        let matched = match_patch_at(&reference, &target, 60, 50, 63, 47, 48, 4).unwrap();
+        assert!((matched.shift[0] - 0.4).abs() < 0.25, "{matched:?}");
+        assert!((matched.shift[1] - 0.4).abs() < 0.25, "{matched:?}");
+    }
+
+    #[test]
+    fn patch_match_reports_ambiguous_repeated_peaks() {
+        let mut stripes = Plane::new(160, 120);
+        for y in 0..stripes.height {
+            for x in 0..stripes.width {
+                // Periodic vertical structure: many horizontal shifts are
+                // photometrically indistinguishable.
+                stripes.data[y * stripes.width + x] = ((x % 8) as f32 - 3.5).abs();
+            }
+        }
+        let matched = match_patch(&stripes, &stripes, 50, 40, 24, 12).unwrap();
+        assert!(matched.score > 0.99);
+        assert!(matched.peak_margin < 1.0e-3, "{matched:?}");
     }
 
     #[test]

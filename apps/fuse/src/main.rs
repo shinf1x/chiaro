@@ -4,10 +4,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
 use chiaro_fusion::array_color::ColorProfileMode;
-use chiaro_fusion::calibration::IntrinsicsMode;
+use chiaro_fusion::calibration::{IntrinsicsMode, MirrorAngleMode};
 use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::resolution::ResolutionReconstruction;
+use chiaro_fusion::rig::RigRefinementStrategy;
 use chiaro_fusion::synth::{CanvasMode, CropWindow, OutputColor};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::HighlightRecovery;
@@ -44,6 +45,40 @@ impl From<FactoryProfile> for ColorProfileMode {
 enum Intrinsics {
     LinearHall,
     Clamp,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MirrorAngleModel {
+    CurrentQuadratic,
+    CalibrationQuadraticInverse,
+    CalibrationPairsLinear,
+}
+
+impl From<MirrorAngleModel> for MirrorAngleMode {
+    fn from(value: MirrorAngleModel) -> Self {
+        match value {
+            MirrorAngleModel::CurrentQuadratic => Self::CurrentQuadratic,
+            MirrorAngleModel::CalibrationQuadraticInverse => Self::CalibrationQuadraticInverse,
+            MirrorAngleModel::CalibrationPairsLinear => Self::CalibrationPairsLinear,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RigStrategy {
+    Physical,
+    AnchorGraph,
+    LatentGraph,
+}
+
+impl From<RigStrategy> for RigRefinementStrategy {
+    fn from(value: RigStrategy) -> Self {
+        match value {
+            RigStrategy::Physical => Self::Physical,
+            RigStrategy::AnchorGraph => Self::AnchorGraph,
+            RigStrategy::LatentGraph => Self::LatentGraph,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -191,6 +226,298 @@ struct Cli {
     #[arg(long)]
     no_rig_refine: bool,
 
+    /// Rig correspondence strategy. `physical` keeps the V10 matcher;
+    /// `anchor-graph` grows constellation-validated tracks before fitting;
+    /// `latent-graph` keeps several repeated-structure hypotheses and lets
+    /// them switch between bundle passes.
+    #[arg(long, value_enum, default_value = "physical")]
+    rig_strategy: RigStrategy,
+
+    /// Maximum anchor-graph propagation rounds after bootstrap.
+    #[arg(long)]
+    rig_anchor_rounds: Option<usize>,
+
+    /// Minimum factory overlap, relative to the smaller field, for a camera
+    /// pair to be eligible as a direct anchor-graph edge.
+    #[arg(long)]
+    rig_anchor_min_overlap: Option<f64>,
+
+    /// Direct camera edges activated before propagation starts.
+    #[arg(long)]
+    rig_anchor_initial_edges: Option<usize>,
+
+    /// Hard ceiling on direct camera edges after adaptive graph growth.
+    #[arg(long)]
+    rig_anchor_max_edges: Option<usize>,
+
+    /// Desired minimum degree per camera in the active graph.
+    #[arg(long)]
+    rig_anchor_min_degree: Option<usize>,
+
+    /// Maximum camera edges activated after any one propagation round.
+    #[arg(long)]
+    rig_anchor_edges_per_round: Option<usize>,
+
+    /// Early-stop threshold for new validated observations per round.
+    #[arg(long)]
+    rig_anchor_min_observation_growth: Option<f64>,
+
+    /// Early-stop threshold for new cycle-supported 3+ view tracks per round.
+    #[arg(long)]
+    rig_anchor_min_track_growth: Option<f64>,
+
+    /// Native-sensor search radius around an anchor/constellation prediction.
+    #[arg(long)]
+    rig_anchor_search_radius_px: Option<f64>,
+
+    /// Wide native-sensor radius used only to establish a newly activated
+    /// camera edge directly from factory geometry.
+    #[arg(long)]
+    rig_anchor_direct_seed_radius_px: Option<f64>,
+
+    /// Maximum response-sorted corners considered per camera when directly
+    /// seeding a newly activated edge.
+    #[arg(long)]
+    rig_anchor_direct_seed_max_corners: Option<usize>,
+
+    /// Maximum candidates retained for one latent track/camera observation.
+    #[arg(long)]
+    rig_latent_candidates: Option<usize>,
+
+    /// Maximum latent correspondence-assignment rounds.
+    #[arg(long)]
+    rig_latent_rounds: Option<usize>,
+
+    /// Minimum target-side self-similarity for a latent alternative.
+    #[arg(long)]
+    rig_latent_min_similarity: Option<f64>,
+
+    /// Maximum difference from the initial candidate's signed factory
+    /// epipolar residual, in target sensor pixels.
+    #[arg(long)]
+    rig_latent_epipolar_band_px: Option<f64>,
+
+    /// Local constellation neighbours used when scoring candidate switches.
+    #[arg(long)]
+    rig_latent_neighbours: Option<usize>,
+
+    /// Near-duplicate latent alternatives above this similarity are not used
+    /// as frozen held-out labels.
+    #[arg(long)]
+    rig_latent_validation_max_similarity: Option<f64>,
+
+    /// Minimum image-only seed confidence for a latent held-out observation.
+    #[arg(long)]
+    rig_latent_validation_min_confidence: Option<f64>,
+
+    /// Minimum best-vs-runner-up image-match margin for a latent held-out label.
+    #[arg(long)]
+    rig_latent_validation_min_peak_margin: Option<f64>,
+
+    /// Maximum forward/backward localization disagreement for a latent
+    /// held-out label, in native target-sensor pixels.
+    #[arg(long)]
+    rig_latent_validation_max_forward_backward_px: Option<f64>,
+
+    /// Maximum image-only local-constellation disagreement allowed for a
+    /// latent held-out label, in reference-equivalent pixels.
+    #[arg(long)]
+    rig_latent_validation_max_constellation_error_px: Option<f64>,
+
+    /// Minimum active fit observations protected per target camera by
+    /// reversible latent membership.
+    #[arg(long)]
+    rig_latent_membership_min_camera_observations: Option<usize>,
+
+    /// Minimum fraction of each camera's initial fit support protected by
+    /// reversible latent membership.
+    #[arg(long)]
+    rig_latent_membership_min_camera_fraction: Option<f64>,
+
+    /// Dormant observation reactivation threshold in reference-equivalent px.
+    #[arg(long)]
+    rig_latent_membership_recovery_reference_px: Option<f64>,
+
+    /// Looser LOO gate used only when restoring a starved camera to its
+    /// protected fit-support floor.
+    #[arg(long)]
+    rig_latent_membership_floor_max_reference_px: Option<f64>,
+
+    /// Symmetric calibrated epipolar cutoff for intrinsically two-view latent
+    /// tracks. Tracks above it become dormant as a whole.
+    #[arg(long)]
+    rig_latent_pairwise_max_reference_px: Option<f64>,
+
+    /// Hysteretic recovery cutoff for a dormant two-view latent track.
+    #[arg(long)]
+    rig_latent_pairwise_recovery_reference_px: Option<f64>,
+
+    /// Relative bundle-objective weight of intrinsically two-view tracks.
+    #[arg(long)]
+    rig_latent_pairwise_bundle_weight: Option<f64>,
+
+    /// Disable bootstrap multi-camera cycle constraints inside LatentGraph.
+    #[arg(long)]
+    rig_latent_no_cycle_graph: bool,
+
+    /// Maximum direct camera edges used by LatentGraph's image-only cycle graph.
+    #[arg(long)]
+    rig_latent_cycle_max_edges: Option<usize>,
+
+    /// Minimum cycle-supported anchors required for a cross-camera pair field.
+    #[arg(long)]
+    rig_latent_cycle_min_anchors: Option<usize>,
+
+    /// Weight of multi-camera cycle consistency in latent candidate scoring.
+    #[arg(long)]
+    rig_latent_cycle_weight: Option<f64>,
+
+    /// Maximum cycle-prediction disagreement allowed for an unsupported switch.
+    #[arg(long)]
+    rig_latent_cycle_max_error_px: Option<f64>,
+
+    /// Fit-only robust-membership cutoff in reference-equivalent pixels.
+    #[arg(long)]
+    rig_fit_membership_max_reference_px: Option<f64>,
+
+    /// Absolute held-out rig RMS target in native target-sensor pixels.
+    #[arg(long)]
+    rig_validation_max_rms_px: Option<f64>,
+
+    /// Maximum held-out p90 residual accepted for a physical rig.
+    #[arg(long)]
+    rig_validation_max_p90_px: Option<f64>,
+
+    /// Maximum held-out p95 residual accepted for a physical rig.
+    #[arg(long)]
+    rig_validation_max_p95_px: Option<f64>,
+
+    /// Minimum frozen held-out observations required for every optimized camera.
+    #[arg(long)]
+    rig_validation_min_camera_samples: Option<usize>,
+
+    /// Maximum camera-local held-out RMS accepted for an optimized camera.
+    #[arg(long)]
+    rig_validation_max_camera_rms_px: Option<f64>,
+
+    /// Maximum camera-local held-out p90 accepted for an optimized camera.
+    #[arg(long)]
+    rig_validation_max_camera_p90_px: Option<f64>,
+
+    /// Maximum per-axis capture-specific camera orientation correction.
+    #[arg(long)]
+    rig_max_orientation_degrees: Option<f64>,
+
+    /// Maximum additive movable-mirror angle correction.
+    #[arg(long)]
+    rig_max_mirror_degrees: Option<f64>,
+
+    /// Maximum optical-centre correction per world axis, in calibration units.
+    #[arg(long)]
+    rig_max_center_offset: Option<f64>,
+
+    /// Maximum shared B/C-group scale of CRA/Hall-implied focus travel along
+    /// each physical camera optical axis. Zero (the default) disables it.
+    #[arg(long)]
+    rig_max_focus_pupil_scale: Option<f64>,
+
+    /// Maximum calibration-raster origin correction per sensor axis.
+    #[arg(long)]
+    rig_max_sensor_offset_px: Option<f64>,
+
+    /// Maximum LatentGraph isotropic focal correction, as percent from factory.
+    #[arg(long)]
+    rig_max_focal_scale_percent: Option<f64>,
+
+    /// Maximum LatentGraph C-camera focal anisotropy, as percent. Positive
+    /// values expand fx while contracting fy around the common focal scale.
+    #[arg(long)]
+    rig_max_focal_aspect_percent: Option<f64>,
+
+    /// Maximum additive C-camera Brown k1 correction.
+    #[arg(long)]
+    rig_max_distortion_k1_delta: Option<f64>,
+
+    /// Maximum additive C-camera Brown k2 correction.
+    #[arg(long)]
+    rig_max_distortion_k2_delta: Option<f64>,
+
+    /// Maximum absolute additive C-camera Brown p1/p2 correction.
+    #[arg(long)]
+    rig_max_distortion_tangential_delta: Option<f64>,
+
+    /// Maximum independent C-camera distortion-centre offset per sensor axis.
+    #[arg(long)]
+    rig_max_distortion_center_offset_px: Option<f64>,
+
+    /// One-sigma scale of the factory prior for orientation corrections.
+    #[arg(long)]
+    rig_orientation_prior_sigma_degrees: Option<f64>,
+
+    /// One-sigma scale of the factory prior for movable-mirror corrections.
+    #[arg(long)]
+    rig_mirror_prior_sigma_degrees: Option<f64>,
+
+    /// One-sigma scale of the factory prior for optical-centre corrections.
+    #[arg(long)]
+    rig_center_prior_sigma: Option<f64>,
+
+    /// One-sigma prior for the dimensionless shared focus-pupil scale.
+    #[arg(long)]
+    rig_focus_pupil_prior_sigma: Option<f64>,
+
+    /// One-sigma scale of the factory prior for sensor-raster offsets.
+    #[arg(long)]
+    rig_sensor_prior_sigma_px: Option<f64>,
+
+    /// One-sigma LatentGraph focal-scale prior, as percent from factory.
+    #[arg(long)]
+    rig_focal_scale_prior_percent: Option<f64>,
+
+    /// One-sigma LatentGraph C-camera focal-anisotropy prior, as percent.
+    #[arg(long)]
+    rig_focal_aspect_prior_percent: Option<f64>,
+
+    /// One-sigma prior for additive C-camera Brown k1 correction.
+    #[arg(long)]
+    rig_distortion_k1_prior: Option<f64>,
+
+    /// One-sigma prior for additive C-camera Brown k2 correction.
+    #[arg(long)]
+    rig_distortion_k2_prior: Option<f64>,
+
+    /// One-sigma prior for additive C-camera Brown p1/p2 correction.
+    #[arg(long)]
+    rig_distortion_tangential_prior: Option<f64>,
+
+    /// One-sigma prior for C-camera distortion-centre offset, in sensor pixels.
+    #[arg(long)]
+    rig_distortion_center_prior_px: Option<f64>,
+
+    /// Weight of the normalized quadratic factory-rig prior.
+    #[arg(long)]
+    rig_factory_prior_weight: Option<f64>,
+
+    /// Finest native-sensor step used by physical-match localization.
+    #[arg(long)]
+    rig_match_subpixel_step_px: Option<f64>,
+
+    /// Half-resolution ZNCC patch radius for physical matching.
+    #[arg(long)]
+    rig_match_patch_radius: Option<usize>,
+
+    /// Minimum per-camera ZNCC score accepted by physical matching.
+    #[arg(long)]
+    rig_match_min_score: Option<f32>,
+
+    /// Minimum relative separation between competing physical depth modes.
+    #[arg(long)]
+    rig_match_min_margin: Option<f32>,
+
+    /// Pre-solve proposal-normalized reprojection gate, in reference pixels.
+    #[arg(long)]
+    rig_match_pre_solve_reprojection_px: Option<f64>,
+
     /// Disable calibrated local inverse-depth refinement and keep one global
     /// homography per module.
     #[arg(long)]
@@ -207,6 +534,17 @@ struct Cli {
     /// Focus calibration outside the measured Hall range.
     #[arg(long, value_enum, default_value = "linear-hall")]
     intrinsics: Intrinsics,
+
+    /// Hall-code to movable-mirror angle model. The default implements the
+    /// factory quadratic's stored inverse-root semantics; the other modes are
+    /// retained for controlled A/B comparisons and rollback.
+    #[arg(long, value_enum, default_value = "calibration-quadratic-inverse")]
+    mirror_angle_model: MirrorAngleModel,
+
+    /// Disable the factory mirror-angle optical-center mapping candidate for
+    /// A1->B and B4->C image alignment.
+    #[arg(long)]
+    no_angle_optical_center_prior: bool,
 
     /// Skip the factory flat-field (vignetting) correction.
     #[arg(long)]
@@ -245,6 +583,8 @@ fn main() -> Result<()> {
             Intrinsics::LinearHall => IntrinsicsMode::LinearHall,
             Intrinsics::Clamp => IntrinsicsMode::Clamp,
         },
+        mirror_angle_mode: cli.mirror_angle_model.into(),
+        angle_optical_center_prior: !cli.no_angle_optical_center_prior,
         hotpixel: cli.hotpixel_rec.clone().map(|rec| HotpixelStage {
             rec,
             universal_model: !cli.no_universal_hotpixel_model,
@@ -260,6 +600,239 @@ fn main() -> Result<()> {
     };
     options.align.refine = !cli.no_refine;
     options.rig_refinement.enabled = !cli.no_refine && !cli.no_rig_refine;
+    options.rig_refinement.strategy = cli.rig_strategy.into();
+    if let Some(value) = cli.rig_anchor_rounds {
+        options.rig_refinement.anchor_max_rounds = value.min(12);
+    }
+    if let Some(value) = cli.rig_anchor_min_overlap {
+        options.rig_refinement.anchor_min_factory_overlap = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = cli.rig_anchor_initial_edges {
+        options.rig_refinement.anchor_initial_active_edges = value.max(1);
+    }
+    if let Some(value) = cli.rig_anchor_max_edges {
+        options.rig_refinement.anchor_max_active_edges = value.max(1);
+    }
+    if let Some(value) = cli.rig_anchor_min_degree {
+        options.rig_refinement.anchor_min_camera_degree = value;
+    }
+    if let Some(value) = cli.rig_anchor_edges_per_round {
+        options.rig_refinement.anchor_edges_per_round = value;
+    }
+    if let Some(value) = cli.rig_anchor_min_observation_growth {
+        options
+            .rig_refinement
+            .anchor_min_observation_growth_fraction = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = cli.rig_anchor_min_track_growth {
+        options
+            .rig_refinement
+            .anchor_min_strong_track_growth_fraction = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = cli.rig_anchor_search_radius_px {
+        options.rig_refinement.anchor_search_radius_px = value.max(1.0);
+    }
+    if let Some(value) = cli.rig_anchor_direct_seed_radius_px {
+        options.rig_refinement.anchor_direct_seed_search_radius_px = value.max(4.0);
+    }
+    if let Some(value) = cli.rig_anchor_direct_seed_max_corners {
+        options.rig_refinement.anchor_direct_seed_max_corners = value.max(64);
+    }
+    if let Some(value) = cli.rig_latent_candidates {
+        options.rig_refinement.latent_max_candidates = value.clamp(1, 16);
+    }
+    if let Some(value) = cli.rig_latent_rounds {
+        options.rig_refinement.latent_max_assignment_iterations = value.min(16);
+    }
+    if let Some(value) = cli.rig_latent_min_similarity {
+        options.rig_refinement.latent_min_appearance_similarity = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = cli.rig_latent_epipolar_band_px {
+        options.rig_refinement.latent_candidate_epipolar_band_px = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_latent_neighbours {
+        let neighbours = value.max(3);
+        options.rig_refinement.latent_neighbour_count = neighbours;
+        options.rig_refinement.latent_cycle_neighbour_count = neighbours;
+    }
+    if let Some(value) = cli.rig_latent_validation_max_similarity {
+        options
+            .rig_refinement
+            .latent_validation_max_alternative_similarity = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = cli.rig_latent_validation_min_confidence {
+        options.rig_refinement.latent_validation_min_confidence = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = cli.rig_latent_validation_min_peak_margin {
+        options.rig_refinement.latent_validation_min_peak_margin = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_latent_validation_max_forward_backward_px {
+        options
+            .rig_refinement
+            .latent_validation_max_forward_backward_px = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_latent_validation_max_constellation_error_px {
+        options
+            .rig_refinement
+            .latent_validation_max_constellation_error_px = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_latent_membership_min_camera_observations {
+        options
+            .rig_refinement
+            .latent_membership_min_camera_observations = value.max(2);
+    }
+    if let Some(value) = cli.rig_latent_membership_min_camera_fraction {
+        options.rig_refinement.latent_membership_min_camera_fraction = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = cli.rig_latent_membership_recovery_reference_px {
+        options
+            .rig_refinement
+            .latent_membership_recovery_reference_px = value.max(0.1);
+    }
+    if let Some(value) = cli.rig_latent_membership_floor_max_reference_px {
+        options
+            .rig_refinement
+            .latent_membership_floor_max_reference_px = value.max(0.1);
+    }
+    if let Some(value) = cli.rig_latent_pairwise_max_reference_px {
+        options
+            .rig_refinement
+            .latent_pairwise_membership_max_reference_px = value.max(0.1);
+    }
+    if let Some(value) = cli.rig_latent_pairwise_recovery_reference_px {
+        options
+            .rig_refinement
+            .latent_pairwise_membership_recovery_reference_px = value.max(0.05);
+    }
+    if let Some(value) = cli.rig_latent_pairwise_bundle_weight {
+        options.rig_refinement.latent_pairwise_bundle_weight = value.clamp(0.0, 1.0);
+    }
+    if cli.rig_latent_no_cycle_graph {
+        options.rig_refinement.latent_cycle_graph_enabled = false;
+    }
+    if let Some(value) = cli.rig_latent_cycle_max_edges {
+        options.rig_refinement.latent_cycle_graph_max_edges = value;
+    }
+    if let Some(value) = cli.rig_latent_cycle_min_anchors {
+        options.rig_refinement.latent_cycle_min_pair_anchors = value.max(3);
+    }
+    if let Some(value) = cli.rig_latent_cycle_weight {
+        options.rig_refinement.latent_cycle_weight = value.clamp(0.0, 4.0);
+    }
+    if let Some(value) = cli.rig_latent_cycle_max_error_px {
+        options.rig_refinement.latent_cycle_max_error_px = value.max(0.1);
+    }
+    if let Some(value) = cli.rig_fit_membership_max_reference_px {
+        options.rig_refinement.fit_membership_max_reference_px = value.max(0.25);
+    }
+    if let Some(value) = cli.rig_validation_max_rms_px {
+        options.rig_refinement.max_validation_rms_px = value.max(0.05);
+    }
+    if let Some(value) = cli.rig_validation_max_p90_px {
+        options.rig_refinement.max_validation_p90_px = value.max(0.05);
+    }
+    if let Some(value) = cli.rig_validation_max_p95_px {
+        options.rig_refinement.max_validation_p95_px = value.max(0.05);
+    }
+    if let Some(value) = cli.rig_validation_min_camera_samples {
+        options.rig_refinement.min_validation_camera_samples = value.max(3);
+    }
+    if let Some(value) = cli.rig_validation_max_camera_rms_px {
+        options.rig_refinement.max_validation_camera_rms_px = value.max(0.05);
+    }
+    if let Some(value) = cli.rig_validation_max_camera_p90_px {
+        options.rig_refinement.max_validation_camera_p90_px = value.max(0.05);
+    }
+    // Keep RigRefinementOptions::default() as the single source of truth.
+    // CLI values override it only when the user explicitly supplies them;
+    // duplicating defaults here previously left stale bounds/priors active
+    // even after the library defaults were tightened.
+    if let Some(value) = cli.rig_max_orientation_degrees {
+        options.rig_refinement.max_orientation_degrees = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_max_mirror_degrees {
+        options.rig_refinement.max_mirror_degrees = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_max_center_offset {
+        options.rig_refinement.max_center_offset = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_max_focus_pupil_scale {
+        options.rig_refinement.max_focus_pupil_scale = value.clamp(0.0, 4.0);
+    }
+    if let Some(value) = cli.rig_max_sensor_offset_px {
+        options.rig_refinement.max_sensor_offset_px = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_max_focal_scale_percent {
+        options.rig_refinement.max_focal_scale_delta = (value.max(0.0) / 100.0).min(0.10);
+    }
+    if let Some(value) = cli.rig_max_focal_aspect_percent {
+        options.rig_refinement.max_focal_aspect_delta = (value.max(0.0) / 100.0).min(0.05);
+    }
+    if let Some(value) = cli.rig_max_distortion_k1_delta {
+        options.rig_refinement.max_distortion_k1_delta = value.max(0.0).min(0.25);
+    }
+    if let Some(value) = cli.rig_max_distortion_k2_delta {
+        options.rig_refinement.max_distortion_k2_delta = value.max(0.0).min(0.50);
+    }
+    if let Some(value) = cli.rig_max_distortion_tangential_delta {
+        options.rig_refinement.max_distortion_tangential_delta = value.max(0.0).min(0.05);
+    }
+    if let Some(value) = cli.rig_max_distortion_center_offset_px {
+        options.rig_refinement.max_distortion_center_offset_px = value.clamp(0.0, 128.0);
+    }
+    if let Some(value) = cli.rig_orientation_prior_sigma_degrees {
+        options.rig_refinement.orientation_prior_sigma_degrees = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_mirror_prior_sigma_degrees {
+        options.rig_refinement.mirror_prior_sigma_degrees = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_center_prior_sigma {
+        options.rig_refinement.center_prior_sigma = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_focus_pupil_prior_sigma {
+        options.rig_refinement.focus_pupil_prior_sigma = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_sensor_prior_sigma_px {
+        options.rig_refinement.sensor_offset_prior_sigma_px = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_focal_scale_prior_percent {
+        options.rig_refinement.focal_scale_prior_sigma = (value.max(1.0e-6) / 100.0).min(0.10);
+    }
+    if let Some(value) = cli.rig_focal_aspect_prior_percent {
+        options.rig_refinement.focal_aspect_prior_sigma = (value.max(1.0e-6) / 100.0).min(0.05);
+    }
+    if let Some(value) = cli.rig_distortion_k1_prior {
+        options.rig_refinement.distortion_k1_prior_sigma = value.max(1.0e-8).min(0.25);
+    }
+    if let Some(value) = cli.rig_distortion_k2_prior {
+        options.rig_refinement.distortion_k2_prior_sigma = value.max(1.0e-8).min(0.50);
+    }
+    if let Some(value) = cli.rig_distortion_tangential_prior {
+        options.rig_refinement.distortion_tangential_prior_sigma = value.max(1.0e-8).min(0.05);
+    }
+    if let Some(value) = cli.rig_distortion_center_prior_px {
+        options.rig_refinement.distortion_center_prior_sigma_px = value.clamp(1.0e-6, 64.0);
+    }
+    if let Some(value) = cli.rig_factory_prior_weight {
+        options.rig_refinement.factory_prior_weight = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_match_subpixel_step_px {
+        options.rig_refinement.physical_match_subpixel_step_px = value.clamp(0.0625, 1.0);
+    }
+    if let Some(value) = cli.rig_match_patch_radius {
+        options.rig_refinement.physical_match_patch_radius = value.max(1);
+    }
+    if let Some(value) = cli.rig_match_min_score {
+        options.rig_refinement.physical_match_min_score = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = cli.rig_match_min_margin {
+        options.rig_refinement.physical_match_min_margin = value.max(0.0);
+    }
+    if let Some(value) = cli.rig_match_pre_solve_reprojection_px {
+        options
+            .rig_refinement
+            .physical_match_max_reprojection_reference_px = value.max(0.1);
+    }
     options.align.depth.enabled = !cli.no_depth;
     options.align.depth.near_depth = cli.depth_near;
     options.align.depth.far_depth = cli.depth_far;
@@ -315,11 +888,18 @@ fn main() -> Result<()> {
         report.synthesis.covered * 100.0,
     );
     let rig = &report.rig_refinement;
+    let rig_strategy = match rig.strategy {
+        RigRefinementStrategy::Physical => "physical",
+        RigRefinementStrategy::AnchorGraph => "anchor-graph",
+        RigRefinementStrategy::LatentGraph => "latent-graph",
+    };
     if rig.validation_evaluated {
         println!(
-            "physical rig: {} - {} tracks ({} with 3+ cameras; {} fit/{} held out), RMS {:.3}->{:.3} px, held-out {:.3}->{:.3} px ({:+.2}%){}",
-            if rig.accepted {
-                "accepted"
+            "rig ({rig_strategy}): {} - {} tracks ({} with 3+ cameras; {} fit/{} held out; {} ambiguous hold-out excluded), RMS {:.3}->{:.3} px, held-out {:.3}->{:.3} px ({:+.2}%){}",
+            if rig.accepted && rig.validation_passed {
+                "selected; validation passed"
+            } else if rig.accepted {
+                "selected; validation warning"
             } else {
                 "factory retained"
             },
@@ -327,18 +907,20 @@ fn main() -> Result<()> {
             rig.tracks_three_plus,
             rig.fit_tracks,
             rig.validation_tracks,
+            rig.validation_excluded_ambiguous_tracks,
             rig.reprojection_rms_before,
             rig.reprojection_rms_after,
             rig.held_out_rms_before,
             rig.held_out_rms_after,
             rig.held_out_relative_improvement * 100.0,
-            rig.fallback_reason
+            rig.validation_warning
                 .as_ref()
+                .or(rig.fallback_reason.as_ref())
                 .map_or(String::new(), |reason| format!("; {reason}")),
         );
     } else if rig.enabled && rig.accepted {
         println!(
-            "physical rig: accepted - {} all-track production fit tracks, RMS {:.3}->{:.3} px{}",
+            "rig ({rig_strategy}): accepted - {} all-track production fit tracks, RMS {:.3}->{:.3} px{}",
             rig.fit_tracks,
             rig.reprojection_rms_before,
             rig.reprojection_rms_after,
@@ -348,14 +930,126 @@ fn main() -> Result<()> {
         );
     } else if rig.enabled {
         println!(
-            "physical rig: factory retained - {} all-track production fit tracks{}",
+            "rig ({rig_strategy}): factory retained - {} all-track production fit tracks{}",
             rig.fit_tracks,
             rig.fallback_reason
                 .as_ref()
                 .map_or(String::new(), |reason| format!("; {reason}")),
         );
     } else {
-        println!("physical rig: not run (--no-rig-refine)");
+        println!("rig: not run (--no-rig-refine)");
+    }
+    if let Some(anchor) = &rig.anchor_graph {
+        println!(
+            "  anchor graph: {} bootstrap anchors, {} -> {} tracks, {} -> {} cycle-supported 3+ tracks; {} propagation rounds{}",
+            anchor.bootstrap_anchors,
+            anchor.initial_tracks,
+            anchor.final_tracks,
+            anchor.initial_cycle_supported_three_plus_tracks,
+            anchor.final_cycle_supported_three_plus_tracks,
+            anchor.rounds_run,
+            if anchor.stopped_early {
+                " (early stop)"
+            } else {
+                ""
+            },
+        );
+        println!(
+            "  anchor growth: {} new observations, {} promoted anchors, {} spawned tracks",
+            anchor.propagated_observations, anchor.promoted_observations, anchor.spawned_tracks,
+        );
+        println!(
+            "  camera graph: {} factory-overlap candidates (>= {:.0}%), {} -> {} active edges (max {}, target degree {})",
+            anchor.candidate_edges,
+            100.0 * anchor.factory_overlap_threshold,
+            anchor.initial_active_edges,
+            anchor.final_active_edges,
+            anchor.maximum_active_edges,
+            anchor.target_min_camera_degree,
+        );
+        for round in &anchor.rounds {
+            println!(
+                "    round {}: edges {} -> {} (+{}), +{} obs ({:.2}%), +{} promoted, +{} tracks, +{} cycle edges; strong 3+ {} -> {} ({:.2}%){}",
+                round.round,
+                round.active_edges_before,
+                round.active_edges_after,
+                round.activated_edges,
+                round.new_observations,
+                round.observation_growth_fraction * 100.0,
+                round.promoted_observations,
+                round.new_tracks,
+                round.closed_cycle_edges,
+                round.strong_three_plus_before,
+                round.strong_three_plus_after,
+                round.strong_track_growth_fraction * 100.0,
+                if round.stopped_early { "; stop" } else { "" },
+            );
+        }
+        if !anchor.pairs.is_empty() {
+            let mut pair_rms = anchor
+                .pairs
+                .iter()
+                .map(|pair| pair.loo_rms_px)
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>();
+            pair_rms.sort_by(f64::total_cmp);
+            if let Some(median) = pair_rms.get(pair_rms.len() / 2) {
+                println!(
+                    "  anchor pair local-LOO RMS: median {:.3} native px across {} validated pairs",
+                    median,
+                    pair_rms.len(),
+                );
+            }
+        }
+    }
+    if let Some(latent) = &rig.latent_match {
+        println!(
+            "  latent graph: {} pairwise seeds -> {} tracks ({} with 3+ cameras); {} target landmarks searched; {} ambiguous observations, {} total candidates (max {})",
+            latent.seed_pairwise_matches,
+            latent.initial_tracks,
+            latent.initial_three_plus_tracks,
+            latent.candidate_pool_landmarks,
+            latent.ambiguous_observations,
+            latent.total_candidates,
+            latent.max_candidates_per_observation,
+        );
+        println!(
+            "  latent assignments: {} rounds, {} switches ({} geometry-supported, {} constellation-supported, {} cycle-supported; {} cycle / {} collision proposals rejected)",
+            latent.assignment_iterations,
+            latent.assignment_switches,
+            latent.geometry_supported_switches,
+            latent.constellation_supported_switches,
+            latent.cycle_supported_switches,
+            latent.cycle_rejected_switches,
+            latent.collision_rejected_switches,
+        );
+        if latent.cycle_graph_candidate_edges > 0 {
+            println!(
+                "  latent cycle graph: {} / {} active/candidate edges, {} fit-only validated pair fields from {} bootstrap cycle-supported tracks ({} observations); {} held-out pair anchors excluded; {} pair predictions evaluated",
+                latent.cycle_graph_active_edges,
+                latent.cycle_graph_candidate_edges,
+                latent.cycle_graph_pairs,
+                latent.cycle_graph_anchor_tracks,
+                latent.cycle_graph_anchor_observations,
+                latent.cycle_graph_validation_anchors_excluded,
+                latent.cycle_predictions_evaluated,
+            );
+        }
+        for round in &latent.rounds {
+            println!(
+                "    round {}: {} switches over {} ambiguous observations; score {:.3}->{:.3}; {} geometry / {} constellation / {} cycle supported; {} cycle / {} collision proposals rejected",
+                round.iteration,
+                round.switches,
+                round.evaluated_observations,
+                round.mean_score_before,
+                round.mean_score_after,
+                round.geometry_supported_switches,
+                round.constellation_supported_switches,
+                round.cycle_supported_switches,
+                round.cycle_rejected_switches,
+                round.collision_rejected_switches,
+            );
+        }
     }
     if rig.image_space_evaluated_cameras > 0 {
         println!(
@@ -447,10 +1141,15 @@ fn main() -> Result<()> {
         correction.orientation_offset_degrees != [0.0; 3]
             || correction.mirror_angle_offset_degrees != 0.0
             || correction.center_offset_world != [0.0; 3]
+            || correction.focus_pupil_scale != 0.0
             || correction.sensor_offset_px != [0.0; 2]
+            || correction.focal_scale_delta != 0.0
+            || correction.focal_aspect_delta != 0.0
+            || correction.distortion_center_offset_px != [0.0; 2]
+            || correction.distortion_delta != [0.0; 4]
     }) {
         println!(
-            "  {} {}physical correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, sensor {:+.2},{:+.2} px, mirror {:+.4} deg{}",
+            "  {} {}{rig_strategy} correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, focus-pupil {:+.4}, sensor {:+.2},{:+.2} px, focal(s,a) {:+.3},{:+.3}%, dist-centre {:+.2},{:+.2} px, d[k1,k2,p1,p2]=[{:+.5},{:+.5},{:+.5},{:+.5}], mirror {:+.4} deg{}",
             correction.camera,
             if rig.accepted { "" } else { "candidate " },
             correction.orientation_offset_degrees[0],
@@ -459,8 +1158,17 @@ fn main() -> Result<()> {
             correction.center_offset_world[0],
             correction.center_offset_world[1],
             correction.center_offset_world[2],
+            correction.focus_pupil_scale,
             correction.sensor_offset_px[0],
             correction.sensor_offset_px[1],
+            correction.focal_scale_delta * 100.0,
+            correction.focal_aspect_delta * 100.0,
+            correction.distortion_center_offset_px[0],
+            correction.distortion_center_offset_px[1],
+            correction.distortion_delta[0],
+            correction.distortion_delta[1],
+            correction.distortion_delta[2],
+            correction.distortion_delta[3],
             correction.mirror_angle_offset_degrees,
             if correction.reached_bound {
                 " (at bound)"
@@ -523,6 +1231,25 @@ fn main() -> Result<()> {
             module.correction_median_px[1],
             module.status
         );
+        if module.rig_feature_candidates > 0 {
+            println!(
+                "      rig features: {}/{} accepted; {} ambiguous, {} forward/back rejected",
+                module.rig_feature_matches,
+                module.rig_feature_candidates,
+                module.rig_feature_rejected_ambiguous,
+                module.rig_feature_rejected_forward_backward,
+            );
+        }
+        if let (Some(reference_pixel), Some(shift), Some(prior_quality)) = (
+            module.angle_optical_center_prior_reference_px,
+            module.angle_optical_center_prior_shift_target_px,
+            module.angle_optical_center_prior_quality,
+        ) {
+            println!(
+                "      angle optical-center mapping: applied at reference {:.1},{:.1} px; target shift {:+.1},{:+.1} px; measured quality {:.2}",
+                reference_pixel[0], reference_pixel[1], shift[0], shift[1], prior_quality,
+            );
+        }
     }
     for (camera, cleanup) in &report.cleanup {
         if cleanup.profile_supplied {

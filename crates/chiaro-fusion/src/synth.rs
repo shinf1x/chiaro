@@ -34,7 +34,7 @@ use crate::cfa::{
     camera_response_base, camera_response_from_base, corrected_noise_variance, noise_variance,
     solve_joint_xyz_with_scratch,
 };
-use crate::depth::DenseDepthMap;
+use crate::depth::{DenseDepthMap, DenseDepthNode, DepthProvenance};
 use crate::image::Mosaic;
 use crate::resolution::{
     EdgeAlignedHannGeometry, InverseWarpJacobian, ResolutionAlignmentReport,
@@ -437,6 +437,43 @@ fn source_base_warp_sample(source: &SynthSource<'_>, x: f32, y: f32) -> WarpSamp
     } else {
         warp.sample(x, y)
     }
+}
+
+#[inline]
+fn high_frequency_geometry_weight(
+    depth_enabled: bool,
+    node: Option<DenseDepthNode>,
+    sample: WarpSample,
+    reference: bool,
+) -> f32 {
+    if reference {
+        return 1.0;
+    }
+    if sample.visibility.blocks_sampling() {
+        return 0.0;
+    }
+    // "Unknown" is not an occlusion.  In difficult low-parallax captures a
+    // camera can have an excellent locally registered 2-D mapping while the
+    // shared metric depth remains ambiguous.  Keep that evidence available to
+    // the resolution/CFA stage at reduced weight; the existing local
+    // registration, edge-consistency and chroma gates still have to agree.
+    let visibility_weight = match sample.visibility {
+        WarpVisibility::Visible => 1.0,
+        WarpVisibility::Unknown => 0.45,
+        WarpVisibility::Occluded | WarpVisibility::Boundary => 0.0,
+    };
+    if !depth_enabled {
+        return visibility_weight * sample.confidence.clamp(0.0, 1.0);
+    }
+    let depth_weight = match node.map(|node| (node.provenance, node.confidence)) {
+        Some((DepthProvenance::Measured, confidence)) => 0.65 + 0.35 * confidence.clamp(0.0, 1.0),
+        Some((DepthProvenance::Regularized, confidence)) => {
+            0.25 + 0.35 * confidence.clamp(0.0, 1.0)
+        }
+        Some((DepthProvenance::Global, confidence)) => 0.20 * confidence.clamp(0.0, 1.0),
+        Some((DepthProvenance::Unsupported, _)) | None => 0.0,
+    };
+    visibility_weight * sample.confidence.clamp(0.0, 1.0) * depth_weight
 }
 
 /// Choose the locally best reconstruction warp without allowing sparse
@@ -1232,8 +1269,8 @@ pub fn synthesize(
                         )
                     });
                     let needs_source_structure = structure_needs_source_sample(reference_structure);
-                    let scene_depth = depth_map
-                        .and_then(|map| map.sample_nearest(rx, ry))
+                    let scene_depth_node = depth_map.and_then(|map| map.sample_nearest(rx, ry));
+                    let scene_depth = scene_depth_node
                         .and_then(|node| node.depth.map(|depth| (depth, node.confidence)));
                     // Chroma comes from colour modules (XYZ), luminance from
                     // every module including panchromatic ones.
@@ -1267,6 +1304,12 @@ pub fn synthesize(
                         let warp_sample = prepared_source
                             .map(|sample| sample.warp_sample)
                             .unwrap_or_else(|| source_base_warp_sample(source, rx, ry));
+                        let high_frequency_geometry = high_frequency_geometry_weight(
+                            depth_map.is_some(),
+                            scene_depth_node,
+                            warp_sample,
+                            source.reference,
+                        );
                         let q = if let Some(sample) = prepared_source {
                             sample.q
                         } else {
@@ -1326,18 +1369,18 @@ pub fn synthesize(
                                         .gain_field
                                         .at(q[0], q[1], mosaic.width, mosaic.height)
                                 });
-                        let reconstruction_geometry = options
-                            .resolution_reconstruction
-                            .uses_resolution_warps()
-                            .then(|| {
-                                reconstruction_geometry_from_base_sample(
-                                    source,
-                                    rx,
-                                    ry,
-                                    warp_sample,
-                                )
-                            })
-                            .flatten();
+                        let reconstruction_geometry =
+                            (options.resolution_reconstruction.uses_resolution_warps()
+                                && high_frequency_geometry > 0.0)
+                                .then(|| {
+                                    reconstruction_geometry_from_base_sample(
+                                        source,
+                                        rx,
+                                        ry,
+                                        warp_sample,
+                                    )
+                                })
+                                .flatten();
                         if let Some(geometry) = reconstruction_geometry {
                             reconstruction_geometries[source_index] = Some(geometry);
                             touched_reconstruction_geometries.push(source_index);
@@ -1410,7 +1453,8 @@ pub fn synthesize(
                                         * source.confidence
                                         * source.magnification
                                         * source.magnification
-                                        * edge_weight,
+                                        * edge_weight
+                                        * high_frequency_geometry,
                                     source.magnification,
                                 );
                             }
@@ -1518,7 +1562,8 @@ pub fn synthesize(
                                         * source.confidence
                                         * source.magnification
                                         * source.magnification
-                                        * edge_weight,
+                                        * edge_weight
+                                        * high_frequency_geometry,
                                     source.magnification,
                                 );
                             }
@@ -3943,6 +3988,43 @@ mod tests {
             support: 1.0,
             phase,
         }
+    }
+
+    #[test]
+    fn high_frequency_reconstruction_requires_local_depth_evidence() {
+        let visible = WarpSample {
+            mapped: Some([10.0, 10.0]),
+            confidence: 0.90,
+            visibility: WarpVisibility::Visible,
+        };
+        let unsupported = DenseDepthNode {
+            depth: None,
+            confidence: 1.0,
+            provenance: DepthProvenance::Unsupported,
+        };
+        let measured = DenseDepthNode {
+            depth: Some(2_000.0),
+            confidence: 0.90,
+            provenance: DepthProvenance::Measured,
+        };
+        assert_eq!(
+            high_frequency_geometry_weight(true, Some(unsupported), visible, false),
+            0.0
+        );
+        assert!(high_frequency_geometry_weight(true, Some(measured), visible, false) > 0.80);
+        assert_eq!(
+            high_frequency_geometry_weight(true, None, visible, false),
+            0.0
+        );
+        assert_eq!(
+            high_frequency_geometry_weight(true, None, visible, true),
+            1.0
+        );
+        let unknown = WarpSample {
+            visibility: WarpVisibility::Unknown,
+            ..visible
+        };
+        assert!(high_frequency_geometry_weight(true, Some(measured), unknown, false) > 0.30);
     }
 
     #[test]

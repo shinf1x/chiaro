@@ -364,6 +364,8 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
         height: reference.frame.camera.height,
         camera: None,
         depth_evidence_enabled: true,
+        depth_evidence_reliability: 1.0,
+        angle_optical_center_prior_reference_px: None,
         nominal_focal_px: options
             .focal_px
             .unwrap_or(reference.frame.camera.width as f64),
@@ -377,6 +379,8 @@ pub fn stack_mosaic_burst(data: &[u8], options: &StackOptions) -> Result<MosaicS
             height: frame.frame.camera.height,
             camera: None,
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: None,
             nominal_focal_px: options.focal_px.unwrap_or(frame.frame.camera.width as f64),
         };
         let (seed, seed_name) =

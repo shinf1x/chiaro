@@ -15,7 +15,7 @@
 //! discontinuities. The resulting metric field drives each camera's exact
 //! calibrated parallax and carries local confidence into synthesis.
 
-use std::{path::Path, thread};
+use std::{collections::VecDeque, path::Path, thread};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -24,7 +24,7 @@ use crate::{
     align::{AlignInput, ModuleAlignment, Warp, WarpVisibility},
     geometry::{Ray, ResolvedCamera},
     image::Plane,
-    math::{Vec2, add, dot, norm, scale, sub},
+    math::{Vec2, Vec3, add, cross, dot, norm, normalize, scale, sub},
 };
 
 const INFINITY_DEPTH: f64 = 1.0e8;
@@ -67,6 +67,20 @@ const PHYSICAL_SUPPORT_CONFIDENCE_SATURATION: f32 = 1.5;
 const PHYSICAL_MIN_INFORMATION_WEIGHT: f32 = 0.05;
 const PHYSICAL_MAX_INFORMATION_WEIGHT: f32 = 2.00;
 const PHYSICAL_VISIBLE_COMPATIBILITY: f32 = 0.55;
+// Two cameras are sufficient to *propose* a metric depth, but on repeated
+// structure they are not enough to call a fine-grid depth directly measured.
+// Require three independently informative views for authoritative finite
+// physical depth. Two-view evidence can still seed the search and regularized
+// completion, preserving coverage without letting accidental stereo matches
+// dominate the map.
+const PHYSICAL_MIN_DIRECT_VIEWS: usize = 3;
+const PHYSICAL_MIN_INFORMATION_FRACTION: f32 = 0.08;
+// A finite hypothesis must be preferred to the same camera's far/infinity
+// projection by a non-zero amount before that view can count as one of the
+// authoritative direct-depth supporters. Relative consensus alone is not
+// enough: three cameras can otherwise agree on the same shallow accidental
+// peak while none of them actually prefers finite depth to infinity.
+const PHYSICAL_MIN_PER_VIEW_FINITE_IMPROVEMENT: f32 = 0.005;
 const PHYSICAL_UNKNOWN_CONFIDENCE_SCALE: f32 = 0.15;
 const PHYSICAL_UNRESOLVED_MAPPING_CONFIDENCE: f32 = 0.08;
 const PHYSICAL_GLOBAL_FALLBACK_CONFIDENCE: f32 = 0.35;
@@ -74,13 +88,37 @@ const PHYSICAL_GLOBAL_FALLBACK_CONFIDENCE: f32 = 0.35;
 // physical hypotheses within roughly three quarters of a matching pixel so a
 // narrow ZNCC peak cannot sit entirely between the fixed coarse planes.
 const DIRECT_MAX_PROJECTED_STEP_PX: f64 = 1.5;
+// Competing inverse-depth labels are considered genuinely different modes only
+// when they move at least one calibrated target image by this many full sensor
+// pixels. This makes ambiguity testing invariant to how densely the depth axis
+// happened to be sampled.
+const DIRECT_DISTINCT_MODE_PX: f64 = 1.0;
+// If several nearly-equivalent finite hypotheses span more than this much
+// target-image reprojection, the data do not identify a unique mapping well
+// enough for authoritative metric depth/high-frequency reconstruction.
+const DIRECT_MAX_REPROJECTION_UNCERTAINTY_PX: f64 = 0.85;
+// Beyond this separation, a near-tied mode is too different even for a
+// correspondence-only/regularized depth hypothesis and is rejected outright.
+const DIRECT_HARD_REPROJECTION_AMBIGUITY_PX: f64 = 4.0;
+// Preserve/refine a small beam of projectively distinct modes instead of only
+// subdividing the current winner. Repeated structures often leave the correct
+// mode second-best until a finer patch or neighbouring evidence disambiguates it.
+const DIRECT_DEPTH_MODE_BEAM: usize = 3;
 const DIRECT_MAX_DEPTH_REFINEMENTS: usize = 3;
 // A coarse SGM estimate has real multi-view evidence, but it has not passed
 // the stricter fine-grid direct decision. Keep it useful for reconstruction
 // while ensuring it can never carry the authority of a direct measurement.
 const FINAL_COARSE_CONFIDENCE_SCALE: f32 = 0.45;
 const FINAL_COARSE_MAX_CONFIDENCE: f32 = 0.35;
+const FINAL_COARSE_MIN_DIRECT_ANCHORS: usize = 2;
+const FINAL_COARSE_DIRECT_ANCHOR_RADIUS: i32 = 2;
 const COMPLETION_IMAGE_EDGE_LIMIT: f32 = 0.35;
+// Completion may use regularized neighbours for smooth interpolation, but it
+// must remain physically tethered to a direct measurement. This caps how far
+// a regularized surface can grow from its evidence and prevents detached dots
+// or large SGM islands from becoming apparently measured geometry.
+const COMPLETION_DIRECT_ANCHOR_RADIUS: i32 = 3;
+const COMPLETION_MIN_DIRECT_ANCHORS: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthGeometryMode {
@@ -157,14 +195,18 @@ impl Default for DepthOptions {
             minimum_score: 0.45,
             minimum_margin: 0.01,
             minimum_improvement: 0.01,
-            minimum_neighbour_support: 2,
-            completion_iterations: 8,
+            minimum_neighbour_support: 3,
+            completion_iterations: 4,
         }
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DepthAlignmentReport {
+    /// Soft capture-specific weight applied when this camera supplies dense
+    /// depth evidence.  Zero means held out; nonzero cameras remain eligible
+    /// for local consensus even when sparse rig support is weak.
+    pub evidence_reliability: f32,
     /// True when dense correspondence used the physical rig depth locus with
     /// only a perpendicular proposal from the measured image alignment.
     pub physical_geometry: bool,
@@ -189,6 +231,9 @@ pub struct DepthAlignmentReport {
     pub measured_nodes: usize,
     /// Nodes inferred by SGM or completed from edge-compatible neighbours.
     pub regularized_nodes: usize,
+    /// Regularized nodes removed because their connected finite-depth island
+    /// had no surviving direct-measurement ancestry.
+    pub rejected_unanchored_regularized_nodes: usize,
     /// Tested nodes that did not retain a finite reconstruction and therefore
     /// use the active far/baseline mapping. In physical mode this is a
     /// low-confidence fallback, not proof that the surface is actually at infinity.
@@ -202,6 +247,10 @@ pub struct DepthAlignmentReport {
     /// Nodes suppressed around a discontinuous warp boundary so bilinear
     /// interpolation cannot blend foreground and background mappings.
     pub boundary_nodes: usize,
+    /// Final warp proposals discarded because their emitted target coordinate
+    /// was outside the physical sensor. This is a hard invariant check after
+    /// all local depth/refinement logic.
+    pub rejected_out_of_sensor_nodes: usize,
     /// Nodes for which the final per-camera warp has a finite mapping. This is
     /// evidence-gated warp support, not geometric field-of-view overlap.
     pub defined_nodes: usize,
@@ -287,6 +336,39 @@ impl DenseDepthMap {
             self.columns,
             self.rows,
             &provenance,
+        )
+    }
+
+    /// Write inverse-depth layers separated by evidence provenance. These are
+    /// intentionally sparse: a bright pixel in `measured` is direct multiview
+    /// evidence, while a bright pixel in `regularized` exists only because the
+    /// anchored completion/SGM model inferred it.
+    pub fn write_split_inverse_diagnostics(
+        &self,
+        measured_path: &Path,
+        regularized_path: &Path,
+    ) -> Result<()> {
+        let (inverse_depth, _) = self.diagnostic_samples();
+        let mut measured = vec![0u16; self.nodes.len()];
+        let mut regularized = vec![0u16; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            match node.provenance {
+                DepthProvenance::Measured => measured[index] = inverse_depth[index],
+                DepthProvenance::Regularized => regularized[index] = inverse_depth[index],
+                DepthProvenance::Unsupported | DepthProvenance::Global => {}
+            }
+        }
+        chiaro_hotpixel_core::png16::write_gray16_native_atomic(
+            measured_path,
+            self.columns,
+            self.rows,
+            &measured,
+        )?;
+        chiaro_hotpixel_core::png16::write_gray16_native_atomic(
+            regularized_path,
+            self.columns,
+            self.rows,
+            &regularized,
         )
     }
 
@@ -422,6 +504,11 @@ struct ViewScore {
     /// Relative inverse-depth information carried by this physical view.
     /// This is normalized robustly during aggregation, so only ratios matter.
     depth_information: f32,
+    /// Capture-specific trust in this camera's correspondence/calibration
+    /// evidence. This is intentionally soft: a globally awkward camera is not
+    /// blacklisted, and can still dominate locally when its image evidence is
+    /// strong.
+    reliability: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -559,7 +646,7 @@ fn build_target_visibility_buffer(
     step: usize,
     reference: &ResolvedCamera,
     target: &ResolvedCamera,
-    measured_proposal: &Warp,
+    alignment: &ModuleAlignment,
     options: &DepthOptions,
 ) -> TargetVisibilityBuffer {
     let cell_size = step.max(2) as f64;
@@ -581,13 +668,15 @@ fn build_target_visibility_buffer(
             let pixel = [(column * step) as f64, (row * step) as f64];
             let ray = reference.pixel_to_ray(pixel);
             let world = add(ray.origin, scale(ray.direction, node.depth));
-            let Some(projected) = local_patch_projection(
+            let reference_rays = local_patch_reference_rays(reference, pixel);
+            let Some(projected) = local_patch_projection_from_alignment(
                 reference,
                 target,
-                measured_proposal,
+                alignment,
                 pixel,
                 Some(node.depth),
                 options,
+                &reference_rays,
             )
             .map(|projection| projection.target_centre) else {
                 continue;
@@ -753,6 +842,13 @@ pub fn refine_multiview_depth(
             inverse_step * 4.0,
         );
     }
+    let rejected_unanchored_regularized_nodes = reject_unanchored_regularized_components(
+        &mut field,
+        &guidance,
+        columns,
+        rows,
+        inverse_step * 4.0,
+    );
     fit_local_depth_planes(&mut field, &guidance, columns, rows, inverse_step * 4.0);
 
     let tested_nodes = tested.iter().filter(|&&tested| tested).count();
@@ -821,7 +917,7 @@ pub fn refine_multiview_depth(
                 step,
                 reference_camera,
                 target_camera,
-                &base_alignment.warp,
+                base_alignment,
                 options,
             )
         });
@@ -832,14 +928,22 @@ pub fn refine_multiview_depth(
                 let p = [(column * step) as f64, (row * step) as f64];
                 match geometry_mode {
                     DepthGeometryMode::PhysicalRig => {
-                        let far_q =
-                            base_alignment
-                                .warp
-                                .map(p[0] as f32, p[1] as f32)
-                                .filter(|point| {
-                                    target_camera
-                                        .contains([f64::from(point[0]), f64::from(point[1])])
-                                });
+                        let far_q = if base_alignment.report.accepted {
+                            base_alignment.warp.map(p[0] as f32, p[1] as f32)
+                        } else {
+                            // A rejected residual warp is not a valid output
+                            // fallback either. Use the calibrated infinity
+                            // projection so a weak camera cannot drag the
+                            // final physical warp toward a failed 2-D fit.
+                            let ray = reference_camera.pixel_to_ray(p);
+                            let world = add(ray.origin, scale(ray.direction, INFINITY_DEPTH));
+                            target_camera
+                                .project(world)
+                                .map(|point| [point[0] as f32, point[1] as f32])
+                        }
+                        .filter(|point| {
+                            target_camera.contains([f64::from(point[0]), f64::from(point[1])])
+                        });
                         let Some(node) = field[index] else {
                             let Some(far_q) = far_q else {
                                 decisions.push(NodeWarp::Undefined);
@@ -880,9 +984,11 @@ pub fn refine_multiview_depth(
                             {
                                 decisions.push(NodeWarp::Global {
                                     point: far_q,
-                                    confidence: base_alignment
-                                        .warp
-                                        .confidence(p[0] as f32, p[1] as f32),
+                                    confidence: if base_alignment.report.accepted {
+                                        base_alignment.warp.confidence(p[0] as f32, p[1] as f32)
+                                    } else {
+                                        PHYSICAL_GLOBAL_FALLBACK_CONFIDENCE
+                                    },
                                 });
                                 continue;
                             }
@@ -903,13 +1009,15 @@ pub fn refine_multiview_depth(
                             continue;
                         };
 
-                        let Some(mapped) = local_patch_projection(
+                        let reference_rays = local_patch_reference_rays(reference_camera, p);
+                        let Some(mapped) = local_patch_projection_from_alignment(
                             reference_camera,
                             target_camera,
-                            &base_alignment.warp,
+                            base_alignment,
                             p,
                             Some(node.depth),
                             options,
+                            &reference_rays,
                         )
                         .map(|projection| projection.target_centre) else {
                             if let Some(far_q) = far_q {
@@ -987,7 +1095,7 @@ pub fn refine_multiview_depth(
                             if let Some(selected) = refine_one_view_physical(
                                 reference,
                                 &inputs[target_index],
-                                &base_alignment.warp,
+                                base_alignment,
                                 p,
                                 node.depth,
                                 options,
@@ -1123,8 +1231,31 @@ pub fn refine_multiview_depth(
         let mut unknown_nodes = 0usize;
         let mut occluded_nodes = 0usize;
         let mut boundary_nodes = 0usize;
+        let mut rejected_out_of_sensor_nodes = 0usize;
         let mut defined_nodes = 0usize;
         for decision in decisions {
+            // Last-line physical invariant: no target coordinate outside this
+            // sensor is ever allowed into the interpolation grid. Individual
+            // producers already check this in normal paths, but keeping the
+            // invariant here prevents a future/local refinement branch from
+            // reintroducing impossible checkerboard/depth mappings.
+            let emitted_point = match &decision {
+                NodeWarp::Undefined => None,
+                NodeWarp::Global { point, .. }
+                | NodeWarp::Unknown { point, .. }
+                | NodeWarp::Refined { point, .. }
+                | NodeWarp::Occluded { point, .. }
+                | NodeWarp::Boundary(point) => Some(*point),
+            };
+            if emitted_point.is_some_and(|point| {
+                !target_camera.contains([f64::from(point[0]), f64::from(point[1])])
+            }) {
+                points.push([f32::NAN; 2]);
+                confidence.push(0.0);
+                visibility.push(WarpVisibility::Unknown);
+                rejected_out_of_sensor_nodes += 1;
+                continue;
+            }
             match decision {
                 NodeWarp::Undefined => {
                     points.push([f32::NAN; 2]);
@@ -1197,6 +1328,7 @@ pub fn refine_multiview_depth(
         let directly_supported_nodes = refined_nodes + far_nodes;
         let warp_node_count = columns * rows;
         alignments[target_index].report.depth = Some(DepthAlignmentReport {
+            evidence_reliability: inputs[target_index].depth_evidence_reliability,
             physical_geometry: geometry_mode.is_physical(),
             tested_nodes,
             epipolar_seeded_nodes,
@@ -1206,11 +1338,13 @@ pub fn refine_multiview_depth(
             far_supported_nodes,
             measured_nodes,
             regularized_nodes,
+            rejected_unanchored_regularized_nodes,
             fallback_nodes: far_nodes,
             refined_nodes,
             unknown_nodes,
             occluded_nodes,
             boundary_nodes,
+            rejected_out_of_sensor_nodes,
             defined_nodes,
             defined_fraction: fraction(defined_nodes, warp_node_count),
             directly_supported_nodes,
@@ -1500,8 +1634,10 @@ fn measure_direct_depths(
                     // and per-view scoring buffers resident.
                     let mut candidates = Vec::with_capacity(40);
                     let mut scores = Vec::with_capacity(40);
-                    let mut refinement_candidates = Vec::with_capacity(2);
-                    let mut scored_additions = Vec::with_capacity(2);
+                    let mut refinement_candidates: Vec<f64> = Vec::with_capacity(8);
+                    let mut mode_refinement_candidates = Vec::with_capacity(2);
+                    let mut mode_indices = Vec::with_capacity(DIRECT_DEPTH_MODE_BEAM);
+                    let mut scored_additions = Vec::with_capacity(8);
                     let mut merge_scratch = Vec::with_capacity(48);
                     let mut wide_scores = Vec::with_capacity(8);
                     let mut view_scores = Vec::with_capacity(active_view_indices.len());
@@ -1529,6 +1665,20 @@ fn measure_direct_depths(
                                 coarse_step,
                                 p,
                             );
+                            let surface_normal = if geometry_mode.is_physical() {
+                                inputs[reference_index].camera.and_then(|reference_camera| {
+                                    coarse_surface_normal(
+                                        coarse,
+                                        coarse_columns,
+                                        coarse_rows,
+                                        coarse_step,
+                                        reference_camera,
+                                        p,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
                             let (prepared_reference, reference_rays) = prepare_physical_score_cache(
                                 inputs,
                                 reference_index,
@@ -1571,6 +1721,7 @@ fn measure_direct_depths(
                                 active_view_indices,
                                 p,
                                 None,
+                                None,
                                 direct_options,
                                 geometry_mode,
                                 prepared_reference.then_some(&reference_patch),
@@ -1588,6 +1739,7 @@ fn measure_direct_depths(
                                     active_view_indices,
                                     p,
                                     Some(depth),
+                                    surface_normal,
                                     direct_options,
                                     geometry_mode,
                                     prepared_reference.then_some(&reference_patch),
@@ -1600,19 +1752,37 @@ fn measure_direct_depths(
                             }
                             if geometry_mode.is_physical() {
                                 for _ in 0..DIRECT_MAX_DEPTH_REFINEMENTS {
-                                    let Some(best) =
-                                        best_depth_candidate(&candidates, &scores, direct_options)
-                                    else {
-                                        break;
-                                    };
-                                    direct_depth_refinement_candidates_into(
+                                    top_projective_depth_modes_into(
                                         inputs,
                                         reference_index,
                                         p,
                                         &candidates,
-                                        best,
-                                        &mut refinement_candidates,
+                                        &scores,
+                                        direct_options,
+                                        &mut mode_indices,
                                     );
+                                    if mode_indices.is_empty() {
+                                        break;
+                                    }
+                                    refinement_candidates.clear();
+                                    for &mode in &mode_indices {
+                                        direct_depth_refinement_candidates_into(
+                                            inputs,
+                                            reference_index,
+                                            p,
+                                            &candidates,
+                                            mode,
+                                            &mut mode_refinement_candidates,
+                                        );
+                                        for &depth in &mode_refinement_candidates {
+                                            if !refinement_candidates.iter().any(|existing| {
+                                                (1.0 / *existing - 1.0 / depth).abs()
+                                                    <= f64::EPSILON
+                                            }) {
+                                                refinement_candidates.push(depth);
+                                            }
+                                        }
+                                    }
                                     if refinement_candidates.is_empty() {
                                         break;
                                     }
@@ -1625,6 +1795,7 @@ fn measure_direct_depths(
                                             active_view_indices,
                                             p,
                                             Some(depth),
+                                            surface_normal,
                                             direct_options,
                                             geometry_mode,
                                             prepared_reference.then_some(&reference_patch),
@@ -1647,7 +1818,10 @@ fn measure_direct_depths(
                             let node_tested =
                                 baseline.is_some() || scores.iter().any(Option::is_some);
                             let mut far_evidence = baseline;
-                            let mut selected = select_direct_depth(
+                            let mut selected = select_direct_depth_projective(
+                                inputs,
+                                reference_index,
+                                p,
                                 &candidates,
                                 &scores,
                                 baseline,
@@ -1685,6 +1859,7 @@ fn measure_direct_depths(
                                     active_view_indices,
                                     p,
                                     None,
+                                    None,
                                     wide_options,
                                     geometry_mode,
                                     wide_prepared_reference.then_some(&wide_reference_patch),
@@ -1703,6 +1878,7 @@ fn measure_direct_depths(
                                         active_view_indices,
                                         p,
                                         Some(depth),
+                                        surface_normal,
                                         wide_options,
                                         geometry_mode,
                                         wide_prepared_reference.then_some(&wide_reference_patch),
@@ -1716,7 +1892,10 @@ fn measure_direct_depths(
                                 if wide_baseline.is_some() {
                                     far_evidence = wide_baseline;
                                 }
-                                selected = select_direct_depth(
+                                selected = select_direct_depth_projective(
+                                    inputs,
+                                    reference_index,
+                                    p,
                                     wide_candidates,
                                     &wide_scores,
                                     wide_baseline,
@@ -1806,10 +1985,10 @@ fn prepare_physical_score_cache(
             };
             depth_information[index] =
                 physical_depth_information(reference_camera, target_camera, centre);
-            let Some(projection) = local_patch_projection_from_rays(
+            let Some(projection) = local_patch_projection_from_alignment(
                 reference_camera,
                 target_camera,
-                &alignments[index].warp,
+                &alignments[index],
                 centre,
                 None,
                 options,
@@ -1832,6 +2011,7 @@ fn score_prepared_depth(
     active_view_indices: &[usize],
     centre: Vec2,
     depth: Option<f64>,
+    surface_normal: Option<Vec3>,
     options: &DepthOptions,
     geometry_mode: DepthGeometryMode,
     reference_patch: Option<&PreparedReferencePatch>,
@@ -1848,6 +2028,7 @@ fn score_prepared_depth(
         active_view_indices,
         centre,
         depth,
+        surface_normal,
         options,
         geometry_mode,
         reference_patch,
@@ -1857,7 +2038,43 @@ fn score_prepared_depth(
         None,
         view_scores,
     );
-    aggregate_with_scratch(view_scores, options, geometry_mode, aggregate_scratch)
+    let primary = aggregate_with_scratch(view_scores, options, geometry_mode, aggregate_scratch);
+    if surface_normal.is_none() || depth.is_none() || !geometry_mode.is_physical() {
+        return primary;
+    }
+
+    // A coarse depth field can estimate a useful slanted local plane, but a
+    // discontinuity can make that normal wrong. Evaluate the fronto-parallel
+    // model as a second orientation mode and retain whichever explains the
+    // same depth hypothesis better. This is a bounded two-orientation
+    // PatchMatch-like step rather than forcing every patch to face the camera.
+    score_views_prepared_into(
+        inputs,
+        reference_index,
+        alignments,
+        active_view_indices,
+        centre,
+        depth,
+        None,
+        options,
+        geometry_mode,
+        reference_patch,
+        reference_rays,
+        far_scores,
+        depth_information,
+        None,
+        view_scores,
+    );
+    let fronto = aggregate_with_scratch(view_scores, options, geometry_mode, aggregate_scratch);
+    match (primary, fronto) {
+        (Some(primary), Some(fronto)) => Some(if fronto.ranking_score > primary.ranking_score {
+            fronto
+        } else {
+            primary
+        }),
+        (primary @ Some(_), None) => primary,
+        (None, fronto) => fronto,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1930,6 +2147,7 @@ fn physical_visibility_memberships(
                                 active_view_indices,
                                 p,
                                 depth,
+                                None,
                                 options,
                                 DepthGeometryMode::PhysicalRig,
                                 prepared_reference.then_some(&reference_patch),
@@ -1966,6 +2184,18 @@ fn physical_visibility_memberships(
     (memberships, words_per_node)
 }
 
+#[inline]
+fn physical_required_support(scores: &[ViewScore], options: &DepthOptions) -> usize {
+    if scores.iter().any(|view| view.far_score.is_some()) {
+        options.minimum_support.max(PHYSICAL_MIN_DIRECT_VIEWS)
+    } else {
+        // The far/baseline hypothesis is a censored mapping rather than a
+        // metric depth measurement; preserve the user's ordinary support
+        // threshold for that case.
+        options.minimum_support
+    }
+}
+
 fn physical_consensus_visibility_bits(
     scores: &[ViewScore],
     options: &DepthOptions,
@@ -1973,7 +2203,8 @@ fn physical_consensus_visibility_bits(
     scratch: &mut AggregateScratch,
 ) {
     bits.fill(0);
-    if scores.len() < options.minimum_support {
+    let required_support = physical_required_support(scores, options);
+    if scores.len() < required_support {
         return;
     }
     scratch.ordered.clear();
@@ -1981,7 +2212,7 @@ fn physical_consensus_visibility_bits(
         .ordered
         .extend(scores.iter().map(|view| view.compatibility_score));
     scratch.ordered.sort_by(|left, right| right.total_cmp(left));
-    let anchor_count = options.minimum_support.max(2).min(scratch.ordered.len());
+    let anchor_count = required_support.max(2).min(scratch.ordered.len());
     let anchor = scratch.ordered[..anchor_count].iter().sum::<f32>() / anchor_count as f32;
     let threshold = anchor - PHYSICAL_CONSENSUS_BAND;
 
@@ -2001,12 +2232,18 @@ fn physical_consensus_visibility_bits(
         .max(1.0e-6);
 
     let per_view_score_floor = (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
+    let finite_hypothesis = scores.iter().any(|view| view.far_score.is_some());
     let mut effective_support = 0.0f32;
     let mut total_weight = 0.0f32;
+    let mut strong_independent_support = 0usize;
     for view in scores {
         let x = ((view.compatibility_score - threshold) / PHYSICAL_CONSENSUS_SOFTNESS)
             .clamp(-20.0, 20.0);
         let compatibility = 1.0 / (1.0 + (-x).exp());
+        let reliability = view.reliability.clamp(0.0, 1.0);
+        // Reliability is a soft score weight, not a quorum count.  Reducing
+        // effective support here made three-view/narrow-FOV cameras fail the
+        // physical-consensus gate even when all three views agreed.
         effective_support += compatibility;
         let relative_information = if view.depth_information > 1.0e-6 {
             view.depth_information / median_information
@@ -2017,8 +2254,21 @@ fn physical_consensus_visibility_bits(
             PHYSICAL_MIN_INFORMATION_WEIGHT,
             PHYSICAL_MAX_INFORMATION_WEIGHT,
         );
-        total_weight += compatibility * (0.75 + 0.25 * information_weight);
-        if compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY && view.score >= per_view_score_floor {
+        total_weight +=
+            compatibility * (0.70 + 0.30 * reliability) * (0.75 + 0.25 * information_weight);
+        let independent_fraction = if relative_information > 0.0 {
+            relative_information / (1.0 + relative_information)
+        } else {
+            0.0
+        };
+        if compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
+            && view.score >= per_view_score_floor
+            && (!finite_hypothesis
+                || (independent_fraction >= PHYSICAL_MIN_INFORMATION_FRACTION
+                    && view.far_score.is_some()
+                    && view.compatibility_score >= PHYSICAL_MIN_PER_VIEW_FINITE_IMPROVEMENT))
+        {
+            strong_independent_support += 1;
             let word = view.source_index / u64::BITS as usize;
             let bit = view.source_index % u64::BITS as usize;
             if let Some(value) = bits.get_mut(word) {
@@ -2026,7 +2276,10 @@ fn physical_consensus_visibility_bits(
             }
         }
     }
-    if effective_support < options.minimum_support as f32 * 0.75 || total_weight <= 1.0e-6 {
+    if effective_support < required_support as f32 * 0.75
+        || total_weight <= 1.0e-6
+        || (finite_hypothesis && strong_independent_support < required_support)
+    {
         bits.fill(0);
     }
 }
@@ -2240,6 +2493,68 @@ fn nearest_coarse_depth(
         .round()
         .clamp(0.0, (rows - 1) as f64) as usize;
     coarse[row * columns + column]
+}
+
+fn coarse_surface_normal(
+    coarse: &[Option<NodeDepth>],
+    columns: usize,
+    rows: usize,
+    step: usize,
+    reference: &ResolvedCamera,
+    pixel: Vec2,
+) -> Option<Vec3> {
+    if columns == 0 || rows == 0 || step == 0 {
+        return None;
+    }
+    let column = (pixel[0] / step as f64)
+        .round()
+        .clamp(0.0, (columns - 1) as f64) as usize;
+    let row = (pixel[1] / step as f64)
+        .round()
+        .clamp(0.0, (rows - 1) as f64) as usize;
+    let point_at = |column: usize, row: usize| -> Option<Vec3> {
+        let node = coarse.get(row * columns + column)?.as_ref()?;
+        if !node.depth.is_finite() || node.depth <= 0.0 {
+            return None;
+        }
+        let p = [(column * step) as f64, (row * step) as f64];
+        let ray = reference.pixel_to_ray(p);
+        Some(add(ray.origin, scale(ray.direction, node.depth)))
+    };
+    let centre = point_at(column, row);
+    let left = column.checked_sub(1).and_then(|c| point_at(c, row));
+    let right = (column + 1 < columns)
+        .then_some(column + 1)
+        .and_then(|c| point_at(c, row));
+    let above = row.checked_sub(1).and_then(|r| point_at(column, r));
+    let below = (row + 1 < rows)
+        .then_some(row + 1)
+        .and_then(|r| point_at(column, r));
+
+    let tangent_x = match (left, right, centre) {
+        (Some(a), Some(b), _) => Some(sub(b, a)),
+        (Some(a), _, Some(c)) => Some(sub(c, a)),
+        (_, Some(b), Some(c)) => Some(sub(b, c)),
+        _ => None,
+    }?;
+    let tangent_y = match (above, below, centre) {
+        (Some(a), Some(b), _) => Some(sub(b, a)),
+        (Some(a), _, Some(c)) => Some(sub(c, a)),
+        (_, Some(b), Some(c)) => Some(sub(b, c)),
+        _ => None,
+    }?;
+    let mut normal = cross(tangent_x, tangent_y);
+    if !normal.into_iter().all(f64::is_finite) || norm(normal) <= 1.0e-9 {
+        return None;
+    }
+    normal = normalize(normal);
+    let centre_ray = reference.pixel_to_ray(pixel);
+    if dot(normal, centre_ray.direction) < 0.0 {
+        normal = scale(normal, -1.0);
+    }
+    // Extremely grazing fits usually indicate a depth discontinuity rather
+    // than a stable local plane. Fall back to fronto-parallel scoring there.
+    (dot(normal, centre_ray.direction).abs() >= 0.20).then_some(normal)
 }
 
 fn ray_pair_reference_depth(reference: Ray, target: Ray) -> Option<f64> {
@@ -2478,28 +2793,38 @@ fn merge_depth_scores_with_scratch(
     scores.extend(scratch.iter().map(|(_, score)| *score));
 }
 
-fn select_direct_depth(
+fn depth_candidate_objective(
+    depth: f64,
+    evidence: AggregateEvidence,
+    options: &DepthOptions,
+) -> f32 {
+    let far_inverse = 1.0 / options.far_depth;
+    let inverse_range = 1.0 / options.near_depth - far_inverse;
+    let near_fraction = ((1.0 / depth - far_inverse) / inverse_range).clamp(0.0, 1.0);
+    evidence.ranking_score - NEAR_DEPTH_PRIOR * near_fraction as f32
+}
+
+fn select_direct_depth_with_separation<F>(
     depths: &[f64],
     scores: &[Option<AggregateEvidence>],
     baseline: Option<AggregateEvidence>,
     seeded: bool,
     options: &DepthOptions,
     geometry_mode: DepthGeometryMode,
-) -> Option<NodeDepth> {
-    let far_inverse = 1.0 / options.far_depth;
-    let inverse_range = 1.0 / options.near_depth - far_inverse;
+    enforce_projective_uncertainty: bool,
+    projected_separation: F,
+) -> Option<NodeDepth>
+where
+    F: Fn(usize, usize) -> f64,
+{
     let objective_at = |index: usize| {
-        let depth = depths[index];
-        let evidence = scores[index]?;
-        let near_fraction = ((1.0 / depth - far_inverse) / inverse_range).clamp(0.0, 1.0);
-        Some(evidence.ranking_score - NEAR_DEPTH_PRIOR * near_fraction as f32)
+        Some(depth_candidate_objective(
+            depths[index],
+            scores[index]?,
+            options,
+        ))
     };
 
-    // The previous implementation materialised and sorted every valid finite
-    // hypothesis. Only the best objective and the strongest non-neighbouring
-    // competitor are needed, so two linear scans preserve the same selection
-    // while eliminating a per-node allocation and sort. Ties keep the earliest
-    // candidate, matching stable sort behaviour.
     let mut best = None::<(usize, f32)>;
     for index in 0..depths.len() {
         let Some(objective) = objective_at(index) else {
@@ -2512,9 +2837,15 @@ fn select_direct_depth(
     let (best_index, best_objective) = best?;
     let depth = depths[best_index];
     let score = scores[best_index]?.photometric_score;
+
+    // Compare against *projectively distinct* modes rather than arbitrary label
+    // distance. Dense inverse-depth sampling must not make one physical mode
+    // look artificially ambiguous, while a repeated-structure peak many pixels
+    // away must remain a serious competitor even if its label is adjacent.
     let mut competing = None::<f32>;
     for index in 0..depths.len() {
-        if index.abs_diff(best_index) <= 1 {
+        if index == best_index || projected_separation(best_index, index) < DIRECT_DISTINCT_MODE_PX
+        {
             continue;
         }
         let Some(objective) = objective_at(index) else {
@@ -2529,9 +2860,6 @@ fn select_direct_depth(
     let paired_improvement = scores[best_index]
         .and_then(|evidence| Some(evidence.paired_photometric_score? - evidence.paired_far_score?));
     let comparable_improvement = if geometry_mode.is_physical() {
-        // Never compare a finite physical consensus against a separately
-        // aggregated far consensus: that would reintroduce camera-population
-        // bias whenever the two hypotheses are visible in different views.
         paired_improvement
     } else {
         baseline.map(|baseline| score - baseline.photometric_score)
@@ -2543,11 +2871,38 @@ fn select_direct_depth(
     } else {
         options.minimum_margin
     };
-    // A finite label being unique among other finite labels is insufficient:
-    // distant textured surfaces can have an extremely shallow cost curve and
-    // acquire a coherent but fictitious finite depth. Require the candidate
-    // to improve measurably on the active far/baseline hypothesis. When that
-    // patch is unavailable, uniqueness remains the only usable evidence.
+
+    // Turn the near-optimal cost valley into an image-space uncertainty. A
+    // distant scene can have enormous metric depth uncertainty yet still map
+    // every camera to substantially the same sub-pixel location; that is safe
+    // for fusion. Conversely, two repeated-structure modes separated by whole
+    // pixels are not a usable metric-depth observation even when one wins by a
+    // tiny numerical amount.
+    let uncertainty_band = required_margin
+        .max(options.minimum_margin * 0.75)
+        .max(0.006);
+    let mut reprojection_uncertainty = 0.0f64;
+    for index in 0..depths.len() {
+        if index == best_index {
+            continue;
+        }
+        let Some(objective) = objective_at(index) else {
+            continue;
+        };
+        if best_objective - objective <= uncertainty_band {
+            reprojection_uncertainty =
+                reprojection_uncertainty.max(projected_separation(best_index, index));
+        }
+    }
+    let metric_ambiguous = geometry_mode.is_physical()
+        && enforce_projective_uncertainty
+        && reprojection_uncertainty > DIRECT_MAX_REPROJECTION_UNCERTAINTY_PX;
+    if metric_ambiguous && reprojection_uncertainty > DIRECT_HARD_REPROJECTION_AMBIGUITY_PX {
+        // A near-tied alternative several target pixels away is the repeated-
+        // structure failure mode we explicitly do not want to crystallize.
+        return None;
+    }
+
     let improves_global = comparable_improvement
         .is_none_or(|improvement| improvement >= options.minimum_improvement * 0.5);
     let supported = score >= score_floor
@@ -2561,12 +2916,116 @@ fn select_direct_depth(
     let score_confidence =
         ((score - score_floor) / (1.0 - score_floor).max(1.0e-3)).clamp(0.0, 1.0);
     let margin_confidence = (margin / required_margin.max(1.0e-3)).clamp(0.0, 1.0);
+    let geometric_confidence = if enforce_projective_uncertainty {
+        let normalized = reprojection_uncertainty / DIRECT_MAX_REPROJECTION_UNCERTAINTY_PX;
+        (1.0 / (1.0 + normalized * normalized)) as f32
+    } else {
+        1.0
+    };
     Some(NodeDepth {
         depth,
-        confidence: (0.30 + 0.45 * score_confidence + 0.25 * margin_confidence).clamp(0.0, 1.0),
+        confidence: ((0.30 + 0.45 * score_confidence + 0.25 * margin_confidence)
+            * (0.55 + 0.45 * geometric_confidence))
+            .clamp(0.0, 1.0),
         improvement,
-        regularized: false,
+        // Keep a plausible best mode for spatial regularization/fusion when
+        // metric depth is unresolved but the competing mappings are still
+        // within a few pixels.  Downstream code can distinguish it from a
+        // directly identified metric surface through provenance.
+        regularized: metric_ambiguous,
     })
+}
+
+fn select_direct_depth(
+    depths: &[f64],
+    scores: &[Option<AggregateEvidence>],
+    baseline: Option<AggregateEvidence>,
+    seeded: bool,
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+) -> Option<NodeDepth> {
+    select_direct_depth_with_separation(
+        depths,
+        scores,
+        baseline,
+        seeded,
+        options,
+        geometry_mode,
+        false,
+        |first, second| {
+            if first.abs_diff(second) > 1 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        },
+    )
+}
+
+fn select_direct_depth_projective(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    centre: Vec2,
+    depths: &[f64],
+    scores: &[Option<AggregateEvidence>],
+    baseline: Option<AggregateEvidence>,
+    seeded: bool,
+    options: &DepthOptions,
+    geometry_mode: DepthGeometryMode,
+) -> Option<NodeDepth> {
+    select_direct_depth_with_separation(
+        depths,
+        scores,
+        baseline,
+        seeded,
+        options,
+        geometry_mode,
+        true,
+        |first, second| {
+            maximum_projected_depth_motion(
+                inputs,
+                reference_index,
+                centre,
+                depths[first],
+                depths[second],
+            )
+        },
+    )
+}
+
+fn top_projective_depth_modes_into(
+    inputs: &[AlignInput<'_>],
+    reference_index: usize,
+    centre: Vec2,
+    depths: &[f64],
+    scores: &[Option<AggregateEvidence>],
+    options: &DepthOptions,
+    modes: &mut Vec<usize>,
+) {
+    modes.clear();
+    for _ in 0..DIRECT_DEPTH_MODE_BEAM {
+        let mut best = None::<(usize, f32)>;
+        for (index, (&depth, &evidence)) in depths.iter().zip(scores).enumerate() {
+            let Some(evidence) = evidence else { continue };
+            if modes.iter().any(|&selected| {
+                maximum_projected_depth_motion(
+                    inputs,
+                    reference_index,
+                    centre,
+                    depths[selected],
+                    depth,
+                ) < DIRECT_DISTINCT_MODE_PX
+            }) {
+                continue;
+            }
+            let objective = depth_candidate_objective(depth, evidence, options);
+            if best.is_none_or(|(_, current)| objective.total_cmp(&current).is_gt()) {
+                best = Some((index, objective));
+            }
+        }
+        let Some((index, _)) = best else { break };
+        modes.push(index);
+    }
 }
 
 fn best_depth_candidate(
@@ -2574,19 +3033,13 @@ fn best_depth_candidate(
     scores: &[Option<AggregateEvidence>],
     options: &DepthOptions,
 ) -> Option<usize> {
-    let far_inverse = 1.0 / options.far_depth;
-    let inverse_range = 1.0 / options.near_depth - far_inverse;
     depths
         .iter()
         .zip(scores)
         .enumerate()
         .filter_map(|(index, (&depth, &evidence))| {
             let evidence = evidence?;
-            let near_fraction = ((1.0 / depth - far_inverse) / inverse_range).clamp(0.0, 1.0);
-            Some((
-                index,
-                evidence.ranking_score - NEAR_DEPTH_PRIOR * near_fraction as f32,
-            ))
+            Some((index, depth_candidate_objective(depth, evidence, options)))
         })
         .max_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(index, _)| index)
@@ -2689,9 +3142,20 @@ fn build_cost_volume(
                                                     target_camera,
                                                     p,
                                                 );
-                                                measured_centres[index] = alignments[index]
-                                                    .warp
-                                                    .map(p[0] as f32, p[1] as f32);
+                                                measured_centres[index] = if alignments[index]
+                                                    .report
+                                                    .accepted
+                                                {
+                                                    alignments[index]
+                                                        .warp
+                                                        .map(p[0] as f32, p[1] as f32)
+                                                } else {
+                                                    // A rejected residual warp is not a safe
+                                                    // perpendicular proposal. Keep using the
+                                                    // calibrated physical camera, but score it
+                                                    // without importing the rejected 2-D fit.
+                                                    None
+                                                };
                                                 for (finite_index, depth) in
                                                     labels.iter().skip(1).enumerate()
                                                 {
@@ -2795,6 +3259,7 @@ fn build_cost_volume(
                                     active_view_indices,
                                     p,
                                     depth,
+                                    None,
                                     options,
                                     geometry_mode,
                                     prepared_reference.then_some(&reference_patch),
@@ -3111,6 +3576,13 @@ fn retain_coarse_regularized_depths(
     coarse_step: usize,
     inverse_tolerance: f64,
 ) {
+    // Freeze the fine-grid direct measurements before inserting any coarse
+    // regularized estimates.  A coarse SGM solution is allowed to fill a
+    // directly tested hole only when the same inverse-depth mode is anchored
+    // by multiple nearby *direct* measurements.  Without this guard, a smooth
+    // but incorrect coarse surface can seed a large unsupported island and
+    // completion then propagates it across much of the depth map.
+    let direct = field.to_vec();
     for row in 0..rows {
         for column in 0..columns {
             let index = row * columns + column;
@@ -3197,6 +3669,40 @@ fn retain_coarse_regularized_depths(
                 .iter()
                 .map(|candidate| candidate.2)
                 .fold(0.0, f32::max);
+
+            let mut direct_anchors = 0usize;
+            for dy in -FINAL_COARSE_DIRECT_ANCHOR_RADIUS..=FINAL_COARSE_DIRECT_ANCHOR_RADIUS {
+                for dx in -FINAL_COARSE_DIRECT_ANCHOR_RADIUS..=FINAL_COARSE_DIRECT_ANCHOR_RADIUS {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let x = column as i32 + dx;
+                    let y = row as i32 + dy;
+                    if x < 0 || y < 0 || x >= columns as i32 || y >= rows as i32 {
+                        continue;
+                    }
+                    let neighbour_index = y as usize * columns + x as usize;
+                    let Some(anchor) = direct[neighbour_index] else {
+                        continue;
+                    };
+                    if anchor.regularized {
+                        continue;
+                    }
+                    if (guidance[index] - guidance[neighbour_index]).abs()
+                        > COMPLETION_IMAGE_EDGE_LIMIT
+                    {
+                        continue;
+                    }
+                    let anchor_inverse = 1.0 / anchor.depth;
+                    if (anchor_inverse - inverse_depth).abs() <= inverse_tolerance * 1.5 {
+                        direct_anchors += 1;
+                    }
+                }
+            }
+            if direct_anchors < FINAL_COARSE_MIN_DIRECT_ANCHORS {
+                continue;
+            }
+
             field[index] = Some(NodeDepth {
                 depth: 1.0 / inverse_depth,
                 confidence: (source_confidence * FINAL_COARSE_CONFIDENCE_SCALE)
@@ -3217,6 +3723,13 @@ fn complete_depth_field(
     options: &DepthOptions,
     inverse_tolerance: f64,
 ) {
+    // Freeze authoritative anchors before any completion. Newly regularized
+    // pixels may support interpolation, but can never become new evidence that
+    // recursively grows a surface without bound.
+    let direct_anchors = field
+        .iter()
+        .map(|node| (*node).filter(|node| !node.regularized))
+        .collect::<Vec<_>>();
     for _ in 0..options.completion_iterations {
         let previous = field.to_vec();
         let mut changed = false;
@@ -3303,6 +3816,32 @@ fn complete_depth_field(
                         (accumulated >= total_weight * 0.5).then_some(inverse_depth)
                     })
                     .unwrap_or(winning_inverse);
+                let mut direct_support = 0usize;
+                for dy in -COMPLETION_DIRECT_ANCHOR_RADIUS..=COMPLETION_DIRECT_ANCHOR_RADIUS {
+                    for dx in -COMPLETION_DIRECT_ANCHOR_RADIUS..=COMPLETION_DIRECT_ANCHOR_RADIUS {
+                        let x = column as i32 + dx;
+                        let y = row as i32 + dy;
+                        if x < 0 || y < 0 || x >= columns as i32 || y >= rows as i32 {
+                            continue;
+                        }
+                        let anchor_index = y as usize * columns + x as usize;
+                        let Some(anchor) = direct_anchors[anchor_index] else {
+                            continue;
+                        };
+                        if (guidance[index] - guidance[anchor_index]).abs()
+                            > COMPLETION_IMAGE_EDGE_LIMIT
+                        {
+                            continue;
+                        }
+                        if (1.0 / anchor.depth - inverse_depth).abs() <= inverse_tolerance * 1.5 {
+                            direct_support += 1;
+                        }
+                    }
+                }
+                if direct_support < COMPLETION_MIN_DIRECT_ANCHORS {
+                    continue;
+                }
+
                 let confidence = (compatible[..compatible_count]
                     .iter()
                     .map(|candidate| candidate.1)
@@ -3324,6 +3863,96 @@ fn complete_depth_field(
     }
 }
 
+fn reject_unanchored_regularized_components(
+    field: &mut [Option<NodeDepth>],
+    guidance: &[f32],
+    columns: usize,
+    rows: usize,
+    inverse_tolerance: f64,
+) -> usize {
+    let mut visited = vec![false; field.len()];
+    let mut rejected = 0usize;
+    let neighbours = [
+        (-1i32, -1i32),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ];
+
+    for start in 0..field.len() {
+        if visited[start] || field[start].is_none() {
+            continue;
+        }
+        visited[start] = true;
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        let mut component = Vec::new();
+        let mut has_direct = false;
+
+        while let Some(index) = queue.pop_front() {
+            component.push(index);
+            let node = field[index].expect("finite depth component node");
+            has_direct |= !node.regularized;
+            let row = index / columns;
+            let column = index % columns;
+            let inverse = 1.0 / node.depth;
+            for (dx, dy) in neighbours {
+                let x = column as i32 + dx;
+                let y = row as i32 + dy;
+                if x < 0 || y < 0 || x >= columns as i32 || y >= rows as i32 {
+                    continue;
+                }
+                let other_index = y as usize * columns + x as usize;
+                if visited[other_index] {
+                    continue;
+                }
+                let Some(other) = field[other_index] else {
+                    continue;
+                };
+                if (guidance[index] - guidance[other_index]).abs() > COMPLETION_IMAGE_EDGE_LIMIT {
+                    continue;
+                }
+                if (inverse - 1.0 / other.depth).abs() > inverse_tolerance * 2.0 {
+                    continue;
+                }
+                visited[other_index] = true;
+                queue.push_back(other_index);
+            }
+        }
+
+        if !has_direct {
+            for index in component {
+                if field[index].is_some_and(|node| node.regularized) {
+                    field[index] = None;
+                    rejected += 1;
+                }
+            }
+        }
+    }
+    rejected
+}
+
+#[inline]
+fn depth_view_reliability(input: &AlignInput<'_>, alignment: &ModuleAlignment) -> f32 {
+    if alignment.report.initialised_from == "reference" {
+        return input.depth_evidence_reliability.clamp(0.0, 1.0);
+    }
+    // Keep this deliberately soft. A difficult narrow-FOV camera must be able
+    // to recover locally even when its global stage-2 fit was awkward.
+    let inlier = alignment.report.inlier_ratio.clamp(0.0, 1.0);
+    let residual = (-alignment.report.residual_p90_px.max(0.0) / 6.0).exp();
+    let feature = (alignment.report.rig_feature_matches as f32 / 400.0).clamp(0.0, 1.0);
+    let accepted = if alignment.report.accepted { 1.0 } else { 0.65 };
+    let image_reliability = (0.35
+        + 0.65 * (0.45 * inlier + 0.30 * residual + 0.25 * feature) * accepted)
+        .clamp(0.20, 1.0);
+    (image_reliability * input.depth_evidence_reliability.clamp(0.0, 1.0)).clamp(0.20, 1.0)
+}
+
 fn score_views_prepared_into(
     inputs: &[AlignInput<'_>],
     reference_index: usize,
@@ -3331,6 +3960,7 @@ fn score_views_prepared_into(
     active_view_indices: &[usize],
     centre: Vec2,
     depth: Option<f64>,
+    surface_normal: Option<Vec3>,
     options: &DepthOptions,
     geometry_mode: DepthGeometryMode,
     reference_patch: Option<&PreparedReferencePatch>,
@@ -3373,17 +4003,24 @@ fn score_views_prepared_into(
                                     )
                                 })
                         } else {
-                            projected_patch_zncc_from_prepared_rays(
-                                &inputs[reference_index],
-                                &inputs[index],
-                                &alignments[index].warp,
+                            local_patch_projection_from_alignment_with_normal(
+                                reference_camera,
+                                target_camera,
+                                &alignments[index],
                                 centre,
                                 Some(depth),
-                                [0.0, 0.0],
                                 options,
-                                reference_patch,
                                 reference_rays,
+                                surface_normal,
                             )
+                            .and_then(|projection| {
+                                projected_patch_zncc_prepared(
+                                    &inputs[index],
+                                    &projection,
+                                    [0.0, 0.0],
+                                    reference_patch,
+                                )
+                            })
                         }
                     }
                 };
@@ -3404,6 +4041,7 @@ fn score_views_prepared_into(
                     far_score,
                     compatibility_score,
                     depth_information: information,
+                    reliability: depth_view_reliability(&inputs[index], &alignments[index]),
                 }
             }
             DepthGeometryMode::WarpSeeded => {
@@ -3432,20 +4070,22 @@ fn score_views_prepared_into(
 fn refine_one_view_physical(
     reference: &AlignInput<'_>,
     target: &AlignInput<'_>,
-    measured_proposal: &Warp,
+    alignment: &ModuleAlignment,
     centre: Vec2,
     shared_depth: f64,
     options: &DepthOptions,
 ) -> Option<ViewRefinement> {
     let reference_camera = reference.camera?;
     let target_camera = target.camera?;
-    let projection = local_patch_projection(
+    let reference_rays = local_patch_reference_rays(reference_camera, centre);
+    let projection = local_patch_projection_from_alignment(
         reference_camera,
         target_camera,
-        measured_proposal,
+        alignment,
         centre,
         Some(shared_depth),
         options,
+        &reference_rays,
     )?;
     let depth_point = [
         projection.target_centre[0] as f32,
@@ -3570,6 +4210,7 @@ fn score_one_view_warp_seeded(
         far_score: None,
         compatibility_score: score,
         depth_information: 1.0,
+        reliability: target.depth_evidence_reliability.clamp(0.0, 1.0),
     })
 }
 
@@ -3906,11 +4547,12 @@ fn local_patch_reference_rays(
     }
 }
 
-fn local_patch_projection_from_rays_core(
+fn local_patch_projection_from_rays_core_with_normal(
     target_camera: &ResolvedCamera,
     centre: Vec2,
     depth: Option<f64>,
     rays: &LocalPatchReferenceRays,
+    surface_normal: Option<Vec3>,
     proposal_for_centre: impl FnOnce(Vec2) -> Vec2,
 ) -> Option<LocalPatchProjection> {
     const DERIVATIVE_STEP: f64 = 2.0;
@@ -3921,7 +4563,17 @@ fn local_patch_projection_from_rays_core(
         centre_ray.origin,
         scale(centre_ray.direction, surface_depth),
     );
-    let surface_normal = centre_ray.direction;
+    let mut surface_normal = surface_normal.unwrap_or(centre_ray.direction);
+    if !surface_normal.into_iter().all(f64::is_finite) || norm(surface_normal) <= 1.0e-9 {
+        surface_normal = centre_ray.direction;
+    } else {
+        surface_normal = normalize(surface_normal);
+        // Plane orientation has an arbitrary sign. Keep it facing roughly the
+        // reference ray for stable denominator checks.
+        if dot(surface_normal, centre_ray.direction) < 0.0 {
+            surface_normal = scale(surface_normal, -1.0);
+        }
+    }
     let project_ray = |ray: Ray| -> Option<Vec2> {
         let denominator = dot(ray.direction, surface_normal);
         if denominator.abs() <= 1.0e-9 {
@@ -3959,6 +4611,23 @@ fn local_patch_projection_from_rays_core(
     })
 }
 
+fn local_patch_projection_from_rays_core(
+    target_camera: &ResolvedCamera,
+    centre: Vec2,
+    depth: Option<f64>,
+    rays: &LocalPatchReferenceRays,
+    proposal_for_centre: impl FnOnce(Vec2) -> Vec2,
+) -> Option<LocalPatchProjection> {
+    local_patch_projection_from_rays_core_with_normal(
+        target_camera,
+        centre,
+        depth,
+        rays,
+        None,
+        proposal_for_centre,
+    )
+}
+
 fn local_patch_projection_from_rays(
     reference_camera: &ResolvedCamera,
     target_camera: &ResolvedCamera,
@@ -3979,6 +4648,74 @@ fn local_patch_projection_from_rays(
             options,
         )
     })
+}
+
+/// Physical scoring may still use a calibrated camera whose ordinary
+/// residual homography was rejected, but that rejected 2-D warp must not steer
+/// the physical correspondence perpendicular to the epipolar locus.
+fn local_patch_projection_from_alignment(
+    reference_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    alignment: &ModuleAlignment,
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+    rays: &LocalPatchReferenceRays,
+) -> Option<LocalPatchProjection> {
+    if alignment.report.accepted {
+        local_patch_projection_from_rays(
+            reference_camera,
+            target_camera,
+            &alignment.warp,
+            centre,
+            depth,
+            options,
+            rays,
+        )
+    } else {
+        local_patch_projection_from_rays_core(target_camera, centre, depth, rays, |_| [0.0, 0.0])
+    }
+}
+
+fn local_patch_projection_from_alignment_with_normal(
+    reference_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    alignment: &ModuleAlignment,
+    centre: Vec2,
+    depth: Option<f64>,
+    options: &DepthOptions,
+    rays: &LocalPatchReferenceRays,
+    surface_normal: Option<Vec3>,
+) -> Option<LocalPatchProjection> {
+    if alignment.report.accepted {
+        local_patch_projection_from_rays_core_with_normal(
+            target_camera,
+            centre,
+            depth,
+            rays,
+            surface_normal,
+            |physical_centre| {
+                measured_perpendicular_proposal(
+                    &alignment.warp,
+                    reference_camera,
+                    target_camera,
+                    centre,
+                    physical_centre,
+                    depth,
+                    options,
+                )
+            },
+        )
+    } else {
+        local_patch_projection_from_rays_core_with_normal(
+            target_camera,
+            centre,
+            depth,
+            rays,
+            surface_normal,
+            |_| [0.0, 0.0],
+        )
+    }
 }
 
 fn local_patch_projection_from_rays_cached_proposal(
@@ -4152,7 +4889,8 @@ fn aggregate_physical_evidence_with_scratch(
     options: &DepthOptions,
     scratch: &mut AggregateScratch,
 ) -> Option<AggregateEvidence> {
-    if scores.len() < options.minimum_support {
+    let required_support = physical_required_support(scores, options);
+    if scores.len() < required_support {
         return None;
     }
 
@@ -4161,7 +4899,7 @@ fn aggregate_physical_evidence_with_scratch(
         .ordered
         .extend(scores.iter().map(|view| view.compatibility_score));
     scratch.ordered.sort_by(|left, right| right.total_cmp(left));
-    let anchor_count = options.minimum_support.max(2).min(scratch.ordered.len());
+    let anchor_count = required_support.max(2).min(scratch.ordered.len());
     let anchor = scratch.ordered[..anchor_count].iter().sum::<f32>() / anchor_count as f32;
     let threshold = anchor - PHYSICAL_CONSENSUS_BAND;
 
@@ -4186,12 +4924,19 @@ fn aggregate_physical_evidence_with_scratch(
     let mut paired_far = 0.0f32;
     let mut paired_weight = 0.0f32;
     let mut paired_support = 0.0f32;
+    let per_view_score_floor = (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
+    let finite_hypothesis = scores.iter().any(|view| view.far_score.is_some());
     let mut effective_support = 0.0f32;
     let mut effective_independent_support = 0.0f32;
+    let mut strong_independent_support = 0usize;
     for view in scores {
         let x = ((view.compatibility_score - threshold) / PHYSICAL_CONSENSUS_SOFTNESS)
             .clamp(-20.0, 20.0);
         let compatibility = 1.0 / (1.0 + (-x).exp());
+        let reliability = view.reliability.clamp(0.0, 1.0);
+        // Reliability is a soft score weight, not a quorum count.  Reducing
+        // effective support here made three-view/narrow-FOV cameras fail the
+        // physical-consensus gate even when all three views agreed.
         effective_support += compatibility;
 
         let relative_information = if view.depth_information > 1.0e-6 {
@@ -4203,7 +4948,8 @@ fn aggregate_physical_evidence_with_scratch(
             PHYSICAL_MIN_INFORMATION_WEIGHT,
             PHYSICAL_MAX_INFORMATION_WEIGHT,
         );
-        let photometric_weight = compatibility * (0.75 + 0.25 * information_weight);
+        let photometric_weight =
+            compatibility * (0.70 + 0.30 * reliability) * (0.75 + 0.25 * information_weight);
         weighted_score += photometric_weight * view.score;
         total_weight += photometric_weight;
         if let Some(far_score) = view.far_score {
@@ -4218,14 +4964,26 @@ fn aggregate_physical_evidence_with_scratch(
             0.0
         };
         effective_independent_support += compatibility * independent_fraction;
+        if compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
+            && view.score >= per_view_score_floor
+            && (!finite_hypothesis
+                || (independent_fraction >= PHYSICAL_MIN_INFORMATION_FRACTION
+                    && view.far_score.is_some()
+                    && view.compatibility_score >= PHYSICAL_MIN_PER_VIEW_FINITE_IMPROVEMENT))
+        {
+            strong_independent_support += 1;
+        }
     }
 
-    if effective_support < options.minimum_support as f32 * 0.75 || total_weight <= 1.0e-6 {
+    if effective_support < required_support as f32 * 0.75
+        || total_weight <= 1.0e-6
+        || (finite_hypothesis && strong_independent_support < required_support)
+    {
         return None;
     }
     let photometric_score = (weighted_score / total_weight).clamp(-1.0, 1.0);
     let (paired_photometric_score, paired_far_score) =
-        if paired_weight > 1.0e-6 && paired_support >= options.minimum_support as f32 * 0.75 {
+        if paired_weight > 1.0e-6 && paired_support >= required_support as f32 * 0.75 {
             (
                 Some((paired_finite / paired_weight).clamp(-1.0, 1.0)),
                 Some((paired_far / paired_weight).clamp(-1.0, 1.0)),
@@ -4233,7 +4991,7 @@ fn aggregate_physical_evidence_with_scratch(
         } else {
             (None, None)
         };
-    let minimum_independent = options.minimum_support as f32 * 0.5;
+    let minimum_independent = required_support as f32 * 0.5;
     let excess_support = (effective_independent_support - minimum_independent).max(0.0);
     let support_confidence = 1.0 - (-excess_support / PHYSICAL_SUPPORT_CONFIDENCE_SATURATION).exp();
     let ranking_score = if photometric_score > 0.0 {
@@ -4298,7 +5056,8 @@ fn aggregate_physical_consensus(
     scores: &[ViewScore],
     options: &DepthOptions,
 ) -> Option<PhysicalConsensus> {
-    if scores.len() < options.minimum_support {
+    let required_support = physical_required_support(scores, options);
+    if scores.len() < required_support {
         return None;
     }
 
@@ -4309,7 +5068,7 @@ fn aggregate_physical_consensus(
         .map(|view| view.compatibility_score)
         .collect::<Vec<_>>();
     ordered.sort_by(|left, right| right.total_cmp(left));
-    let anchor_count = options.minimum_support.max(2).min(ordered.len());
+    let anchor_count = required_support.max(2).min(ordered.len());
     let anchor = ordered[..anchor_count].iter().sum::<f32>() / anchor_count as f32;
     let threshold = anchor - PHYSICAL_CONSENSUS_BAND;
 
@@ -4334,13 +5093,20 @@ fn aggregate_physical_consensus(
     let mut paired_far = 0.0f32;
     let mut paired_weight = 0.0f32;
     let mut paired_support = 0.0f32;
+    let per_view_score_floor = (options.minimum_score - 0.10).max(MINIMUM_REGULARIZED_SCORE);
+    let finite_hypothesis = scores.iter().any(|view| view.far_score.is_some());
     let mut effective_support = 0.0f32;
     let mut effective_independent_support = 0.0f32;
+    let mut strong_independent_support = 0usize;
     let mut members = Vec::with_capacity(scores.len());
     for view in scores {
         let x = ((view.compatibility_score - threshold) / PHYSICAL_CONSENSUS_SOFTNESS)
             .clamp(-20.0, 20.0);
         let compatibility = 1.0 / (1.0 + (-x).exp());
+        let reliability = view.reliability.clamp(0.0, 1.0);
+        // Reliability is a soft score weight, not a quorum count.  Reducing
+        // effective support here made three-view/narrow-FOV cameras fail the
+        // physical-consensus gate even when all three views agreed.
         effective_support += compatibility;
 
         let relative_information = if view.depth_information > 1.0e-6 {
@@ -4352,7 +5118,8 @@ fn aggregate_physical_consensus(
             PHYSICAL_MIN_INFORMATION_WEIGHT,
             PHYSICAL_MAX_INFORMATION_WEIGHT,
         );
-        let photometric_weight = compatibility * (0.75 + 0.25 * information_weight);
+        let photometric_weight =
+            compatibility * (0.70 + 0.30 * reliability) * (0.75 + 0.25 * information_weight);
         weighted_score += photometric_weight * view.score;
         total_weight += photometric_weight;
 
@@ -4373,6 +5140,15 @@ fn aggregate_physical_consensus(
             0.0
         };
         effective_independent_support += compatibility * independent_fraction;
+        if compatibility >= PHYSICAL_VISIBLE_COMPATIBILITY
+            && view.score >= per_view_score_floor
+            && (!finite_hypothesis
+                || (independent_fraction >= PHYSICAL_MIN_INFORMATION_FRACTION
+                    && view.far_score.is_some()
+                    && view.compatibility_score >= PHYSICAL_MIN_PER_VIEW_FINITE_IMPROVEMENT))
+        {
+            strong_independent_support += 1;
+        }
         members.push(PhysicalMember {
             source_index: view.source_index,
             score: view.score,
@@ -4380,13 +5156,16 @@ fn aggregate_physical_consensus(
         });
     }
 
-    if effective_support < options.minimum_support as f32 * 0.75 || total_weight <= 1.0e-6 {
+    if effective_support < required_support as f32 * 0.75
+        || total_weight <= 1.0e-6
+        || (finite_hypothesis && strong_independent_support < required_support)
+    {
         return None;
     }
 
     let photometric_score = (weighted_score / total_weight).clamp(-1.0, 1.0);
     let (paired_photometric_score, paired_far_score) =
-        if paired_weight > 1.0e-6 && paired_support >= options.minimum_support as f32 * 0.75 {
+        if paired_weight > 1.0e-6 && paired_support >= required_support as f32 * 0.75 {
             (
                 Some((paired_finite / paired_weight).clamp(-1.0, 1.0)),
                 Some((paired_far / paired_weight).clamp(-1.0, 1.0)),
@@ -4399,7 +5178,7 @@ fn aggregate_physical_consensus(
     // not as another signed correlation term.  This keeps the ranking inside
     // [-1, 1], leaves negative/weak hypotheses weak, and lets broad coherent
     // support accumulate enough evidence to beat a chance few-view peak.
-    let minimum_independent = options.minimum_support as f32 * 0.5;
+    let minimum_independent = required_support as f32 * 0.5;
     let excess_support = (effective_independent_support - minimum_independent).max(0.0);
     let support_confidence = 1.0 - (-excess_support / PHYSICAL_SUPPORT_CONFIDENCE_SATURATION).exp();
     let ranking_score = if photometric_score > 0.0 {
@@ -4553,6 +5332,8 @@ mod tests {
             height: 48,
             camera: None,
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: None,
             nominal_focal_px: 1_000.0,
         };
         let target = AlignInput {
@@ -4562,6 +5343,8 @@ mod tests {
             height: 48,
             camera: None,
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: None,
             nominal_focal_px: 1_000.0,
         };
         let options = DepthOptions {
@@ -4744,6 +5527,67 @@ mod tests {
     }
 
     #[test]
+    fn projectively_distinct_near_tied_depth_modes_are_not_authoritative() {
+        let options = DepthOptions {
+            minimum_score: 0.40,
+            minimum_margin: 0.001,
+            minimum_improvement: 0.001,
+            ..DepthOptions::default()
+        };
+        let evidence = |score: f32| {
+            Some(AggregateEvidence {
+                photometric_score: score,
+                paired_photometric_score: Some(score),
+                paired_far_score: Some(0.60),
+                ranking_score: score,
+            })
+        };
+        let depths = [2_000.0, 2_200.0];
+        let scores = [evidence(0.900), evidence(0.897)];
+
+        let ambiguous = select_direct_depth_with_separation(
+            &depths,
+            &scores,
+            None,
+            true,
+            &options,
+            DepthGeometryMode::PhysicalRig,
+            true,
+            |first, second| if first == second { 0.0 } else { 1.5 },
+        )
+        .expect("moderately ambiguous mapping should survive for spatial regularization");
+        assert!(ambiguous.regularized);
+
+        let hard_ambiguous = select_direct_depth_with_separation(
+            &depths,
+            &scores,
+            None,
+            true,
+            &options,
+            DepthGeometryMode::PhysicalRig,
+            true,
+            |first, second| if first == second { 0.0 } else { 5.0 },
+        );
+        assert!(
+            hard_ambiguous.is_none(),
+            "a near-tied mode several pixels away must remain unresolved"
+        );
+
+        let mapping_stable = select_direct_depth_with_separation(
+            &depths,
+            &scores,
+            None,
+            true,
+            &options,
+            DepthGeometryMode::PhysicalRig,
+            true,
+            |first, second| if first == second { 0.0 } else { 0.4 },
+        );
+        let mapping_stable = mapping_stable.expect("sub-pixel mapping should be authoritative");
+        assert!(!mapping_stable.regularized);
+    }
+
+    #[test]
     fn sublabel_fit_refines_inverse_depth_between_planes() {
         let labels = [None, Some(10_000.0), Some(5_000.0), Some(10_000.0 / 3.0)];
         let depth = sublabel_depth(&labels, &[9.0, 2.0, 0.0, 1.0], 2);
@@ -4760,6 +5604,7 @@ mod tests {
             far_score: None,
             compatibility_score: score,
             depth_information: 1.0,
+            reliability: 1.0,
         };
         let one = [view(0, 0.9)];
         assert!(aggregate(&one, &options, DepthGeometryMode::PhysicalRig).is_none());
@@ -4832,6 +5677,51 @@ mod tests {
     }
 
     #[test]
+    fn physical_finite_consensus_requires_three_informative_views() {
+        let options = DepthOptions {
+            minimum_support: 2,
+            ..DepthOptions::default()
+        };
+        let finite = |source_index| ViewScore {
+            source_index,
+            score: 0.90,
+            far_score: Some(0.70),
+            compatibility_score: 0.20,
+            depth_information: 1.0,
+            reliability: 1.0,
+        };
+        let two = [finite(0), finite(1)];
+        assert!(
+            aggregate_physical_consensus(&two, &options).is_none(),
+            "two-view finite correlation must remain a proposal, not direct metric depth"
+        );
+
+        let three = [finite(0), finite(1), finite(2)];
+        assert!(aggregate_physical_consensus(&three, &options).is_some());
+    }
+
+    #[test]
+    fn physical_finite_consensus_requires_each_authoritative_view_to_beat_far() {
+        let options = DepthOptions {
+            minimum_support: 2,
+            ..DepthOptions::default()
+        };
+        let shallow = |source_index| ViewScore {
+            source_index,
+            score: 0.901,
+            far_score: Some(0.900),
+            compatibility_score: 0.001,
+            depth_information: 1.0,
+            reliability: 1.0,
+        };
+        let views = [shallow(0), shallow(1), shallow(2), shallow(3)];
+        assert!(
+            aggregate_physical_consensus(&views, &options).is_none(),
+            "relative multi-view agreement must not manufacture finite depth when no view meaningfully beats infinity"
+        );
+    }
+
+    #[test]
     fn physical_consensus_pairs_finite_and_far_on_identical_view_weights() {
         let options = DepthOptions::default();
         let finite = [0.90, 0.90, 0.50, 0.50];
@@ -4846,6 +5736,7 @@ mod tests {
                 far_score: Some(far_score),
                 compatibility_score: score - far_score,
                 depth_information: 1.0,
+                reliability: 1.0,
             })
             .collect::<Vec<_>>();
         let evidence = aggregate_physical_consensus(&views, &options)
@@ -4867,6 +5758,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.90,
                 depth_information: 1.0,
+                reliability: 1.0,
             })
             .collect::<Vec<_>>();
         let views10 = (0..10)
@@ -4876,6 +5768,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.90,
                 depth_information: 1.0,
+                reliability: 1.0,
             })
             .collect::<Vec<_>>();
         let two = aggregate(&views2, &options, DepthGeometryMode::PhysicalRig).unwrap();
@@ -4898,6 +5791,7 @@ mod tests {
                 far_score: Some(0.72),
                 compatibility_score: 0.19,
                 depth_information: 0.4,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 3,
@@ -4905,6 +5799,7 @@ mod tests {
                 far_score: Some(0.71),
                 compatibility_score: 0.13,
                 depth_information: 1.0,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 5,
@@ -4912,6 +5807,7 @@ mod tests {
                 far_score: Some(0.75),
                 compatibility_score: -0.07,
                 depth_information: 2.5,
+                reliability: 1.0,
             },
         ];
         let consensus = aggregate_physical_consensus(&views, &options).expect("consensus");
@@ -4944,6 +5840,7 @@ mod tests {
                 far_score: Some(0.72),
                 compatibility_score: 0.19,
                 depth_information: 0.4,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 2,
@@ -4951,6 +5848,7 @@ mod tests {
                 far_score: Some(0.71),
                 compatibility_score: 0.13,
                 depth_information: 1.0,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 3,
@@ -4958,6 +5856,7 @@ mod tests {
                 far_score: Some(0.75),
                 compatibility_score: -0.07,
                 depth_information: 2.5,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 4,
@@ -4965,6 +5864,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: -0.33,
                 depth_information: 0.0,
+                reliability: 1.0,
             },
         ];
 
@@ -5008,6 +5908,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.80 + source_index as f32 * 0.005,
                 depth_information: 1.0,
+                reliability: 1.0,
             })
             .collect::<Vec<_>>();
         let physical = aggregate(&views, &options, DepthGeometryMode::PhysicalRig).unwrap();
@@ -5034,6 +5935,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.80,
                 depth_information: 1.0,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 1,
@@ -5041,6 +5943,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.80,
                 depth_information: 1.0,
+                reliability: 1.0,
             },
             ViewScore {
                 source_index: 2,
@@ -5048,6 +5951,7 @@ mod tests {
                 far_score: None,
                 compatibility_score: 0.30,
                 depth_information: 1.0e6,
+                reliability: 1.0,
             },
         ];
         let evidence = aggregate(&views, &options, DepthGeometryMode::PhysicalRig).unwrap();
@@ -5294,9 +6198,108 @@ mod tests {
     }
 
     #[test]
-    fn final_field_retains_only_tested_edge_compatible_coarse_depth() {
+    fn completion_cannot_walk_beyond_direct_measurement_ancestry() {
+        let options = DepthOptions {
+            completion_iterations: 8,
+            minimum_neighbour_support: 1,
+            ..DepthOptions::default()
+        };
+        let mut field = vec![None; 8];
+        field[0] = Some(NodeDepth {
+            depth: 2_000.0,
+            confidence: 1.0,
+            improvement: 0.2,
+            regularized: false,
+        });
+        complete_depth_field(&mut field, &[0.0; 8], &[true; 8], 8, 1, &options, 1.0e-4);
+        assert!(field[1].is_some());
+        assert!(field[COMPLETION_DIRECT_ANCHOR_RADIUS as usize].is_some());
+        assert!(field[COMPLETION_DIRECT_ANCHOR_RADIUS as usize + 1].is_none());
+    }
+
+    #[test]
+    fn unanchored_regularized_component_is_removed() {
+        let direct = NodeDepth {
+            depth: 2_000.0,
+            confidence: 1.0,
+            improvement: 0.2,
+            regularized: false,
+        };
+        let regularized = NodeDepth {
+            depth: 2_000.0,
+            confidence: 0.3,
+            improvement: 0.0,
+            regularized: true,
+        };
+        let mut field = vec![Some(direct), Some(regularized), None, Some(regularized)];
+        let rejected =
+            reject_unanchored_regularized_components(&mut field, &[0.0; 4], 4, 1, 1.0e-4);
+        assert_eq!(rejected, 1);
+        assert!(
+            field[1].is_some(),
+            "regularization connected to direct evidence survives"
+        );
+        assert!(
+            field[3].is_none(),
+            "detached regularization must be removed"
+        );
+    }
+
+    #[test]
+    fn final_field_retains_only_tested_edge_compatible_direct_anchored_coarse_depth() {
         let measured = NodeDepth {
-            depth: 1_500.0,
+            depth: 2_000.0,
+            confidence: 0.9,
+            improvement: 0.2,
+            regularized: false,
+        };
+        let coarse_node = NodeDepth {
+            depth: 2_000.0,
+            confidence: 0.8,
+            improvement: 0.1,
+            regularized: false,
+        };
+        // Index 1 is bracketed by two compatible direct measurements and may
+        // inherit the coarse mode. Index 3 is across a strong image edge;
+        // index 4 was never directly testable.
+        let mut field = vec![Some(measured), None, Some(measured), None, None];
+        let guidance = [0.0, 0.0, 0.0, 1.0, 0.0];
+        let tested = [true, true, true, true, false];
+        let coarse = [Some(coarse_node), Some(coarse_node), Some(coarse_node)];
+        let coarse_guidance = [0.0, 0.0, 0.0];
+        retain_coarse_regularized_depths(
+            &mut field,
+            &guidance,
+            &tested,
+            5,
+            1,
+            4,
+            &coarse,
+            &coarse_guidance,
+            3,
+            1,
+            8,
+            1.0e-4,
+        );
+
+        assert!(field[0].is_some_and(|node| !node.regularized && node.depth == 2_000.0));
+        assert!(field[1].is_some_and(|node| {
+            node.regularized
+                && node.depth == 2_000.0
+                && node.confidence <= FINAL_COARSE_MAX_CONFIDENCE
+        }));
+        assert!(field[2].is_some_and(|node| !node.regularized && node.depth == 2_000.0));
+        assert!(
+            field[3].is_none(),
+            "coarse depth must not be copied across an image edge"
+        );
+        assert!(field[4].is_none(), "untested nodes must remain holes");
+    }
+
+    #[test]
+    fn final_field_rejects_unanchored_coarse_regularization() {
+        let measured = NodeDepth {
+            depth: 2_000.0,
             confidence: 0.9,
             improvement: 0.2,
             regularized: false,
@@ -5308,10 +6311,10 @@ mod tests {
             regularized: false,
         };
         let mut field = vec![Some(measured), None, None, None];
-        let guidance = [0.0, 0.0, 0.0, 1.0];
-        let tested = [true, true, false, true];
+        let guidance = [0.0; 4];
+        let tested = [true; 4];
         let coarse = [Some(coarse_node), Some(coarse_node)];
-        let coarse_guidance = [0.0, 0.0];
+        let coarse_guidance = [0.0; 2];
         retain_coarse_regularized_depths(
             &mut field,
             &guidance,
@@ -5327,17 +6330,7 @@ mod tests {
             1.0e-4,
         );
 
-        assert!(field[0].is_some_and(|node| !node.regularized && node.depth == 1_500.0));
-        assert!(field[1].is_some_and(|node| {
-            node.regularized
-                && node.depth == 2_000.0
-                && node.confidence <= FINAL_COARSE_MAX_CONFIDENCE
-        }));
-        assert!(field[2].is_none(), "untested nodes must remain holes");
-        assert!(
-            field[3].is_none(),
-            "coarse depth must not be copied across an image edge"
-        );
+        assert!(field[1..].iter().all(Option::is_none));
     }
 
     #[test]

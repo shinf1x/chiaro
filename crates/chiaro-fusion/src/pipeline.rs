@@ -36,8 +36,8 @@ use crate::array_color::{
     blended_profile as blended_array_profile, module_color_for_blend, select_array_profile,
 };
 use crate::calibration::{
-    CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, ModuleFocusState,
-    ModuleState, awb_gains, image_focal_length_mm, module_states,
+    CalibrationDatabase, CameraCalibration, IntrinsicsMode, LriMessages, MirrorAngleMode,
+    ModuleFocusState, ModuleState, awb_gains, image_focal_length_mm, module_states,
 };
 use crate::crosstalk::{
     AdaptiveCrosstalkReport, CrosstalkFitSource, CrosstalkMode, fit_adaptive_crosstalk,
@@ -49,8 +49,8 @@ use crate::geometry::{CameraRefinement, ResolvedCamera};
 use crate::image::{Mosaic, Plane};
 use crate::resolution::{ResolutionReconstruction, refine_resolution_warp};
 use crate::rig::{
-    RigCameraInput, RigRefinementOptions, RigRefinementReport, evaluate_image_space_alignment,
-    refine_capture_rig,
+    RigCameraInput, RigRefinementOptions, RigRefinementReport, RigRefinementStrategy,
+    evaluate_image_space_alignment, refine_capture_rig,
 };
 use crate::synth::{
     ColorPipeline, CropWindow, GainField, ModuleColor, SynthOptions, SynthReport, SynthSource,
@@ -80,6 +80,13 @@ pub struct FusionOptions {
     /// Extra calibration files (`calibration.lri`, `zoom_calib_v0.lri`).
     pub overlays: Vec<PathBuf>,
     pub intrinsics_mode: IntrinsicsMode,
+    /// Factory Hall-code to movable-mirror angle model. The measured-pair
+    /// branch exists as an explicit A/B experiment because the semantics of
+    /// the protobuf quadratic branch metadata are not yet established.
+    pub mirror_angle_mode: MirrorAngleMode,
+    /// Bootstrap factory image alignment with the movable camera's calibrated
+    /// optical-axis point in its adjacent wider reference camera.
+    pub angle_optical_center_prior: bool,
     pub hotpixel: Option<HotpixelStage>,
     /// Modules to use; empty means every RAW module in the capture.
     pub cameras: Vec<String>,
@@ -87,8 +94,9 @@ pub struct FusionOptions {
     /// excluded completely from reconstruction.
     pub cfa_held_out: Vec<String>,
     pub align: AlignOptions,
-    /// Capture-specific bounded physical rig refinement. Debug-report runs
-    /// reserve an independently held-out subset; production uses all tracks.
+    /// Capture-specific bounded physical rig refinement. A spatially held-out
+    /// subset is always reserved for geometry admission; accepting a physical
+    /// rig without independent sub-pixel validation is unsafe for dense depth.
     pub rig_refinement: RigRefinementOptions,
     pub synth: SynthOptions,
     /// Factory-only, disabled, or capture-adaptive CFA-phase crosstalk.
@@ -120,6 +128,8 @@ impl Default for FusionOptions {
             reference: None,
             overlays: Vec::new(),
             intrinsics_mode: IntrinsicsMode::LinearHall,
+            mirror_angle_mode: MirrorAngleMode::default(),
+            angle_optical_center_prior: true,
             hotpixel: None,
             cameras: Vec::new(),
             cfa_held_out: Vec::new(),
@@ -638,6 +648,7 @@ struct LoadedHotpixelModels {
 fn alignment_inputs<'a>(
     modules: &'a [LoadedModule],
     luminance: &'a [Plane],
+    angle_optical_center_reference: Option<&str>,
 ) -> Vec<AlignInput<'a>> {
     modules
         .iter()
@@ -649,6 +660,15 @@ fn alignment_inputs<'a>(
             height: module.raw.height,
             camera: module.camera.as_ref(),
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: angle_optical_center_reference.and_then(
+                |reference| {
+                    module
+                        .camera
+                        .as_ref()?
+                        .angle_optical_center_prior(reference)
+                },
+            ),
             nominal_focal_px: module
                 .camera
                 .as_ref()
@@ -674,6 +694,8 @@ fn alignment_inputs_with_cameras<'a>(
             height: module.raw.height,
             camera: camera.as_ref(),
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: None,
             nominal_focal_px: camera
                 .as_ref()
                 .map(|camera| camera.focal_px)
@@ -689,6 +711,36 @@ fn disable_held_out_depth_evidence(inputs: &mut [AlignInput<'_>], held_out: &[St
             .any(|camera| camera.eq_ignore_ascii_case(input.name))
         {
             input.depth_evidence_enabled = false;
+            input.depth_evidence_reliability = 0.0;
+        }
+    }
+}
+
+/// Keep dense-depth camera admission neutral after sparse rig refinement.
+///
+/// Narrow-FOV cameras can have mediocre global sparse statistics because only
+/// a small/awkward part of the image overlaps while still providing excellent
+/// local stereo evidence. A capture-wide quality multiplier therefore creates
+/// the same feedback loop as a binary camera gate. Every non-held-out camera
+/// stays equally eligible; authority is earned by local evidence.
+fn apply_rig_depth_reliability(
+    inputs: &mut [AlignInput<'_>],
+    _report: &RigRefinementReport,
+    reference_index: usize,
+) {
+    // V8 deliberately has no capture-wide "good camera / bad camera" weight.
+    // Sparse rig difficulty is not evidence that every local observation from
+    // that module is weak.  Local photometric uniqueness, constellation
+    // identity, visibility and depth conditioning decide authority at the
+    // measurement level.  The only zero here is an explicit held-out/disabled
+    // evidence source, set by `disable_held_out_depth_evidence`.
+    for (index, input) in inputs.iter_mut().enumerate() {
+        if index == reference_index {
+            input.depth_evidence_reliability = 1.0;
+        } else if input.depth_evidence_enabled {
+            input.depth_evidence_reliability = 1.0;
+        } else {
+            input.depth_evidence_reliability = 0.0;
         }
     }
 }
@@ -718,17 +770,23 @@ fn align_all_modules(
                 scope.spawn(move || {
                     (first_index..last_index)
                         .map(|index| {
-                            (
-                                index,
-                                align_module_seeded_cached(
-                                    reference,
-                                    &inputs[index],
-                                    options,
-                                    None,
-                                    &pyramids[reference_index],
-                                    &pyramids[index],
-                                ),
-                            )
+                            let target = &inputs[index];
+                            let mut aligned = align_module_seeded_cached(
+                                reference,
+                                target,
+                                options,
+                                None,
+                                &pyramids[reference_index],
+                                &pyramids[index],
+                            );
+                            if target.angle_optical_center_prior_reference_px.is_some()
+                                && let Ok(alignment) = &mut aligned
+                            {
+                                alignment.report.angle_optical_center_prior_selected = Some(true);
+                                alignment.report.angle_optical_center_prior_quality =
+                                    Some(alignment_hypothesis_quality(alignment));
+                            }
+                            (index, aligned)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -747,6 +805,11 @@ fn align_all_modules(
             .map(|result| result.expect("alignment worker omitted a module"))
             .collect()
     })
+}
+
+fn alignment_hypothesis_quality(alignment: &ModuleAlignment) -> f32 {
+    let support = alignment.report.inliers as f32 * alignment.report.inlier_ratio.max(0.01);
+    support / alignment.report.residual_p90_px.max(1.0)
 }
 
 fn alignment_debug_warps(alignments: &[ModuleAlignment]) -> Vec<Option<Warp>> {
@@ -798,8 +861,19 @@ fn candidate_debug_cameras(
                     orientation_offset_degrees: (orientation != [0.0; 3]).then_some(orientation),
                     center_offset_world: (correction.center_offset_world != [0.0; 3])
                         .then_some(correction.center_offset_world),
+                    focus_pupil_scale: (correction.focus_pupil_scale != 0.0)
+                        .then_some(correction.focus_pupil_scale),
                     sensor_offset_px: (correction.sensor_offset_px != [0.0; 2])
                         .then_some(correction.sensor_offset_px),
+                    focal_scale_delta: (correction.focal_scale_delta != 0.0)
+                        .then_some(correction.focal_scale_delta),
+                    focal_aspect_delta: (correction.focal_aspect_delta != 0.0)
+                        .then_some(correction.focal_aspect_delta),
+                    distortion_center_offset_px: (correction.distortion_center_offset_px
+                        != [0.0; 2])
+                        .then_some(correction.distortion_center_offset_px),
+                    distortion_delta: (correction.distortion_delta != [0.0; 4])
+                        .then_some(correction.distortion_delta),
                 }
             });
             ResolvedCamera::new(
@@ -1311,12 +1385,12 @@ fn write_rig_held_out_observations(debug_dir: &Path, report: &RigRefinementRepor
         .with_context(|| format!("write held-out observation map in {}", debug_dir.display()))?;
 
     let mut csv = String::from(
-        "camera,x,y,factory_dx,factory_dy,candidate_dx,candidate_dy,factory_sensor_px,candidate_sensor_px,factory_reference_px,candidate_reference_px,factory_angular_deg,candidate_angular_deg,factory_p95_tail,candidate_p95_tail\n",
+        "camera,x,y,factory_dx,factory_dy,candidate_dx,candidate_dy,factory_sensor_px,candidate_sensor_px,factory_reference_px,candidate_reference_px,factory_angular_deg,candidate_angular_deg,factory_inverse_depth,candidate_inverse_depth,factory_p95_tail,candidate_p95_tail\n",
     );
     for observation in observations {
         let _ = writeln!(
             csv,
-            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.9},{:.9},{},{}",
+            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.9},{:.9},{:.12},{:.12},{},{}",
             observation.camera,
             observation.pixel[0],
             observation.pixel[1],
@@ -1330,6 +1404,8 @@ fn write_rig_held_out_observations(debug_dir: &Path, report: &RigRefinementRepor
             observation.candidate_reference_pixels,
             observation.factory_angular_degrees,
             observation.candidate_angular_degrees,
+            observation.factory_inverse_depth,
+            observation.candidate_inverse_depth,
             observation.factory_p95_tail,
             observation.candidate_p95_tail,
         );
@@ -1340,6 +1416,265 @@ fn write_rig_held_out_observations(debug_dir: &Path, report: &RigRefinementRepor
             debug_dir.display()
         )
     })
+}
+
+fn write_anchor_graph_debug(debug_dir: &Path, report: &RigRefinementReport) -> Result<()> {
+    let Some(graph) = report.anchor_graph.as_ref() else {
+        return Ok(());
+    };
+    if graph.graph_cameras.is_empty() {
+        return Ok(());
+    }
+
+    let mut cameras = graph.graph_cameras.iter().collect::<Vec<_>>();
+    cameras.sort_by(|first, second| first.camera.cmp(&second.camera));
+    let width = 1000.0f64;
+    let height = 900.0f64;
+    let centre = [500.0f64, 435.0f64];
+    let radius = 320.0f64;
+    let mut positions = HashMap::<String, [f64; 2]>::new();
+    for (index, camera) in cameras.iter().enumerate() {
+        let angle = -std::f64::consts::FRAC_PI_2
+            + 2.0 * std::f64::consts::PI * index as f64 / cameras.len().max(1) as f64;
+        positions.insert(
+            camera.camera.clone(),
+            [
+                centre[0] + radius * angle.cos(),
+                centre[1] + radius * angle.sin(),
+            ],
+        );
+    }
+
+    let mut svg = String::new();
+    let _ = writeln!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#,
+    );
+    svg.push_str(
+        r##"<rect width="100%" height="100%" fill="#11151b"/><style>text{font-family:monospace;fill:#e8edf2}.excluded{stroke:#303943;stroke-width:1;stroke-dasharray:2 7;opacity:.20}.candidate{stroke:#46515c;stroke-width:1.2;stroke-dasharray:5 5;opacity:.45}.observedInactive{stroke:#b89cff;stroke-width:1.8;stroke-dasharray:2 4;opacity:.75}.failed{stroke:#ff6b6b;stroke-width:1.8;stroke-dasharray:3 5;opacity:.75}.active0{stroke:#7bd88f}.activeN{stroke:#5cc8ff}.unsupported{stroke:#ff6b6b;stroke-width:2.4;stroke-dasharray:6 4}.provisional{stroke:#ffb86c;stroke-width:2.2;stroke-dasharray:8 3}.seeded{stroke:#c8ff70}.nodeB{fill:#23384b;stroke:#80c7ff}.nodeC{fill:#452d46;stroke:#f0a6e8}.weakNode{stroke:#ff6b6b;stroke-width:3}.label{font-size:13px}.small{font-size:10px;fill:#b9c4cf}</style>"##,
+    );
+    let _ = writeln!(
+        svg,
+        r#"<text x="24" y="28" font-size="18">Anchor camera graph — overlap ≥ {:.0}% · active {}/{} · target degree {}</text>"#,
+        100.0 * graph.factory_overlap_threshold,
+        graph.final_active_edges,
+        graph.candidate_edges,
+        graph.target_min_camera_degree,
+    );
+    svg.push_str(
+        r#"<text x="24" y="50" class="small">faint dotted=below overlap gate; gray dashed=candidate; purple dotted=verified direct evidence not currently active for propagation; red short-dash=direct seed retired; green=bootstrap; cyan=later; lime=local-field validated; amber dash=epipolar+photometric direct evidence; red long-dash=active but unsupported. Node v counts all directly verified evidence edges; local-field LOO is a stronger propagation diagnostic, not the topology gate.</text>"#,
+    );
+
+    for edge in graph.graph_edges.iter().filter(|edge| !edge.active) {
+        let (Some(first), Some(second)) = (
+            positions.get(&edge.first_camera),
+            positions.get(&edge.second_camera),
+        ) else {
+            continue;
+        };
+        let class = if edge.direct_support_tracks > 0 {
+            "observedInactive"
+        } else if edge.direct_seed_attempted {
+            "failed"
+        } else if edge.candidate {
+            "candidate"
+        } else {
+            "excluded"
+        };
+        let status = if edge.direct_support_tracks > 0 {
+            "verified direct evidence (inactive)"
+        } else if edge.direct_seed_attempted {
+            "direct seed retired"
+        } else if edge.candidate {
+            "candidate"
+        } else {
+            "below overlap gate"
+        };
+        let _ = writeln!(
+            svg,
+            r#"<g><title>{}-{} {}: overlap {:.1}% baseline {:.2} shared_tracks {} direct_tracks {} anchors {} LOO {}</title><line class="{}" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}"/></g>"#,
+            edge.first_camera,
+            edge.second_camera,
+            status,
+            100.0 * edge.factory_overlap,
+            edge.factory_baseline,
+            edge.shared_tracks,
+            edge.direct_support_tracks,
+            edge.validated_anchors,
+            edge.loo_rms_px
+                .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.2}px")),
+            class,
+            first[0],
+            first[1],
+            second[0],
+            second[1],
+        );
+    }
+    for edge in graph.graph_edges.iter().filter(|edge| edge.active) {
+        let (Some(first), Some(second)) = (
+            positions.get(&edge.first_camera),
+            positions.get(&edge.second_camera),
+        ) else {
+            continue;
+        };
+        let class = if edge.direct_support_tracks == 0 {
+            "unsupported"
+        } else if edge.validated_anchors == 0 {
+            "provisional"
+        } else if edge.direct_seed_matches > 0 {
+            "seeded"
+        } else if edge.activated_round.unwrap_or(0) == 0 {
+            "active0"
+        } else {
+            "activeN"
+        };
+        let stroke_width = 1.8 + (edge.direct_support_tracks.max(1) as f64).ln().min(5.0) * 0.55;
+        let loo = edge
+            .loo_rms_px
+            .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.2}px"));
+        let round = edge
+            .activated_round
+            .map_or_else(|| "-".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            svg,
+            r#"<g><title>{}-{} active r{}: overlap {:.1}% shared_tracks {} direct_tracks {} seed_attempts={} seed_matches={} anchors {} LOO {}</title><line class="{}" style="stroke-width:{:.2}" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}"/></g>"#,
+            edge.first_camera,
+            edge.second_camera,
+            round,
+            100.0 * edge.factory_overlap,
+            edge.shared_tracks,
+            edge.direct_support_tracks,
+            edge.direct_seed_attempts,
+            edge.direct_seed_matches,
+            edge.validated_anchors,
+            loo,
+            class,
+            stroke_width,
+            first[0],
+            first[1],
+            second[0],
+            second[1],
+        );
+    }
+
+    for camera in &cameras {
+        let Some(position) = positions.get(&camera.camera) else {
+            continue;
+        };
+        let base_class = if camera.camera.starts_with('B') {
+            "nodeB"
+        } else {
+            "nodeC"
+        };
+        let class = if camera.active_degree < graph.target_min_camera_degree
+            || camera.verified_degree < 2
+            || camera.triangle_edges == 0
+        {
+            format!("{base_class} weakNode")
+        } else {
+            base_class.to_owned()
+        };
+        let _ = writeln!(
+            svg,
+            r#"<g><title>{}: degree {}, verified_degree {}, triangle_edges {}, promoted {}, direct {}, cycle_tracks {}, coverage {:.0}%</title><circle class="{}" cx="{:.2}" cy="{:.2}" r="42" stroke-width="2"/><text class="label" x="{:.2}" y="{:.2}" text-anchor="middle" font-size="18">{}</text><text class="small" x="{:.2}" y="{:.2}" text-anchor="middle">d={} v={} tri={}</text><text class="small" x="{:.2}" y="{:.2}" text-anchor="middle">dir={} cyc={} cov={:.0}%</text></g>"#,
+            camera.camera,
+            camera.active_degree,
+            camera.verified_degree,
+            camera.triangle_edges,
+            camera.promoted_observations,
+            camera.direct_support_tracks,
+            camera.cycle_supported_tracks,
+            100.0 * camera.spatial_coverage_fraction,
+            class,
+            position[0],
+            position[1],
+            position[0],
+            position[1] - 7.0,
+            camera.camera,
+            position[0],
+            position[1] + 10.0,
+            camera.active_degree,
+            camera.verified_degree,
+            camera.triangle_edges,
+            position[0],
+            position[1] + 24.0,
+            camera.direct_support_tracks,
+            camera.cycle_supported_tracks,
+            100.0 * camera.spatial_coverage_fraction,
+        );
+    }
+    svg.push_str("</svg>");
+    fs::write(debug_dir.join("rig-anchor-camera-graph.svg"), svg)
+        .with_context(|| format!("write anchor camera graph in {}", debug_dir.display()))?;
+
+    let mut csv = String::from(
+        "first_camera,second_camera,factory_overlap,factory_baseline,candidate,active,activated_round,shared_tracks,direct_support_tracks,direct_seed_attempted,direct_seed_attempts,direct_seed_matches,validated_anchors,loo_rms_px\n",
+    );
+    for edge in &graph.graph_edges {
+        let _ = writeln!(
+            csv,
+            "{},{},{:.8},{:.8},{},{},{},{},{},{},{},{},{},{}",
+            edge.first_camera,
+            edge.second_camera,
+            edge.factory_overlap,
+            edge.factory_baseline,
+            edge.candidate,
+            edge.active,
+            edge.activated_round
+                .map_or_else(String::new, |value| value.to_string()),
+            edge.shared_tracks,
+            edge.direct_support_tracks,
+            edge.direct_seed_attempted,
+            edge.direct_seed_attempts,
+            edge.direct_seed_matches,
+            edge.validated_anchors,
+            edge.loo_rms_px
+                .map_or_else(String::new, |value| format!("{value:.8}")),
+        );
+    }
+    fs::write(debug_dir.join("rig-anchor-camera-graph.csv"), csv)
+        .with_context(|| format!("write anchor camera graph table in {}", debug_dir.display()))?;
+
+    let mut dot = String::from(
+        "graph AnchorCameraGraph {\n  graph [overlap=false, splines=true];\n  node [shape=circle];\n",
+    );
+    for camera in &cameras {
+        let _ = writeln!(
+            dot,
+            "  \"{}\" [label=\"{}\\nd={} v={} tri={} cov={:.0}%\"];",
+            camera.camera,
+            camera.camera,
+            camera.active_degree,
+            camera.verified_degree,
+            camera.triangle_edges,
+            100.0 * camera.spatial_coverage_fraction,
+        );
+    }
+    for edge in &graph.graph_edges {
+        let style = if edge.active {
+            "solid"
+        } else if edge.candidate {
+            "dashed"
+        } else {
+            "dotted"
+        };
+        let _ = writeln!(
+            dot,
+            "  \"{}\" -- \"{}\" [style={}, label=\"ov={:.0}% n={} seed={} r={}\"];",
+            edge.first_camera,
+            edge.second_camera,
+            style,
+            100.0 * edge.factory_overlap,
+            edge.direct_support_tracks,
+            edge.direct_seed_matches,
+            edge.activated_round
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        );
+    }
+    dot.push_str("}\n");
+    fs::write(debug_dir.join("rig-anchor-camera-graph.dot"), dot)
+        .with_context(|| format!("write anchor camera graph DOT in {}", debug_dir.display()))?;
+    Ok(())
 }
 
 fn write_pipeline_trace(
@@ -1356,9 +1691,90 @@ fn write_pipeline_trace(
     let _ = writeln!(trace, "============================");
     let _ = writeln!(trace, "Reference camera: {reference}");
     let _ = writeln!(trace, "Dense geometry mode: {geometry_mode:?}");
-    let _ = writeln!(trace, "Rig candidate accepted: {}", rig.accepted);
+    let _ = writeln!(trace, "Rig candidate selected: {}", rig.accepted);
+    let _ = writeln!(trace, "Rig validation passed: {}", rig.validation_passed);
+    if let Some(warning) = &rig.validation_warning {
+        let _ = writeln!(trace, "Rig validation warning: {warning}");
+    }
     if let Some(reason) = &rig.fallback_reason {
         let _ = writeln!(trace, "Rig fallback reason: {reason}");
+    }
+    if !rig.factory_model.is_empty() {
+        trace.push_str("\nFactory optical-model audit\n---------------------------\n");
+        let _ = writeln!(
+            trace,
+            "Selected mirror-angle model: {:?}",
+            rig.mirror_angle_mode
+        );
+        trace.push_str(
+            "camera lens-H  calibrated-H  extra-H       fx       fy       cx       cy  CRA-sensor CRA-implied exit-pupil\n",
+        );
+        let value = |number: Option<f64>, width: usize, precision: usize| {
+            number.map_or_else(
+                || format!("{:>width$}", "-"),
+                |number| format!("{number:>width$.precision$}"),
+            )
+        };
+        for model in &rig.factory_model {
+            let hall_range = match (
+                model.calibrated_lens_hall_min,
+                model.calibrated_lens_hall_max,
+            ) {
+                (Some(minimum), Some(maximum)) => format!("{minimum:.0}..{maximum:.0}"),
+                _ => "-".to_owned(),
+            };
+            let (fx, fy, cx, cy) = model.resolved_k.map_or((None, None, None, None), |k| {
+                (Some(k[0][0]), Some(k[1][1]), Some(k[0][2]), Some(k[1][2]))
+            });
+            let _ = writeln!(
+                trace,
+                "{:<6} {:>6.0}  {:>12} {:+8.0} {} {} {} {} {} {} {}",
+                model.camera,
+                model.capture_lens_hall,
+                hall_range,
+                model.lens_hall_extrapolation_counts,
+                value(fx, 8, 1),
+                value(fy, 8, 1),
+                value(cx, 8, 2),
+                value(cy, 8, 2),
+                value(model.cra_sensor_distance, 10, 3),
+                value(model.cra_implied_capture_sensor_distance, 11, 3),
+                value(model.cra_exit_pupil_distance, 10, 3),
+            );
+        }
+        trace.push_str(
+            "camera mirror-H AF-H    current-q    inverse-q    pair-linear   selected   inv-delta inv-px pair-delta pair-px r+L/r+R inflection\n",
+        );
+        for model in rig
+            .factory_model
+            .iter()
+            .filter(|model| model.selected_mirror_angle_degrees.is_some())
+        {
+            let branches = match (
+                model.quadratic_use_rplus_left,
+                model.quadratic_use_rplus_right,
+            ) {
+                (Some(left), Some(right)) => format!("{left}/{right}"),
+                _ => "-".to_owned(),
+            };
+            let _ = writeln!(
+                trace,
+                "{:<6} {:>8.0} {} {} {} {} {} {} {} {} {}  {:>7} {}",
+                model.camera,
+                model.capture_mirror_hall,
+                value(model.af_mirror_hall, 6, 0),
+                value(model.quadratic_mirror_angle_degrees, 11, 6),
+                value(model.inverse_quadratic_mirror_angle_degrees, 11, 6),
+                value(model.pair_linear_mirror_angle_degrees, 13, 6),
+                value(model.selected_mirror_angle_degrees, 10, 6),
+                value(model.inverse_minus_current_degrees, 9, 6),
+                value(model.approximate_inverse_difference_px, 6, 2),
+                value(model.pair_minus_quadratic_degrees, 10, 6),
+                value(model.approximate_mirror_difference_px, 10, 2),
+                branches,
+                value(model.quadratic_inflection_value, 10, 5),
+            );
+        }
     }
     if rig.validation_evaluated {
         let _ = writeln!(
@@ -1370,14 +1786,169 @@ fn write_pipeline_trace(
         );
         let _ = writeln!(
             trace,
-            "Rig tracks: {} fit, {} held out; physical matcher used: {}",
-            rig.fit_tracks, rig.validation_tracks, rig.physical_match_used,
+            "Rig target-camera held-out RMS: {:.3} -> {:.3} px ({:+.2}%); p90 {:.3}, p95 {:.3} px [production acceptance metric]",
+            rig.held_out_target_rms_before,
+            rig.held_out_target_rms_after,
+            rig.held_out_target_relative_improvement * 100.0,
+            rig.held_out_target_residuals_after.sensor_pixels.p90,
+            rig.held_out_target_residuals_after.sensor_pixels.p95,
+        );
+        let _ = writeln!(
+            trace,
+            "Rig held-out distribution after: median {:.3}, p90 {:.3}, p95 {:.3}, p99 {:.3} px; p99-trimmed RMS {:.3} px; >50 px tail {} samples",
+            rig.held_out_residuals_after.sensor_pixels.median,
+            rig.held_out_residuals_after.sensor_pixels.p90,
+            rig.held_out_residuals_after.sensor_pixels.p95,
+            rig.held_out_residuals_after.sensor_pixels.p99,
+            rig.held_out_p99_trimmed_rms_after,
+            rig.held_out_over_50px_after,
+        );
+        let _ = writeln!(
+            trace,
+            "Rig tracks: {} fit, {} held out ({} ambiguous hold-out tracks / {} observations excluded); physical matcher used: {}",
+            rig.fit_tracks,
+            rig.validation_tracks,
+            rig.validation_excluded_ambiguous_tracks,
+            rig.validation_excluded_ambiguous_observations,
+            rig.physical_match_used,
         );
         let _ = writeln!(
             trace,
             "Rig optimization: {} coordinate sweeps, {} robust membership passes",
             rig.optimizer_iterations, rig.membership_iterations,
         );
+        if rig.strategy == RigRefinementStrategy::LatentGraph {
+            let _ = writeln!(
+                trace,
+                "Latent validation: camera-balanced spatial hold-out; each reported observation is leave-one-camera-out reprojection; {} image-only constellation labels rejected",
+                rig.latent_match.as_ref().map_or(0, |latent| latent
+                    .validation_constellation_rejected_observations),
+            );
+        }
+        if let Some(latent) = &rig.latent_match {
+            let _ = writeln!(
+                trace,
+                "Latent matching: {} ambiguous observations / {} candidates; {} assignment rounds, {} switches ({} geometry-supported, {} constellation-supported, {} cycle-supported, {} cycle-rejected, {} collision-rejected)",
+                latent.ambiguous_observations,
+                latent.total_candidates,
+                latent.assignment_iterations,
+                latent.assignment_switches,
+                latent.geometry_supported_switches,
+                latent.constellation_supported_switches,
+                latent.cycle_supported_switches,
+                latent.cycle_rejected_switches,
+                latent.collision_rejected_switches,
+            );
+            let _ = writeln!(
+                trace,
+                "Latent cycle graph: {} / {} active/candidate direct edges; {} fit-only validated pair fields from {} bootstrap cycle-supported tracks / {} observations; {} held-out pair anchors excluded; {} pair predictions evaluated",
+                latent.cycle_graph_active_edges,
+                latent.cycle_graph_candidate_edges,
+                latent.cycle_graph_pairs,
+                latent.cycle_graph_anchor_tracks,
+                latent.cycle_graph_anchor_observations,
+                latent.cycle_graph_validation_anchors_excluded,
+                latent.cycle_predictions_evaluated,
+            );
+            let _ = writeln!(
+                trace,
+                "Latent reversible membership: {} demotions, {} ordinary reactivations, {} support-floor reactivations, {} demotions floor-protected; pairwise whole-track {} demotions / {} reactivations",
+                latent.membership_soft_outlier_events,
+                latent.membership_reactivated_events,
+                latent.membership_floor_reactivated_events,
+                latent.membership_floor_protected_events,
+                latent.pairwise_track_demotions,
+                latent.pairwise_track_reactivations,
+            );
+            if latent.camera_support.iter().any(|support| {
+                support.detector_candidates > 0
+                    || support.seed_pairwise_matches > 0
+                    || support.initial_fit_observations > 0
+            }) {
+                let _ = writeln!(trace, "Latent per-camera feature/support");
+                let _ = writeln!(
+                    trace,
+                    "camera  detected  matched  epipolar  pool     fit0 pair0  floor  fitN pairN  demote react floor+ pair- pair+"
+                );
+                for support in &latent.camera_support {
+                    if support.detector_candidates == 0
+                        && support.seed_pairwise_matches == 0
+                        && support.initial_fit_observations == 0
+                    {
+                        continue;
+                    }
+                    let _ = writeln!(
+                        trace,
+                        "{:<6} {:>8}  {:>7}  {:>8}  {:>7}  {:>5} {:>5}  {:>5}  {:>4} {:>5}  {:>6} {:>5} {:>6} {:>5} {:>5}",
+                        support.camera,
+                        support.detector_candidates,
+                        support.image_matches,
+                        support.seed_pairwise_matches,
+                        support.candidate_pool_landmarks,
+                        support.initial_fit_observations,
+                        support.initial_pairwise_fit_observations,
+                        support.membership_floor,
+                        support.final_fit_observations,
+                        support.final_pairwise_fit_observations,
+                        support.soft_outlier_events,
+                        support.reactivated_events,
+                        support.floor_reactivated_events,
+                        support.pairwise_track_demotions,
+                        support.pairwise_track_reactivations,
+                    );
+                }
+            }
+        }
+        if !rig.per_camera.is_empty() {
+            let _ = writeln!(trace, "Rig held-out acceptance by camera");
+            let _ = writeln!(trace, "camera  samples  RMS     median  p90");
+            for camera in &rig.per_camera {
+                if camera.validation_samples == 0 {
+                    continue;
+                }
+                let _ = writeln!(
+                    trace,
+                    "{:<6} {:>7}  {:>6.3}  {:>6.3}  {:>6.3}",
+                    camera.camera,
+                    camera.validation_samples,
+                    camera.validation_rms_after,
+                    camera.validation_median_after,
+                    camera.validation_p90_after,
+                );
+            }
+        }
+        if !rig.held_out_observations.is_empty() {
+            let _ = writeln!(trace, "Rig held-out per-camera tail");
+            let _ = writeln!(trace, "camera  samples  median  p90    max      >50px");
+            let mut by_camera = HashMap::<&str, Vec<f64>>::new();
+            for observation in &rig.held_out_observations {
+                by_camera
+                    .entry(observation.camera.as_str())
+                    .or_default()
+                    .push(observation.candidate_sensor_pixels);
+            }
+            let mut entries = by_camera.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|first, second| first.0.cmp(second.0));
+            for (camera, mut values) in entries {
+                values.retain(|value| value.is_finite());
+                values.sort_by(f64::total_cmp);
+                if values.is_empty() {
+                    continue;
+                }
+                let at =
+                    |fraction: f64| values[((values.len() - 1) as f64 * fraction).round() as usize];
+                let over_50 = values.iter().filter(|&&value| value > 50.0).count();
+                let _ = writeln!(
+                    trace,
+                    "{camera:<6} {:>7}  {:>6.3}  {:>6.3}  {:>8.3}  {:>5}",
+                    values.len(),
+                    at(0.50),
+                    at(0.90),
+                    values.last().copied().unwrap_or(f64::NAN),
+                    over_50,
+                );
+            }
+        }
         let _ = writeln!(
             trace,
             "Rig bootstrap: factory-first, then stage-02 perpendicular epipolar proposal +/-{:.1} target px, followed by <= {:.1} reference px proposal-normalized physical consistency; {} observations/{} tracks rejected before optimization",
@@ -1483,15 +2054,83 @@ fn write_pipeline_trace(
     if let Some(warning) = &rig.image_space_warning {
         let _ = writeln!(trace, "Downstream residual warning: {warning}");
     }
+    if let Some(graph) = &rig.anchor_graph {
+        trace.push_str("\nAnchor camera graph\n-------------------\n");
+        let _ = writeln!(
+            trace,
+            "Factory overlap gate: {:.0}% of smaller FOV; {} candidates; active {} -> {}; target minimum degree {}",
+            100.0 * graph.factory_overlap_threshold,
+            graph.candidate_edges,
+            graph.initial_active_edges,
+            graph.final_active_edges,
+            graph.target_min_camera_degree,
+        );
+        let _ = writeln!(
+            trace,
+            "Bootstrap direct seeding: {} edges searched, {} mutually verified seeds; final {} tracks / {} cycle-supported 3+ view tracks",
+            graph.bootstrap_direct_seed_edges,
+            graph.bootstrap_direct_seed_matches,
+            graph.final_tracks,
+            graph.final_cycle_supported_three_plus_tracks,
+        );
+        let _ = writeln!(
+            trace,
+            "Landmark membership: {} soft observations retained for possible recovery; {} observations hard-rejected after repeated LOO disagreement; {} mixed tracks split into alternate identities",
+            graph.final_soft_outlier_observations,
+            graph.final_hard_rejected_observations,
+            graph.split_tracks,
+        );
+        trace.push_str(
+            "camera  degree  verified  tri-edges  direct-tracks  cycle-tracks  promoted  spatial-cover\n",
+        );
+        for camera in &graph.graph_cameras {
+            let _ = writeln!(
+                trace,
+                "{:<7} {:>6} {:>9} {:>10} {:>14} {:>13} {:>9} {:>12.1}%",
+                camera.camera,
+                camera.active_degree,
+                camera.verified_degree,
+                camera.triangle_edges,
+                camera.direct_support_tracks,
+                camera.cycle_supported_tracks,
+                camera.promoted_observations,
+                100.0 * camera.spatial_coverage_fraction,
+            );
+        }
+        for round in &graph.rounds {
+            let _ = writeln!(
+                trace,
+                "round {}: active {} -> {} (+{}); direct-seeded {} edges/{} matches; geometry-reseeded {} edges/{} matches; +{} observations, +{} tracks, strong 3+ {} -> {}; skeleton {}, free-params {}, soft/reactivated/hard/split {}/{}/{}/{}",
+                round.round,
+                round.active_edges_before,
+                round.active_edges_after,
+                round.activated_edges,
+                round.directly_seeded_edges,
+                round.directly_seeded_matches,
+                round.geometry_reseeded_edges,
+                round.geometry_reseeded_matches,
+                round.new_observations,
+                round.new_tracks,
+                round.strong_three_plus_before,
+                round.strong_three_plus_after,
+                round.skeleton_landmarks,
+                round.geometry_free_parameters,
+                round.soft_outlier_observations,
+                round.reactivated_observations,
+                round.hard_rejected_observations,
+                round.split_tracks,
+            );
+        }
+    }
     if !rig.corrections.is_empty() {
         trace.push_str("\nRig candidate corrections\n-------------------------\n");
         trace.push_str(
-            "camera  optimized  rotation(x,y,z) deg          centre(x,y,z)       sensor(x,y) px  mirror deg  bound\n",
+            "camera  optimized  rotation(x,y,z) deg          centre(x,y,z)       pupil-a  sensor(x,y) px  focal(s,a)%  dist-centre(x,y)      dk1       dk2       dp1       dp2   mirror deg  bound\n",
         );
         for correction in &rig.corrections {
             let _ = writeln!(
                 trace,
-                "{:<7} {:<9} ({:+7.4},{:+7.4},{:+7.4})  ({:+6.3},{:+6.3},{:+6.3})  ({:+6.2},{:+6.2})   {:+7.4}    {}",
+                "{:<7} {:<9} ({:+7.4},{:+7.4},{:+7.4})  ({:+6.3},{:+6.3},{:+6.3}) {:+8.4}  ({:+6.2},{:+6.2})  ({:+6.3},{:+6.3})  ({:+6.2},{:+6.2})  {:+8.5} {:+8.5} {:+8.5} {:+8.5}   {:+7.4}    {}",
                 correction.camera,
                 correction.optimized,
                 correction.orientation_offset_degrees[0],
@@ -1500,12 +2139,45 @@ fn write_pipeline_trace(
                 correction.center_offset_world[0],
                 correction.center_offset_world[1],
                 correction.center_offset_world[2],
+                correction.focus_pupil_scale,
                 correction.sensor_offset_px[0],
                 correction.sensor_offset_px[1],
+                correction.focal_scale_delta * 100.0,
+                correction.focal_aspect_delta * 100.0,
+                correction.distortion_center_offset_px[0],
+                correction.distortion_center_offset_px[1],
+                correction.distortion_delta[0],
+                correction.distortion_delta[1],
+                correction.distortion_delta[2],
+                correction.distortion_delta[3],
                 correction.mirror_angle_offset_degrees,
                 correction.reached_bound,
             );
         }
+    }
+    if !rig.residual_correlations.is_empty() {
+        trace.push_str("\nRig held-out residual correlations (candidate)\n----------------------------------------------\n");
+        trace.push_str(
+            "camera  samples depthN   dx~x   dx~y   dy~x   dy~y  dx~r2  dy~r2  dx~1/Z dy~1/Z\n",
+        );
+        for correlation in &rig.residual_correlations {
+            let _ = writeln!(
+                trace,
+                "{:<6} {:>7} {:>6}  {:+6.3} {:+6.3} {:+6.3} {:+6.3} {:+6.3} {:+6.3}  {:+6.3} {:+6.3}",
+                correlation.camera,
+                correlation.samples,
+                correlation.inverse_depth_samples,
+                correlation.dx_vs_x,
+                correlation.dx_vs_y,
+                correlation.dy_vs_x,
+                correlation.dy_vs_y,
+                correlation.dx_vs_r2,
+                correlation.dy_vs_r2,
+                correlation.dx_vs_inverse_depth,
+                correlation.dy_vs_inverse_depth,
+            );
+        }
+        trace.push_str("Large image-position/r2 correlations suggest missing intrinsics/distortion; large inverse-depth correlations suggest a remaining baseline/centre error. These are held-out diagnostics only.\n");
     }
     trace.push_str("\nHow to read the stage folders\n-----------------------------\n");
     trace.push_str(
@@ -1569,12 +2241,13 @@ fn write_pipeline_trace(
         };
         let _ = writeln!(
             trace,
-            "\nShared reference-space depth\n----------------------------\n{} / {} tested nodes directly measured ({:.2}%); {} regularized ({:.2}% combined finite coverage).\nA measured along-epipolar seed was available at {} tested nodes; it proposes search hypotheses but is not depth evidence.\nDense acceptance funnel: {} direct finite selections -> {} neighbour-consistent -> {} component-consistent; {} nodes directly support the stage-2 output fallback.\nThis one field is projected into every camera, so it is intentionally not a per-camera percentage.",
+            "\nShared reference-space depth\n----------------------------\n{} / {} tested nodes directly measured ({:.2}%); {} regularized ({:.2}% combined finite coverage); {} unanchored regularized nodes rejected.\nA measured along-epipolar seed was available at {} tested nodes; it proposes search hypotheses but is not depth evidence.\nDense acceptance funnel: {} direct finite selections -> {} neighbour-consistent -> {} component-consistent; {} nodes directly support the stage-2 output fallback.\nThis one field is projected into every camera, so it is intentionally not a per-camera percentage.",
             depth.measured_nodes,
             depth.tested_nodes,
             measured_fraction * 100.0,
             depth.regularized_nodes,
             depth.reconstructed_fraction * 100.0,
+            depth.rejected_unanchored_regularized_nodes,
             depth.epipolar_seeded_nodes,
             depth.direct_selected_nodes,
             depth.neighbour_consistent_nodes,
@@ -1646,7 +2319,7 @@ fn write_pipeline_trace(
     trace.push_str("\nPer-camera geometry\n-------------------\n");
     let _ = writeln!(
         trace,
-        "camera  legacy  physical  overlap  warp-defined  direct-support  correction(x,y) px  view-refined  far-fallback  unknown  occluded"
+        "camera  legacy  physical  overlap  warp-defined  direct-support  rig-w  correction(x,y) px  view-refined  far-fallback  unknown  occluded  out-sensor"
     );
     for alignment in alignments {
         let depth = alignment.report.depth.as_ref();
@@ -1658,7 +2331,7 @@ fn write_pipeline_trace(
             .unwrap_or_else(|| "    n/a".to_owned());
         let _ = writeln!(
             trace,
-            "{:<7} {:<7} {:<8} {:>6.2}%    {}        {}       ({:>7.2},{:>7.2})  {:>7.2}%      {:>7}  {:>7}  {:>7}",
+            "{:<7} {:<7} {:<8} {:>6.2}%    {}        {}  {:>5.2}  ({:>7.2},{:>7.2})  {:>7.2}%      {:>7}  {:>7}  {:>7}  {:>10}",
             alignment.name,
             if alignment.report.accepted {
                 "accept"
@@ -1673,12 +2346,14 @@ fn write_pipeline_trace(
             alignment.report.coverage * 100.0,
             defined,
             direct,
+            depth.map_or(1.0, |depth| depth.evidence_reliability),
             alignment.report.correction_median_px[0],
             alignment.report.correction_median_px[1],
             depth.map_or(0.0, |depth| depth.refined_fraction * 100.0),
             depth.map_or(0, |depth| depth.fallback_nodes),
             depth.map_or(0, |depth| depth.unknown_nodes),
             depth.map_or(0, |depth| depth.occluded_nodes),
+            depth.map_or(0, |depth| depth.rejected_out_of_sensor_nodes),
         );
     }
 
@@ -1840,6 +2515,11 @@ body{margin:0;padding:24px;background:#11151b;color:#e8edf2;font:15px system-ui,
         html.push_str("</div></section>");
     }
     html.push_str("<h2>Whole-run diagnostics</h2><div class=\"overview\">");
+    if rig.anchor_graph.is_some() && debug_dir.join("rig-anchor-camera-graph.svg").is_file() {
+        html.push_str(
+            "<div><h3>Anchor camera graph</h3><object data=\"rig-anchor-camera-graph.svg\" type=\"image/svg+xml\"></object><p><a href=\"rig-anchor-camera-graph.svg\">Open full-size graph</a> · <a href=\"rig-anchor-camera-graph.csv\">CSV</a> · <a href=\"rig-anchor-camera-graph.dot\">Graphviz DOT</a></p></div>",
+        );
+    }
     if !rig.held_out_observations.is_empty() {
         html.push_str(
             "<div><h3>Individual held-out observations</h3><object data=\"rig-held-out-observations.svg\" type=\"image/svg+xml\"></object><p><a href=\"rig-held-out-observations.svg\">Open full-size map</a> · <a href=\"rig-held-out-observations.csv\">Open exact values (CSV)</a></p></div>",
@@ -2321,7 +3001,12 @@ pub fn fuse(
                 .with_context(|| format!("parse {}", path.display()))
         })
         .collect::<Result<Vec<_>>>()?;
-    let calibration = CalibrationDatabase::from_capture_and_overlays(&messages, &overlays);
+    let mut calibration = CalibrationDatabase::from_capture_and_overlays(&messages, &overlays);
+    for camera in calibration.cameras.values_mut() {
+        if let Some(mirror) = camera.mirror.as_mut() {
+            mirror.actuator.angle_mode = options.mirror_angle_mode;
+        }
+    }
     let states = module_states(&messages)
         .into_iter()
         .map(|state| (state.name.clone(), state))
@@ -2561,7 +3246,13 @@ pub fn fuse(
             modules[reference_index].raw.name
         );
     }
-    let inputs = alignment_inputs(&modules, &luminance);
+    let inputs = alignment_inputs(
+        &modules,
+        &luminance,
+        options
+            .angle_optical_center_prior
+            .then_some(reference_name.as_str()),
+    );
     let factory_alignments = align_all_modules(
         &inputs,
         &alignment_pyramids,
@@ -2637,7 +3328,12 @@ pub fn fuse(
         .collect::<Vec<_>>();
     let mut rig_options = options.rig_refinement.clone();
     rig_options.threads = options.threads;
-    rig_options.held_out_validation = options.debug_dir.is_some();
+    // Keep the geometry acceptance population independent in production too.
+    // Previously non-debug runs fitted every track and therefore bypassed the
+    // absolute held-out quality gate entirely. The retained ~80% fit set is
+    // ample for this capture and is the price of knowing the emitted physical
+    // rig actually generalises.
+    rig_options.held_out_validation = true;
     let mut rig_outcome = refine_capture_rig(
         &rig_inputs,
         reference_index,
@@ -2645,7 +3341,24 @@ pub fn fuse(
         options.intrinsics_mode,
         &rig_options,
     );
+    if rig_options.enabled
+        && rig_options.strategy == RigRefinementStrategy::LatentGraph
+        && !rig_outcome.report.accepted
+    {
+        bail!(
+            "latent-graph rig optimizer did not produce a usable candidate: {}",
+            rig_outcome
+                .report
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("unknown optimizer failure")
+        );
+    }
     drop(rig_inputs);
+    if let Some(debug_dir) = &options.debug_dir {
+        fs::create_dir_all(debug_dir).with_context(|| format!("create {}", debug_dir.display()))?;
+        write_anchor_graph_debug(debug_dir, &rig_outcome.report)?;
+    }
     let candidate_audit_cameras = options.debug_dir.as_ref().map(|_| {
         candidate_debug_cameras(
             &modules,
@@ -2699,11 +3412,21 @@ pub fn fuse(
         }
         progress(Progress {
             stage: "align",
-            detail: "refining residual warp from accepted physical rig".to_owned(),
+            detail: match rig_outcome.report.strategy {
+                RigRefinementStrategy::Physical => {
+                    "refining residual warp from selected physical rig".to_owned()
+                }
+                RigRefinementStrategy::AnchorGraph => {
+                    "refining residual warp from selected anchor-graph rig".to_owned()
+                }
+                RigRefinementStrategy::LatentGraph => {
+                    "refining residual warp from selected latent-graph rig".to_owned()
+                }
+            },
             fraction: 0.44,
         });
-        let refined_inputs = alignment_inputs(&modules, &luminance);
-        let refined_alignments = align_all_modules(
+        let refined_inputs = alignment_inputs(&modules, &luminance, None);
+        let mut refined_alignments = align_all_modules(
             &refined_inputs,
             &alignment_pyramids,
             reference_index,
@@ -2718,6 +3441,23 @@ pub fn fuse(
                 .rig_refinement
                 .min_image_space_correction_improvement,
         );
+        for (refined, factory) in refined_alignments.iter_mut().zip(&factory_alignments) {
+            if refined.name != modules[reference_index].raw.name {
+                refined.report.initialised_from = match rig_outcome.report.strategy {
+                    RigRefinementStrategy::Physical => "selected physical rig + residual",
+                    RigRefinementStrategy::AnchorGraph => "selected anchor-graph rig + residual",
+                    RigRefinementStrategy::LatentGraph => "selected latent-graph rig + residual",
+                };
+            }
+            refined.report.angle_optical_center_prior_reference_px =
+                factory.report.angle_optical_center_prior_reference_px;
+            refined.report.angle_optical_center_prior_shift_target_px =
+                factory.report.angle_optical_center_prior_shift_target_px;
+            refined.report.angle_optical_center_prior_selected =
+                factory.report.angle_optical_center_prior_selected;
+            refined.report.angle_optical_center_prior_quality =
+                factory.report.angle_optical_center_prior_quality;
+        }
         refined_alignments
     } else {
         factory_alignments
@@ -2742,10 +3482,11 @@ pub fn fuse(
     }
     align_detail.post_rig_alignment = substage_started.elapsed().as_secs_f32();
     substage_started = Instant::now();
-    let mut inputs = alignment_inputs(&modules, &luminance);
+    let mut inputs = alignment_inputs(&modules, &luminance, None);
     let mut depth_options = options.align.depth.clone();
     depth_options.threads = options.threads;
     disable_held_out_depth_evidence(&mut inputs, &options.cfa_held_out);
+    apply_rig_depth_reliability(&mut inputs, &rig_outcome.report, reference_index);
     for (module, alignment) in modules.iter().zip(&mut alignments) {
         alignment.report.focus_achieved = module.focus.achieved;
         alignment.report.calibrated_focus_distance = module
@@ -2758,12 +3499,14 @@ pub fn fuse(
         alignment.report.lens_timeout = module.focus.lens_timeout;
         alignment.report.mirror_timeout = module.focus.mirror_timeout;
     }
-    // Dense correspondence is a property of the calibrated physical rig, not
-    // of whether a capture-specific correction happened to improve that rig.
-    // If refinement is rejected the module cameras above have already fallen
-    // back to factory calibration, which remains the correct physical model.
-    // Use the legacy warp-seeded path only when there are not enough calibrated
-    // cameras to form a physical multi-view depth hypothesis at all.
+    // Dense PhysicalRig is only safe when the capture-specific camera model
+    // passed independent geometry validation.  The real-capture failure that
+    // motivated v9.1 showed that factory calibration can be a useful prior yet
+    // still miss the active capture by many pixels; running dense depth through
+    // that rejected geometry manufactures regularized surfaces.  If refinement
+    // was attempted and failed the absolute held-out gate, retain the measured
+    // WarpSeeded path instead. An explicitly disabled rig refinement preserves
+    // the historical factory-physical behaviour.
     let calibrated_depth_views = inputs
         .iter()
         .enumerate()
@@ -2771,7 +3514,9 @@ pub fn fuse(
             *index != reference_index && input.camera.is_some() && input.depth_evidence_enabled
         })
         .count();
-    let mut depth_geometry_mode = if inputs[reference_index].camera.is_some()
+    let physical_rig_trusted = !rig_outcome.report.enabled || rig_outcome.report.accepted;
+    let mut depth_geometry_mode = if physical_rig_trusted
+        && inputs[reference_index].camera.is_some()
         && calibrated_depth_views >= options.align.depth.minimum_support
     {
         DepthGeometryMode::PhysicalRig
@@ -3017,6 +3762,10 @@ pub fn fuse(
             depth_map.write_diagnostics(
                 &debug_dir.join("depth-inverse.png"),
                 &debug_dir.join("depth-provenance.png"),
+            )?;
+            depth_map.write_split_inverse_diagnostics(
+                &debug_dir.join("depth-measured-inverse.png"),
+                &debug_dir.join("depth-regularized-inverse.png"),
             )?;
             depth_map.write_visualization(&debug_dir.join("depth-visualization.png"))?;
         }

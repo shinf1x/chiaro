@@ -28,7 +28,9 @@ blend, best and runner-up scores, reliable sample/module/spatial coverage, and
 fallback reason when the array evidence is weak. `rig_refinement` records the
 bounded physical fit, fixed validation population, positive-depth and
 conditioning diagnostics, residual-vector field, downstream alignment gate,
-and exact factory-fallback reason.
+and selection/validation status. A completed `latent-graph` solve is always
+selected; validation failures remain visible as warnings instead of causing a
+factory-rig fallback.
 
 Supply `calibration.lri` and `zoom_calib_v0.lri` whenever possible. Capture
 headers contain only part of the camera model; without device mirror-aiming and
@@ -79,6 +81,60 @@ Common options include:
 - `--no-depth` keeps the global homography for depth-refinement comparisons;
 - `--no-rig-refine` disables the bounded capture-specific physical camera and
   mirror refinement while retaining the existing residual image alignment;
+- `--rig-strategy physical|anchor-graph|latent-graph` selects the V10 physical
+  matcher, the persistent anchor/constellation graph, or the latent
+  multi-hypothesis correspondence strategy. `latent-graph` merges common
+  reference features into multi-view tracks, retains target-side self-similar
+  alternatives, and lets observations switch between bundle passes using
+  leave-one-camera-out 3-D reprojection plus local constellation consistency.
+  Held-out validation identities remain frozen. A successfully solved latent
+  candidate is the only active rig: it is not raced against the physical
+  strategy and is not replaced by factory geometry when validation warns. If
+  latent optimization cannot produce a candidate, fusion fails explicitly.
+  Anchor-graph mode uses the full
+  available 2x2-CFA-cell luminance raster (not the older /4 neural raster),
+  performs up to four iterative identity-growth rounds, re-triangulates and
+  refits orientation between rounds, and keeps factory metric centres/mirror
+  state fixed;
+- `--rig-latent-candidates`, `--rig-latent-rounds`,
+  `--rig-latent-min-similarity`, `--rig-latent-epipolar-band-px`, and
+  `--rig-latent-neighbours` expose the main latent-assignment controls.
+  LatentGraph now carries a 15k response-sorted reference feature budget per
+  camera pair (with a high-recall retry for sparse high-magnification views);
+- `--rig-latent-membership-min-camera-observations`,
+  `--rig-latent-membership-min-camera-fraction`,
+  `--rig-latent-membership-recovery-reference-px`, and
+  `--rig-latent-membership-floor-max-reference-px` control reversible fit
+  membership. Observations are demoted to dormant state rather than deleted,
+  can reactivate after later bundle passes, and each camera retains a protected
+  support floor;
+- `--rig-anchor-rounds`, `--rig-anchor-min-observation-growth`,
+  `--rig-anchor-min-track-growth`, and `--rig-anchor-search-radius-px` expose
+  the main anchor-graph convergence controls. The default four-round ceiling
+  stops early when both validated-observation and strong 3+ track growth fall
+  below 1%;
+- `--rig-max-orientation-degrees`, `--rig-max-mirror-degrees`,
+  `--rig-max-center-offset`, and `--rig-max-sensor-offset-px` expose the
+  physical refinement search bounds for calibration experiments;
+- `--mirror-angle-model calibration-quadratic-inverse|current-quadratic|calibration-pairs-linear`
+  selects the factory movable-mirror interpretation. The default inverts the
+  calibrated angle-to-Hall quadratic using its stored inflection and root
+  flags. The legacy interpretation and measured-pair interpolation remain
+  available for reproducible A/B comparisons;
+- `angle_optical_center_mapping` is applied directly when the reference follows
+  the L16 optical hierarchy (A1 to B, or B4 to C). The aligner measures only
+  this mapping-seeded warp; it no longer runs or selects a calibration-only
+  hypothesis. `--no-angle-optical-center-prior` explicitly disables it;
+- `--rig-max-focus-pupil-scale` enables an experimental group-shared axial
+  optical-centre shift derived from the CRA Hall-to-distance metadata. It is
+  disabled at its default of zero; `--rig-focus-pupil-prior-sigma` controls its
+  prior when enabled;
+- the `--rig-*-prior-sigma*` options set the physical scale of each factory
+  prior, while `--rig-factory-prior-weight` sets its overall strength;
+- `--rig-match-subpixel-step-px`, `--rig-match-patch-radius`,
+  `--rig-match-min-score`, `--rig-match-min-margin`, and
+  `--rig-match-pre-solve-reprojection-px` expose the physical matcher quality
+  gates for controlled calibration experiments;
 - `--depth-near` and `--depth-far` set the calibrated local search interval
   (0.5 m to 10 km by default);
 - `--no-highlight-correction` disables only the final display-oriented smooth

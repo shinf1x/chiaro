@@ -21,14 +21,20 @@
 //!    the correlation peak, which discards textureless sky automatically.
 //!
 //! The report records per-module statistics (initial offset, inliers, residual
-//! quantiles) so alignment quality can be inspected after every export.
+//! quantiles) so alignment quality can be inspected after every export. Rig
+//! calibration does not reuse the arbitrary grid-window centres above as 3-D
+//! points: after the final warp is known, a separate sparse Shi-Tomasi/corner
+//! matcher produces point observations with uniqueness, mutual-match and
+//! localization-covariance diagnostics.
+
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::depth::{DepthAlignmentReport, DepthOptions};
 use crate::geometry::ResolvedCamera;
-use crate::image::{Plane, match_patch};
+use crate::image::{Plane, match_patch, match_patch_at};
 use crate::math::{Mat3, Vec2, apply_homography};
 
 /// View-dependent visibility of one reference-space warp location.
@@ -409,6 +415,21 @@ pub struct AlignmentCorrespondence {
     pub local_scale: f32,
     /// Standard deviation of the reference log-luminance match window.
     pub structure: f32,
+    /// Unit-determinant localization covariance of the reference feature in
+    /// reference sensor axes. This is derived from the local structure tensor:
+    /// corners are close to isotropic while edge-like observations are
+    /// anisotropic and therefore receive less weight along the weak direction.
+    pub reference_localization_covariance: [[f32; 2]; 2],
+    /// Unit-determinant localization covariance of the target feature in
+    /// target sensor axes after propagating the rendered-space structure
+    /// tensor through the current geometric proposal.
+    pub target_localization_covariance: [[f32; 2]; 2],
+    /// Separation between the winning NCC peak and the best non-neighbouring
+    /// peak. Small values indicate repeated structure or a broad edge ridge.
+    pub peak_margin: f32,
+    /// Forward/backward sparse-match closure error, in reference luminance
+    /// plane pixels (one plane pixel is two sensor pixels).
+    pub forward_backward_error_px: f32,
     /// Filled by later depth-aware matchers when available. The initial
     /// physical solve deliberately works without requiring dense depth.
     pub depth_reliability: Option<f32>,
@@ -434,6 +455,20 @@ pub struct AlignmentReport {
     pub focus_roi: Option<[f64; 2]>,
     pub lens_timeout: bool,
     pub mirror_timeout: bool,
+    /// Factory mirror-angle mapping point in the parent reference raster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle_optical_center_prior_reference_px: Option<Vec2>,
+    /// Translation applied to the factory reference-to-target warp so that
+    /// the mapped point lands on the target optical axis. Image matching is
+    /// subsequently free to override this initializer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle_optical_center_prior_shift_target_px: Option<Vec2>,
+    /// Whether the mapping was applied. `None` means no applicable mapping
+    /// existed; the mapped initializer is not raced against a legacy seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle_optical_center_prior_selected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle_optical_center_prior_quality: Option<f32>,
     /// Fraction of the reference frame this module covers.
     pub coverage: f32,
     /// Median correction applied to the factory model, reference pixels.
@@ -448,6 +483,14 @@ pub struct AlignmentReport {
     /// model. Low consensus usually means competing scene depths or a false
     /// correlation, even when the inlier residual itself is small.
     pub inlier_ratio: f32,
+    /// Sparse point-feature proposals considered for physical rig fitting.
+    /// These are deliberately separate from the dense/grid warp patches.
+    pub rig_feature_candidates: usize,
+    /// Sparse point-feature matches that passed 2-D corner conditioning, NCC
+    /// peak uniqueness, and mutual forward/backward verification.
+    pub rig_feature_matches: usize,
+    pub rig_feature_rejected_ambiguous: usize,
+    pub rig_feature_rejected_forward_backward: usize,
     /// Local calibrated inverse-depth refinement, when both camera models were
     /// available and depth-aware alignment was enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -508,6 +551,7 @@ impl Default for AlignOptions {
 }
 
 /// One module's inputs to alignment.
+#[derive(Clone, Copy)]
 pub struct AlignInput<'a> {
     pub name: &'a str,
     /// Half-resolution log luminance of the module.
@@ -520,6 +564,15 @@ pub struct AlignInput<'a> {
     /// Held-out CFA validation disables this while still retaining the camera
     /// model for projection/evaluation, preventing target-radiance leakage.
     pub depth_evidence_enabled: bool,
+    /// Multiplicative evidence prior. V8 keeps this neutral (`1.0`) for every
+    /// enabled camera: sparse rig difficulty is not a camera-wide quality
+    /// judgement. Local match uniqueness/geometry decide authority instead.
+    /// Held-out validation sets it to zero together with
+    /// `depth_evidence_enabled = false`.
+    pub depth_evidence_reliability: f32,
+    /// Optional factory optical-axis point expressed in this alignment's
+    /// reference raster. It is a bootstrap prior only.
+    pub angle_optical_center_prior_reference_px: Option<Vec2>,
     /// Nominal focal length in pixels (used when `camera` is `None`).
     pub nominal_focal_px: f64,
 }
@@ -536,13 +589,23 @@ pub struct AlignmentSeed<'a> {
 #[derive(Clone, Debug)]
 pub struct AlignPyramidCache {
     levels: Vec<Plane>,
+    // Sparse rig features are detected only on the reference luminance plane.
+    // The same reference cache is reused for every target camera, so memoising
+    // them here avoids re-running the structure-tensor scan ten times.
+    rig_corners: OnceLock<Vec<RigCorner>>,
 }
 
 impl AlignPyramidCache {
     pub fn new(luminance: &Plane) -> Self {
         Self {
             levels: luminance.pyramid(16),
+            rig_corners: OnceLock::new(),
         }
+    }
+
+    fn rig_corners(&self) -> &[RigCorner] {
+        self.rig_corners
+            .get_or_init(|| detect_rig_corners(&self.levels[0]))
     }
 
     fn levels_for(&self, min_size: usize) -> &[Plane] {
@@ -631,12 +694,47 @@ pub fn align_module_seeded_cached(
             seed.warp.clone()
         }
         (None, Some(reference_camera), Some(target_camera)) => {
-            report.initialised_from = "calibration";
-            Warp::from_fn(width, height, 8, |p| {
+            let mut grid = Warp::from_fn(width, height, 8, |p| {
                 target_camera
                     .map_from(reference_camera, p, FAR_DEPTH)
                     .filter(|q| q[0].is_finite() && q[1].is_finite())
-            })
+            });
+            if let Some(reference_pixel) = target.angle_optical_center_prior_reference_px {
+                let Some(predicted) =
+                    grid.map(reference_pixel[0] as f32, reference_pixel[1] as f32)
+                else {
+                    bail!(
+                        "{} angle optical-center mapping point {:.3},{:.3} is outside the usable {} reference warp",
+                        target.name,
+                        reference_pixel[0],
+                        reference_pixel[1],
+                        reference.name,
+                    );
+                };
+                let optical_axis = target_camera.optical_axis_pixel();
+                let shift = [
+                    optical_axis[0] - f64::from(predicted[0]),
+                    optical_axis[1] - f64::from(predicted[1]),
+                ];
+                if !shift.iter().all(|value| value.is_finite()) {
+                    bail!(
+                        "{} angle optical-center mapping produced a non-finite target shift",
+                        target.name,
+                    );
+                }
+                for point in &mut grid.points {
+                    if point[0].is_finite() && point[1].is_finite() {
+                        point[0] += shift[0] as f32;
+                        point[1] += shift[1] as f32;
+                    }
+                }
+                report.initialised_from = "calibration + angle optical-center mapping";
+                report.angle_optical_center_prior_reference_px = Some(reference_pixel);
+                report.angle_optical_center_prior_shift_target_px = Some(shift);
+            } else {
+                report.initialised_from = "calibration";
+            }
+            grid
         }
         (None, _, _) => {
             report.initialised_from = "nominal focal group";
@@ -671,6 +769,7 @@ pub fn align_module_seeded_cached(
     let mut correction: Mat3 = crate::math::IDENTITY;
     let mut finest_residuals: Vec<f32> = Vec::new();
     let mut correspondences = Vec::new();
+    let mut alignment_magnification = target.nominal_focal_px / reference.nominal_focal_px;
     if options.refine {
         let reference_pyramid = reference_pyramid.levels_for(96);
         let target_pyramid = target_pyramid.levels_for(48);
@@ -692,6 +791,8 @@ pub fn align_module_seeded_cached(
                 _ => target.nominal_focal_px / reference.nominal_focal_px,
             }
         };
+        alignment_magnification = magnification;
+        let mut acquired_correction = false;
         for level in (0..reference_pyramid.len()).rev() {
             let scale = 1usize << level; // reference luminance pixels per level pixel
             let reference_plane = &reference_pyramid[level];
@@ -710,14 +811,18 @@ pub fn align_module_seeded_cached(
                 &initial,
                 &correction,
             );
-            let radius = if level + 1 == reference_pyramid.len() {
+            // A narrow residual search is valid only after some pyramid level
+            // has actually established a homography. Narrow-FOV cameras can
+            // have fewer than the six required patches at the coarsest level;
+            // in that case retain the bootstrap radius at finer levels instead
+            // of silently stranding an otherwise useful factory prior.
+            let radius = if !acquired_correction {
                 options.coarse_radius
             } else {
                 3
             };
             let patch = options.patch.min(reference_plane.width / 4).max(8);
             let mut pairs = Vec::new();
-            let mut pair_structure = Vec::new();
             let stride = patch / 2;
             let mut y = radius;
             while y + patch + radius <= reference_plane.height {
@@ -747,37 +852,20 @@ pub fn align_module_seeded_cached(
                         // reference shows at `centre`: C maps centre -> shifted
                         // (in the current corrected frame).
                         pairs.push((centre, shifted, found.score));
-                        pair_structure.push(reference_plane.window_std(x, y, patch));
                     }
                     x += stride;
                 }
                 y += stride;
             }
-            // Physical rig refinement must not inherit a single-homography
-            // visibility/model assumption. Retain every reliable finest-level
-            // patch match for the 3-D optimizer; RANSAC inliers below remain
-            // the population used to update and diagnose the legacy 2-D warp.
-            if level == 0 {
-                correspondences = pairs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, &(reference_pixel, shifted, confidence))| {
-                        let corrected = apply_homography(&correction, shifted)?;
-                        let target_pixel = initial(corrected)?;
-                        Some(AlignmentCorrespondence {
-                            reference_pixel,
-                            target_pixel,
-                            confidence,
-                            local_scale: magnification as f32,
-                            structure: pair_structure[index],
-                            depth_reliability: None,
-                        })
-                    })
-                    .collect();
-            }
+            // The grid patches above exist only to estimate the image warp. Rig
+            // correspondences are generated separately from true point-like
+            // features after the final homography has been fitted; an arbitrary
+            // grid-window centre is not a valid 3-D observation.
+
             let threshold = (options.inlier_px * scale as f32 * 2.0).max(options.inlier_px);
             if let Some((update, inliers, residuals)) = fit_homography_ransac(&pairs, threshold) {
                 correction = crate::math::mul(&correction, &update);
+                acquired_correction = true;
                 report.levels.push(LevelReport {
                     scale: scale * 2,
                     patches: pairs.len(),
@@ -796,6 +884,56 @@ pub fn align_module_seeded_cached(
                     inliers: 0,
                     median_residual_px: f32::NAN,
                 });
+            }
+        }
+    }
+
+    if options.refine {
+        // Re-render at the native half-resolution luminance density through the
+        // *final* 2-D alignment proposal. This image is only a search frame:
+        // sparse correspondences remain explicit reference/target sensor
+        // pixels and are independently verified by the rig stage.
+        let rendered = render_through(
+            reference.luminance,
+            1,
+            target.luminance,
+            1.0,
+            &initial,
+            &correction,
+        );
+        correspondences = rig_feature_correspondences(
+            reference.luminance,
+            &rendered,
+            reference_pyramid.rig_corners(),
+            &initial,
+            &correction,
+            alignment_magnification as f32,
+            options.min_score,
+            false,
+            &mut report,
+        );
+        if correspondences.len() < RIG_FEATURE_RETRY_BELOW_MATCHES
+            && alignment_magnification >= RIG_FEATURE_RETRY_MIN_MAGNIFICATION
+        {
+            let mut retry_report = AlignmentReport::default();
+            let retry = rig_feature_correspondences(
+                reference.luminance,
+                &rendered,
+                reference_pyramid.rig_corners(),
+                &initial,
+                &correction,
+                alignment_magnification as f32,
+                options.min_score,
+                true,
+                &mut retry_report,
+            );
+            if retry.len() > correspondences.len() {
+                correspondences = retry;
+                report.rig_feature_candidates = retry_report.rig_feature_candidates;
+                report.rig_feature_matches = retry_report.rig_feature_matches;
+                report.rig_feature_rejected_ambiguous = retry_report.rig_feature_rejected_ambiguous;
+                report.rig_feature_rejected_forward_backward =
+                    retry_report.rig_feature_rejected_forward_backward;
             }
         }
     }
@@ -906,6 +1044,511 @@ fn rendered_covered(rendered: &Plane, x: usize, y: usize, size: usize) -> bool {
         }
     }
     true
+}
+
+// Sparse point-feature matching used only by capture-specific rig fitting.
+// The normal alignment warp deliberately remains grid/NCC based: a broad
+// window is excellent for estimating a local image translation but its
+// arbitrary window centre is not necessarily a physical 3-D point. The rig
+// matcher below instead anchors every observation on a genuine 2-D corner.
+const RIG_FEATURE_TENSOR_RADIUS: usize = 2;
+const RIG_FEATURE_SCAN_STEP: usize = 2;
+const RIG_FEATURE_NMS_RADIUS: usize = 3;
+const RIG_FEATURE_MAX_CANDIDATES: usize = 60_000;
+const RIG_FEATURE_PAIR_MAX_CANDIDATES: usize = 15_000;
+const RIG_FEATURE_MAX_MATCHES: usize = 15_000;
+const RIG_FEATURE_PATCH: usize = 13;
+const RIG_FEATURE_SEARCH_RADIUS: usize = 8;
+const RIG_FEATURE_MIN_EIGEN_RATIO: f32 = 0.08;
+const RIG_FEATURE_MIN_STRUCTURE: f32 = 0.010;
+const RIG_FEATURE_MIN_SCORE: f32 = 0.65;
+const RIG_FEATURE_MIN_PEAK_MARGIN: f32 = 0.025;
+const RIG_FEATURE_MAX_FORWARD_BACKWARD_ERROR: f32 = 0.50;
+const RIG_FEATURE_MAX_CORNER_DISAGREEMENT: f32 = 0.75;
+// Narrow-FOV modules can have excellent geometric overlap but noticeably
+// different local appearance after resampling.  A strict patch gate can then
+// leave only a dozen correspondences (C3 on the real 75/150-mm capture),
+// which is much worse than carrying a larger, noisier population into the
+// calibrated epipolar RANSAC.  Retry only sparse high-magnification cases
+// with a wider/high-recall search; RANSAC remains the geometric authority.
+const RIG_FEATURE_RETRY_BELOW_MATCHES: usize = 1_500;
+const RIG_FEATURE_RETRY_MIN_MAGNIFICATION: f64 = 1.35;
+const RIG_FEATURE_RELAXED_SEARCH_RADIUS: usize = 20;
+const RIG_FEATURE_RELAXED_MIN_SCORE: f32 = 0.54;
+const RIG_FEATURE_RELAXED_MIN_PEAK_MARGIN: f32 = 0.010;
+const RIG_FEATURE_RELAXED_MAX_FORWARD_BACKWARD_ERROR: f32 = 1.25;
+const RIG_FEATURE_RELAXED_MAX_CORNER_DISAGREEMENT: f32 = 1.50;
+const RIG_FEATURE_RELAXED_MAX_MATCHES: usize = 15_000;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RigCorner {
+    pub(crate) integer: [usize; 2],
+    pub(crate) subpixel: [f32; 2],
+    pub(crate) score: f32,
+    pub(crate) structure: f32,
+    pub(crate) covariance: [[f32; 2]; 2],
+}
+
+/// Shi-Tomasi structure tensor at one luminance-plane pixel. The returned
+/// covariance is proportional to `tensor^-1` and normalized to determinant 1;
+/// absolute uncertainty continues to come from NCC/contrast in the rig loss.
+fn rig_corner_metric(plane: &Plane, x: usize, y: usize) -> Option<(f32, f32, [[f32; 2]; 2])> {
+    let radius = RIG_FEATURE_TENSOR_RADIUS;
+    if x <= radius || y <= radius || x + radius + 1 >= plane.width || y + radius + 1 >= plane.height
+    {
+        return None;
+    }
+    let mut xx = 0.0f64;
+    let mut xy = 0.0f64;
+    let mut yy = 0.0f64;
+    let mut samples = 0usize;
+    for sy in y - radius..=y + radius {
+        for sx in x - radius..=x + radius {
+            let left = plane.at(sx - 1, sy);
+            let right = plane.at(sx + 1, sy);
+            let above = plane.at(sx, sy - 1);
+            let below = plane.at(sx, sy + 1);
+            if !left.is_finite() || !right.is_finite() || !above.is_finite() || !below.is_finite() {
+                return None;
+            }
+            let gx = 0.5 * f64::from(right - left);
+            let gy = 0.5 * f64::from(below - above);
+            xx += gx * gx;
+            xy += gx * gy;
+            yy += gy * gy;
+            samples += 1;
+        }
+    }
+    if samples == 0 {
+        return None;
+    }
+    let inv_n = 1.0 / samples as f64;
+    xx *= inv_n;
+    xy *= inv_n;
+    yy *= inv_n;
+    let trace = xx + yy;
+    let discriminant = ((xx - yy) * (xx - yy) + 4.0 * xy * xy).max(0.0).sqrt();
+    let lambda_min = 0.5 * (trace - discriminant);
+    let lambda_max = 0.5 * (trace + discriminant);
+    if !lambda_min.is_finite()
+        || !lambda_max.is_finite()
+        || lambda_min <= 1.0e-10
+        || lambda_max <= 0.0
+    {
+        return None;
+    }
+    let ratio = (lambda_min / lambda_max) as f32;
+    let determinant = xx * yy - xy * xy;
+    if !determinant.is_finite() || determinant <= 1.0e-16 {
+        return None;
+    }
+    // inv(T) * sqrt(det(T)) has unit determinant. Clamp entries only through
+    // the eigen-ratio admission above, not per-axis, so orientation is kept.
+    let scale = determinant.sqrt();
+    let covariance = [
+        [(yy / scale) as f32, (-xy / scale) as f32],
+        [(-xy / scale) as f32, (xx / scale) as f32],
+    ];
+    Some((lambda_min as f32, ratio, covariance))
+}
+
+fn parabolic_corner_offset(minus: f32, centre: f32, plus: f32) -> f32 {
+    let denominator = minus - 2.0 * centre + plus;
+    if !minus.is_finite() || !plus.is_finite() || denominator.abs() < 1.0e-12 {
+        0.0
+    } else {
+        (0.5 * (minus - plus) / denominator).clamp(-0.5, 0.5)
+    }
+}
+
+pub(crate) fn refine_rig_corner(plane: &Plane, seed_x: usize, seed_y: usize) -> Option<RigCorner> {
+    let half = RIG_FEATURE_PATCH / 2;
+    if seed_x <= half + 2
+        || seed_y <= half + 2
+        || seed_x + half + 2 >= plane.width
+        || seed_y + half + 2 >= plane.height
+    {
+        return None;
+    }
+
+    // The detector scan may be strided. Search the immediate 3x3 response
+    // neighbourhood before sub-pixel interpolation so an actual corner on an
+    // unscanned integer pixel is not biased by up to one luminance-plane pixel.
+    let mut best: Option<RigCorner> = None;
+    for y in seed_y - 1..=seed_y + 1 {
+        for x in seed_x - 1..=seed_x + 1 {
+            let Some((score, ratio, covariance)) = rig_corner_metric(plane, x, y) else {
+                continue;
+            };
+            if ratio < RIG_FEATURE_MIN_EIGEN_RATIO {
+                continue;
+            }
+            let structure = plane.window_std(x - half, y - half, RIG_FEATURE_PATCH);
+            if structure < RIG_FEATURE_MIN_STRUCTURE {
+                continue;
+            }
+            if best.as_ref().is_none_or(|current| score > current.score) {
+                best = Some(RigCorner {
+                    integer: [x, y],
+                    subpixel: [x as f32, y as f32],
+                    score,
+                    structure,
+                    covariance,
+                });
+            }
+        }
+    }
+    let mut corner = best?;
+    let [x, y] = corner.integer;
+    let sx_minus = rig_corner_metric(plane, x - 1, y).map_or(corner.score, |v| v.0);
+    let sx_plus = rig_corner_metric(plane, x + 1, y).map_or(corner.score, |v| v.0);
+    let sy_minus = rig_corner_metric(plane, x, y - 1).map_or(corner.score, |v| v.0);
+    let sy_plus = rig_corner_metric(plane, x, y + 1).map_or(corner.score, |v| v.0);
+    corner.subpixel = [
+        x as f32 + parabolic_corner_offset(sx_minus, corner.score, sx_plus),
+        y as f32 + parabolic_corner_offset(sy_minus, corner.score, sy_plus),
+    ];
+    Some(corner)
+}
+
+pub(crate) fn detect_rig_corners(reference: &Plane) -> Vec<RigCorner> {
+    let half = RIG_FEATURE_PATCH / 2;
+    let margin = half + RIG_FEATURE_SEARCH_RADIUS + RIG_FEATURE_TENSOR_RADIUS + 2;
+    if reference.width <= 2 * margin || reference.height <= 2 * margin {
+        return Vec::new();
+    }
+    let mut candidates = Vec::<RigCorner>::new();
+    let mut y = margin;
+    while y + margin < reference.height {
+        let mut x = margin;
+        while x + margin < reference.width {
+            if let Some((score, ratio, covariance)) = rig_corner_metric(reference, x, y)
+                && ratio >= RIG_FEATURE_MIN_EIGEN_RATIO
+            {
+                let structure = reference.window_std(x - half, y - half, RIG_FEATURE_PATCH);
+                if structure >= RIG_FEATURE_MIN_STRUCTURE {
+                    candidates.push(RigCorner {
+                        integer: [x, y],
+                        subpixel: [x as f32, y as f32],
+                        score,
+                        structure,
+                        covariance,
+                    });
+                }
+            }
+            x += RIG_FEATURE_SCAN_STEP;
+        }
+        y += RIG_FEATURE_SCAN_STEP;
+    }
+    candidates.sort_by(|first, second| second.score.total_cmp(&first.score));
+
+    // Greedy non-maximum suppression after response sorting. A compact byte
+    // mask is faster than O(N^2) distance checks and keeps features spatially
+    // distributed instead of allowing one railing junction to dominate.
+    let mut blocked = vec![false; reference.width * reference.height];
+    let mut selected = Vec::with_capacity(RIG_FEATURE_MAX_CANDIDATES);
+    for candidate in candidates {
+        let Some(candidate) =
+            refine_rig_corner(reference, candidate.integer[0], candidate.integer[1])
+        else {
+            continue;
+        };
+        let [x, y] = candidate.integer;
+        if blocked[y * reference.width + x] {
+            continue;
+        }
+        selected.push(candidate);
+        if selected.len() >= RIG_FEATURE_MAX_CANDIDATES {
+            break;
+        }
+        let x0 = x.saturating_sub(RIG_FEATURE_NMS_RADIUS);
+        let y0 = y.saturating_sub(RIG_FEATURE_NMS_RADIUS);
+        let x1 = (x + RIG_FEATURE_NMS_RADIUS).min(reference.width - 1);
+        let y1 = (y + RIG_FEATURE_NMS_RADIUS).min(reference.height - 1);
+        for by in y0..=y1 {
+            blocked[by * reference.width + x0..=by * reference.width + x1].fill(true);
+        }
+    }
+    selected
+}
+
+fn normalize_covariance(covariance: [[f64; 2]; 2]) -> [[f32; 2]; 2] {
+    let determinant = covariance[0][0] * covariance[1][1] - covariance[0][1] * covariance[1][0];
+    if !determinant.is_finite() || determinant <= 1.0e-12 {
+        return [[1.0, 0.0], [0.0, 1.0]];
+    }
+    let scale = determinant.sqrt();
+    [
+        [
+            (covariance[0][0] / scale) as f32,
+            (covariance[0][1] / scale) as f32,
+        ],
+        [
+            (covariance[1][0] / scale) as f32,
+            (covariance[1][1] / scale) as f32,
+        ],
+    ]
+}
+
+fn propagate_rig_covariance(
+    covariance: [[f32; 2]; 2],
+    point: [f32; 2],
+    map: &dyn Fn([f32; 2]) -> Option<Vec2>,
+) -> [[f32; 2]; 2] {
+    let h = 0.5f32;
+    let Some(left) = map([point[0] - h, point[1]]) else {
+        return covariance;
+    };
+    let Some(right) = map([point[0] + h, point[1]]) else {
+        return covariance;
+    };
+    let Some(above) = map([point[0], point[1] - h]) else {
+        return covariance;
+    };
+    let Some(below) = map([point[0], point[1] + h]) else {
+        return covariance;
+    };
+    let j = [
+        [
+            (right[0] - left[0]) / f64::from(2.0 * h),
+            (below[0] - above[0]) / f64::from(2.0 * h),
+        ],
+        [
+            (right[1] - left[1]) / f64::from(2.0 * h),
+            (below[1] - above[1]) / f64::from(2.0 * h),
+        ],
+    ];
+    let c = [
+        [f64::from(covariance[0][0]), f64::from(covariance[0][1])],
+        [f64::from(covariance[1][0]), f64::from(covariance[1][1])],
+    ];
+    let jc = [
+        [
+            j[0][0] * c[0][0] + j[0][1] * c[1][0],
+            j[0][0] * c[0][1] + j[0][1] * c[1][1],
+        ],
+        [
+            j[1][0] * c[0][0] + j[1][1] * c[1][0],
+            j[1][0] * c[0][1] + j[1][1] * c[1][1],
+        ],
+    ];
+    normalize_covariance([
+        [
+            jc[0][0] * j[0][0] + jc[0][1] * j[0][1],
+            jc[0][0] * j[1][0] + jc[0][1] * j[1][1],
+        ],
+        [
+            jc[1][0] * j[0][0] + jc[1][1] * j[0][1],
+            jc[1][0] * j[1][0] + jc[1][1] * j[1][1],
+        ],
+    ])
+}
+
+fn rig_feature_correspondences(
+    reference: &Plane,
+    rendered: &Plane,
+    corners: &[RigCorner],
+    initial: &dyn Fn(Vec2) -> Option<Vec2>,
+    correction: &Mat3,
+    local_scale: f32,
+    minimum_alignment_score: f32,
+    relaxed: bool,
+    report: &mut AlignmentReport,
+) -> Vec<AlignmentCorrespondence> {
+    // `corners` is a large global reference reservoir. Count only candidates
+    // that actually lie in this target camera's rendered overlap so narrow-FOV
+    // cameras can receive the same 15k *pair-specific* feature budget as wide
+    // cameras instead of inheriting roughly overlap_fraction * 15k points.
+    report.rig_feature_candidates = 0;
+    report.rig_feature_matches = 0;
+    report.rig_feature_rejected_ambiguous = 0;
+    report.rig_feature_rejected_forward_backward = 0;
+    let half = RIG_FEATURE_PATCH / 2;
+    let search_radius = if relaxed {
+        RIG_FEATURE_RELAXED_SEARCH_RADIUS
+    } else {
+        RIG_FEATURE_SEARCH_RADIUS
+    };
+    let minimum_score = if relaxed {
+        (minimum_alignment_score - 0.08).max(RIG_FEATURE_RELAXED_MIN_SCORE)
+    } else {
+        minimum_alignment_score.max(RIG_FEATURE_MIN_SCORE)
+    };
+    let minimum_peak_margin = if relaxed {
+        RIG_FEATURE_RELAXED_MIN_PEAK_MARGIN
+    } else {
+        RIG_FEATURE_MIN_PEAK_MARGIN
+    };
+    let maximum_forward_backward_error = if relaxed {
+        RIG_FEATURE_RELAXED_MAX_FORWARD_BACKWARD_ERROR
+    } else {
+        RIG_FEATURE_MAX_FORWARD_BACKWARD_ERROR
+    };
+    let maximum_corner_disagreement = if relaxed {
+        RIG_FEATURE_RELAXED_MAX_CORNER_DISAGREEMENT
+    } else {
+        RIG_FEATURE_MAX_CORNER_DISAGREEMENT
+    };
+    let maximum_matches = if relaxed {
+        RIG_FEATURE_RELAXED_MAX_MATCHES
+    } else {
+        RIG_FEATURE_MAX_MATCHES
+    };
+    let map_rendered = |point: [f32; 2]| -> Option<Vec2> {
+        let raster = [
+            2.0 * f64::from(point[0]) + 0.5,
+            2.0 * f64::from(point[1]) + 0.5,
+        ];
+        initial(apply_homography(correction, raster)?)
+    };
+
+    let mut matches = Vec::new();
+    for &corner in corners {
+        if matches.len() >= maximum_matches {
+            break;
+        }
+        let [x, y] = corner.integer;
+        let rx = x - half;
+        let ry = y - half;
+        let search_x = rx - search_radius;
+        let search_y = ry - search_radius;
+        let search_size = RIG_FEATURE_PATCH + 2 * search_radius;
+        if !rendered_covered(rendered, search_x, search_y, search_size) {
+            continue;
+        }
+        if report.rig_feature_candidates >= RIG_FEATURE_PAIR_MAX_CANDIDATES {
+            break;
+        }
+        report.rig_feature_candidates += 1;
+        let Some(forward) = match_patch_at(
+            reference,
+            rendered,
+            rx,
+            ry,
+            rx,
+            ry,
+            RIG_FEATURE_PATCH,
+            search_radius,
+        ) else {
+            continue;
+        };
+        let search_limit = search_radius as f32 - 0.25;
+        if forward.score < minimum_score
+            || forward.peak_margin < minimum_peak_margin
+            || forward.shift[0].abs() >= search_limit
+            || forward.shift[1].abs() >= search_limit
+        {
+            // A winner on the search boundary is not a localized point: the
+            // true peak may lie outside the residual window. Treat it exactly
+            // like an ambiguous/repeated peak rather than feeding a clipped
+            // displacement to triangulation.
+            report.rig_feature_rejected_ambiguous += 1;
+            continue;
+        }
+
+        let target_centre = [x as f32 + forward.shift[0], y as f32 + forward.shift[1]];
+        let target_integer = [
+            target_centre[0].round() as isize,
+            target_centre[1].round() as isize,
+        ];
+        if target_integer[0] < (half + search_radius) as isize
+            || target_integer[1] < (half + search_radius) as isize
+            || target_integer[0] + (half + search_radius) as isize >= rendered.width as isize
+            || target_integer[1] + (half + search_radius) as isize >= rendered.height as isize
+        {
+            continue;
+        }
+        let Some(target_corner) = refine_rig_corner(
+            rendered,
+            target_integer[0] as usize,
+            target_integer[1] as usize,
+        ) else {
+            report.rig_feature_rejected_ambiguous += 1;
+            continue;
+        };
+        let corner_delta = [
+            target_corner.subpixel[0] - (corner.subpixel[0] + forward.shift[0]),
+            target_corner.subpixel[1] - (corner.subpixel[1] + forward.shift[1]),
+        ];
+        let corner_disagreement =
+            (corner_delta[0] * corner_delta[0] + corner_delta[1] * corner_delta[1]).sqrt();
+        if corner_disagreement > maximum_corner_disagreement {
+            report.rig_feature_rejected_ambiguous += 1;
+            continue;
+        }
+
+        let tx = target_corner.integer[0] - half;
+        let ty = target_corner.integer[1] - half;
+        let Some(backward) = match_patch_at(
+            rendered,
+            reference,
+            tx,
+            ty,
+            rx,
+            ry,
+            RIG_FEATURE_PATCH,
+            search_radius,
+        ) else {
+            continue;
+        };
+        if backward.score < minimum_score
+            || backward.peak_margin < minimum_peak_margin
+            || backward.shift[0].abs() >= search_limit
+            || backward.shift[1].abs() >= search_limit
+        {
+            report.rig_feature_rejected_ambiguous += 1;
+            continue;
+        }
+        // Close the cycle on independently localized point positions. The
+        // backward patch is centred at target_corner.integer; preserve the
+        // target corner's fractional offset when predicting its location back
+        // in the reference image.
+        let target_fraction = [
+            target_corner.subpixel[0] - target_corner.integer[0] as f32,
+            target_corner.subpixel[1] - target_corner.integer[1] as f32,
+        ];
+        let backward_reference = [
+            x as f32 + backward.shift[0] + target_fraction[0],
+            y as f32 + backward.shift[1] + target_fraction[1],
+        ];
+        let closure = [
+            backward_reference[0] - corner.subpixel[0],
+            backward_reference[1] - corner.subpixel[1],
+        ];
+        let forward_backward_error = (closure[0] * closure[0] + closure[1] * closure[1]).sqrt();
+        if forward_backward_error > maximum_forward_backward_error {
+            report.rig_feature_rejected_forward_backward += 1;
+            continue;
+        }
+
+        // Both observations are now independently localized corner extrema;
+        // NCC establishes their identity rather than defining an arbitrary
+        // window-centre point.
+        let target_feature = target_corner.subpixel;
+        let reference_pixel = [
+            2.0 * f64::from(corner.subpixel[0]) + 0.5,
+            2.0 * f64::from(corner.subpixel[1]) + 0.5,
+        ];
+        let Some(target_pixel) = map_rendered(target_feature) else {
+            continue;
+        };
+        let target_covariance =
+            propagate_rig_covariance(target_corner.covariance, target_feature, &map_rendered);
+        matches.push(AlignmentCorrespondence {
+            reference_pixel,
+            target_pixel,
+            confidence: forward.score.min(backward.score),
+            local_scale,
+            structure: corner.structure.min(target_corner.structure),
+            reference_localization_covariance: corner.covariance,
+            target_localization_covariance: target_covariance,
+            peak_margin: forward.peak_margin.min(backward.peak_margin),
+            forward_backward_error_px: forward_backward_error,
+            depth_reliability: None,
+        });
+    }
+    report.rig_feature_matches = matches.len();
+    matches
 }
 
 /// Exhaustive translation search at a coarse level for the no-calibration
@@ -1199,8 +1842,14 @@ pub fn debug_checkerboard(
             let value = if use_target {
                 let rx = x as f32 * 2.0 + 0.5;
                 let ry = y as f32 * 2.0 + 0.5;
-                warp.map(rx, ry)
-                    .and_then(|q| target.sample((q[0] - 0.5) / 2.0, (q[1] - 0.5) / 2.0))
+                let sample = warp.sample(rx, ry);
+                if sample.visibility.blocks_sampling() || sample.confidence <= 0.0 {
+                    None
+                } else {
+                    sample
+                        .mapped
+                        .and_then(|q| target.sample((q[0] - 0.5) / 2.0, (q[1] - 0.5) / 2.0))
+                }
             } else {
                 Some(reference.at(x, y))
             };
@@ -1216,6 +1865,110 @@ pub fn debug_checkerboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rig_corner_metric_rejects_one_dimensional_edges_but_accepts_corners() {
+        let mut plane = Plane::new(96, 96);
+        for y in 0..96 {
+            for x in 0..96 {
+                plane.data[y * 96 + x] = if x >= 48 && y >= 48 { 1.0 } else { 0.0 };
+            }
+        }
+        let (_, corner_ratio, _) = rig_corner_metric(&plane, 48, 48).unwrap();
+        let edge_ratio = rig_corner_metric(&plane, 48, 70).map_or(0.0, |value| value.1);
+        assert!(
+            corner_ratio > RIG_FEATURE_MIN_EIGEN_RATIO,
+            "corner eigen-ratio {corner_ratio}"
+        );
+        assert!(
+            edge_ratio < RIG_FEATURE_MIN_EIGEN_RATIO,
+            "edge eigen-ratio {edge_ratio}"
+        );
+    }
+
+    #[test]
+    fn sparse_rig_features_close_forward_backward_on_known_translation() {
+        let (width, height) = (180usize, 140usize);
+        let mut reference = Plane::new(width, height);
+        // Deterministic non-periodic texture produces many true 2-D corners
+        // and unambiguous small patches without relying on an RNG crate.
+        let mut state = 0xA5C3_19D7u32;
+        for value in &mut reference.data {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *value = ((state >> 8) as f32) / ((1u32 << 24) as f32);
+        }
+        let shift = [3isize, -2isize];
+        let mut rendered = Plane::new(width, height);
+        rendered.data.fill(f32::NAN);
+        for y in 0..height {
+            for x in 0..width {
+                let sx = x as isize - shift[0];
+                let sy = y as isize - shift[1];
+                if sx >= 0 && sy >= 0 && sx < width as isize && sy < height as isize {
+                    rendered.data[y * width + x] = reference.at(sx as usize, sy as usize);
+                }
+            }
+        }
+        let initial = |point: Vec2| Some(point);
+        let mut report = AlignmentReport::default();
+        let corners = detect_rig_corners(&reference);
+        let matches = rig_feature_correspondences(
+            &reference,
+            &rendered,
+            &corners,
+            &initial,
+            &crate::math::IDENTITY,
+            1.0,
+            0.5,
+            false,
+            &mut report,
+        );
+        assert!(matches.len() >= 24, "only {} sparse matches", matches.len());
+        let mut errors = matches
+            .iter()
+            .map(|correspondence| {
+                let dx = correspondence.target_pixel[0]
+                    - correspondence.reference_pixel[0]
+                    - 2.0 * shift[0] as f64;
+                let dy = correspondence.target_pixel[1]
+                    - correspondence.reference_pixel[1]
+                    - 2.0 * shift[1] as f64;
+                (dx * dx + dy * dy).sqrt()
+            })
+            .collect::<Vec<_>>();
+        errors.sort_by(f64::total_cmp);
+        assert!(
+            errors[errors.len() / 2] < 0.35,
+            "median error {}",
+            errors[errors.len() / 2]
+        );
+        assert!(
+            matches
+                .iter()
+                .all(|correspondence| correspondence.forward_backward_error_px
+                    <= RIG_FEATURE_MAX_FORWARD_BACKWARD_ERROR),
+        );
+    }
+
+    #[test]
+    fn checkerboard_does_not_render_occluded_target_samples() {
+        let mut reference = Plane::new(8, 8);
+        let mut target = Plane::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                reference.data[y * 8 + x] = (x + y) as f32;
+                target.data[y * 8 + x] = 7.0 - x as f32 * 0.1;
+            }
+        }
+        let mut warp = Warp::from_fn(16, 16, 4, Some);
+        warp.visibility.fill(WarpVisibility::Occluded);
+        let (samples, width, _) = debug_checkerboard(&reference, &target, &warp, 1);
+        // x=1 is a target tile and must be black even though the mapping and
+        // target sample are both finite. x=2 is a reference tile and remains.
+        assert_eq!(samples[1], 0);
+        assert!(samples[2] > 0);
+        assert_eq!(width, 8);
+    }
 
     #[test]
     fn visibility_is_conservative_across_occlusion_cells() {

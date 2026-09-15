@@ -35,6 +35,28 @@ proprietary Lumen workflow. Linux is currently the primary supported platform.
 | Finished-image formats | 🟡 Fused 16-bit PNG; JPG and DNG planned | ✅ JPG and DNG |
 | Best fit | Open browsing, inspection, research, and per-module workflows | Finished-photo fusion and depth editing |
 
+Chiaro Fuse also includes an experimental `--rig-strategy anchor-graph` path
+for highly repetitive multi-camera scenes. It grows correspondence identity from
+leave-one-out-validated anchor constellations on an adaptive factory-overlap
+camera graph for up to four bounded rounds. From round two it performs a
+global structureless bundle solve over every observable camera parameter while
+re-triangulating the shared scene landmarks inside the objective. Candidate
+pairs default to ≥20% overlap of the smaller FOV; the graph targets
+connected degree-3+ topology and short cycles rather than a reference-camera
+star. Newly activated edges are directly searched in the native image data. The
+factory geometry is used as a wide bootstrap proposal; once an intermediate
+rig exists, sparse active edges are re-seeded against that capture-specific
+geometry while retaining mutual, appearance-margin, reverse-closure, and
+constellation-validation gates. An "active" edge is therefore never merely
+transitive bookkeeping. `--debug-dir` writes an SVG/CSV/DOT camera
+graph for inspection. See
+[`ANCHOR_GRAPH_ROUNDS.md`](ANCHOR_GRAPH_ROUNDS.md).
+
+The factory mirror-quadratic interpretation and CRA-derived focus/pupil model
+have also been audited against real held-out correspondences. See
+[`CALIBRATION_METADATA_AB.md`](CALIBRATION_METADATA_AB.md) for the recovered
+inverse-root semantics, A/B results, diagnostics, and conservative defaults.
+
 The fusion pipeline builds a calibrated multi-view cost field, uses
 semi-global matching to seed a finer direct-measurement pass, and accepts only
 finite depths reproduced by independent camera evidence. Distant, ambiguous,
@@ -90,3 +112,33 @@ Chiaro builds on Light L16 format research from
 [`gennyble/lri-rs`](https://github.com/gennyble/lri-rs), and
 [`dllu/lri-rs`](https://github.com/dllu/lri-rs). The latter recovered the
 original Protocol Buffer definitions from Lumen.
+
+### Anchor graph V5 diagnostics
+
+The V5 graph debugger distinguishes provisional direct edges from fully validated pair fields and reports preserved direct-seed attempt counts plus raw shared-track proposal support. See `ANCHOR_GRAPH_V5_FIX.md` for the local 2-core cycle rule and C4 onboarding changes.
+
+### Anchor graph V6 diagnostics
+
+The graph debugger distinguishes active propagation topology from the underlying direct-evidence graph. `PIPELINE_TRACE.txt` now reports raw held-out RMS together with median/p90/p95/p99, p99-trimmed RMS, >50 px tail count, and a per-camera held-out tail table. See `ANCHOR_GRAPH_V6_FIX.md`.
+
+### Matching/depth V7 experiment
+
+The V7 experimental patch adds capture-geometry reseeding for sparse anchor
+edges, projectively distinct multimode depth refinement, image-space depth
+uncertainty, local slanted-plane scoring, global rig-rank filtering, and
+geometry-gated high-frequency reconstruction. See
+[`MATCHING_DEPTH_V7.md`](MATCHING_DEPTH_V7.md).
+
+### Landmark-constellation V8 experiment
+
+V8 promotes the anchor graph to a persistent scene-landmark identity graph.
+Whole-image distinctiveness is used only to prioritize bootstrap markers; final
+identity is camera/FOV-conditional and requires local appearance, reverse
+closure, and an independently fitted multi-landmark constellation. From round
+two all observable camera parameters participate in one structureless bundle
+objective. Observation membership is reversible: leave-one-observation-out
+reprojection and leave-one-landmark-out constellation checks can demote one bad
+camera observation without deleting the physical landmark, while coherent bad
+subsets are split into alternate landmark identities rather than discarded. No
+capture-wide camera quality multiplier is used. See
+[`LANDMARK_CONSTELLATION_V8.md`](LANDMARK_CONSTELLATION_V8.md).

@@ -197,7 +197,22 @@ impl CanonicalPose {
     }
 }
 
-/// Hall code to mirror angle, see `docs/calibration-model.md`.
+/// Hall code to mirror angle, see `CALIBRATION_METADATA_AB.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MirrorAngleMode {
+    /// Existing interpretation of the six quadratic-model coefficients.
+    CurrentQuadratic,
+    /// Invert the calibrated angle-to-Hall quadratic and choose the stored
+    /// root branch on either side of its raw-Hall inflection value.
+    #[default]
+    CalibrationQuadraticInverse,
+    /// Piecewise-linear interpolation through the explicit measured
+    /// Hall-code/angle calibration pairs.
+    CalibrationPairsLinear,
+}
+
+/// Hall code to mirror angle, see `CALIBRATION_METADATA_AB.md`.
 #[derive(Clone, Debug)]
 pub struct MirrorActuator {
     pub mean_std_normalize: bool,
@@ -207,8 +222,17 @@ pub struct MirrorActuator {
     pub mirror_angle_scale: f64,
     /// Measured `(hall_code, angle_degrees)` pairs.
     pub hall_angle_pairs: Vec<(f64, f64)>,
-    /// Six coefficients forming two candidate quadratic branches.
+    /// Six coefficients from the factory quadratic model. The final three
+    /// encode normalized actuator position as a quadratic of normalized
+    /// mirror angle; the first three are retained for legacy A/B comparison.
     pub quadratic_coeffs: Vec<f64>,
+    pub use_rplus_for_left_segment: Option<bool>,
+    pub use_rplus_for_right_segment: Option<bool>,
+    pub inflection_value: Option<f64>,
+    /// Runtime-selectable interpretation used by camera resolution. This is
+    /// deliberately retained in the resolved calibration so every geometry
+    /// consumer in a fusion run uses the same A/B branch.
+    pub angle_mode: MirrorAngleMode,
 }
 
 impl MirrorActuator {
@@ -247,7 +271,7 @@ impl MirrorActuator {
     }
 
     /// Linear interpolation through the measured pairs.
-    fn interpolated_angle(&self, hall_code: f64) -> Result<f64> {
+    pub fn interpolated_angle(&self, hall_code: f64) -> Result<f64> {
         if self.hall_angle_pairs.len() < 2 {
             bail!("mirror calibration has fewer than two Hall/angle pairs");
         }
@@ -274,8 +298,10 @@ impl MirrorActuator {
         Ok(pairs[pairs.len() - 1].1)
     }
 
-    /// Mirror angle in degrees for a Hall code.
-    pub fn angle_for_hall(&self, hall_code: f64) -> Result<f64> {
+    /// Mirror angle in degrees using the legacy/current quadratic
+    /// interpretation, with measured-pair interpolation as its metadata
+    /// fallback when no usable quadratic is present.
+    pub fn quadratic_angle_for_hall(&self, hall_code: f64) -> Result<f64> {
         let Some(branch) = self.selected_branch() else {
             return self.interpolated_angle(hall_code);
         };
@@ -283,6 +309,63 @@ impl MirrorActuator {
         let x = self.normalized(hall_code);
         let normalized_angle = c[0] * x * x + c[1] * x + c[2];
         Ok(normalized_angle * self.mirror_angle_scale + self.mirror_angle_offset)
+    }
+
+    /// Intended protobuf semantics: the final three coefficients fit
+    /// normalized actuator position as a quadratic of normalized mirror
+    /// angle. `inflection_value` is the vertex converted back to raw Hall
+    /// units, and the rplus flags select which inverse root is physical on
+    /// either side.
+    pub fn inverse_quadratic_angle_for_hall(&self, hall_code: f64) -> Result<f64> {
+        if !self.mean_std_normalize
+            || self.quadratic_coeffs.len() != 6
+            || self.actuator_length_scale == 0.0
+            || self.mirror_angle_scale == 0.0
+        {
+            bail!("mirror calibration has no invertible normalized quadratic model");
+        }
+        let [a, b, c] = self.quadratic_coeffs[3..6] else {
+            unreachable!()
+        };
+        let normalized_hall = self.normalized(hall_code);
+        let normalized_angle = if a.abs() <= 1.0e-12 {
+            if b.abs() <= 1.0e-12 {
+                bail!("mirror quadratic is constant");
+            }
+            (normalized_hall - c) / b
+        } else {
+            let discriminant = b * b - 4.0 * a * (c - normalized_hall);
+            if !discriminant.is_finite() || discriminant < 0.0 {
+                bail!("mirror quadratic has no real inverse at Hall {hall_code}");
+            }
+            let root = discriminant.sqrt();
+            let use_rplus = if hall_code <= self.inflection_value.unwrap_or(hall_code) {
+                self.use_rplus_for_left_segment.unwrap_or(false)
+            } else {
+                self.use_rplus_for_right_segment.unwrap_or(false)
+            };
+            if use_rplus {
+                (-b + root) / (2.0 * a)
+            } else {
+                (-b - root) / (2.0 * a)
+            }
+        };
+        let angle = normalized_angle * self.mirror_angle_scale + self.mirror_angle_offset;
+        if !angle.is_finite() {
+            bail!("mirror quadratic produced a non-finite angle");
+        }
+        Ok(angle)
+    }
+
+    /// Mirror angle in degrees for a Hall code under the selected A/B model.
+    pub fn angle_for_hall(&self, hall_code: f64) -> Result<f64> {
+        match self.angle_mode {
+            MirrorAngleMode::CurrentQuadratic => self.quadratic_angle_for_hall(hall_code),
+            MirrorAngleMode::CalibrationQuadraticInverse => self
+                .inverse_quadratic_angle_for_hall(hall_code)
+                .or_else(|_| self.quadratic_angle_for_hall(hall_code)),
+            MirrorAngleMode::CalibrationPairsLinear => self.interpolated_angle(hall_code),
+        }
     }
 }
 
@@ -307,6 +390,25 @@ pub struct PolynomialDistortion {
     pub normalization: Vec2,
     /// `k1, k2, p1, p2, k3`.
     pub coeffs: Vec<f64>,
+}
+
+/// Chief-ray-angle calibration retained as optical metadata. It is not
+/// treated as a replacement for the Brown object-space distortion model.
+#[derive(Clone, Debug)]
+pub struct CraCalibration {
+    pub center: Option<Vec2>,
+    pub sensor_distance: Option<f64>,
+    pub exit_pupil_distance: Option<f64>,
+    pub pixel_size: Option<f64>,
+    pub lens_hall_code: Option<f64>,
+    pub distance_hall_ratio: Option<f64>,
+    /// Calibrated `(radial sensor position, chief-ray angle)` samples.
+    pub radial_samples: Vec<Vec2>,
+    /// Factory fitted curve coefficients, preserved as protobuf point pairs.
+    pub fitted_coefficients: Vec<Vec2>,
+    pub fit_cost: Option<f64>,
+    /// `[x, y, width, height]` in the calibration sensor raster.
+    pub valid_roi: Option<[i32; 4]>,
 }
 
 /// Colour calibration of one module for one illuminant.
@@ -504,9 +606,40 @@ pub struct CameraCalibration {
     pub intrinsics: Vec<IntrinsicsBundle>,
     pub canonical_pose: Option<CanonicalPose>,
     pub mirror: Option<MirrorModel>,
+    pub angle_optical_center_mapping: Option<AngleOpticalCenterMapping>,
     pub distortion: Option<PolynomialDistortion>,
+    pub cra: Option<CraCalibration>,
     pub color: Vec<ColorProfile>,
     pub vignetting: Option<Vignetting>,
+}
+
+/// Factory mapping from movable-mirror angle to the target optical-axis
+/// location in the adjacent wider reference camera's calibration raster.
+///
+/// The protobuf does not identify that reference camera. On L16 hardware the
+/// hierarchy is B -> A1 and C -> B4; callers must enforce that relationship
+/// before consuming the evaluated point.
+#[derive(Clone, Debug)]
+pub struct AngleOpticalCenterMapping {
+    pub center_start: Vec2,
+    pub center_end: Vec2,
+    pub angle_offset: f64,
+    pub t_scale: f64,
+    pub t_offset: f64,
+}
+
+impl AngleOpticalCenterMapping {
+    /// Optical-axis point in the parent reference raster for a mirror angle in
+    /// degrees. The factor of two follows planar-mirror reflection geometry.
+    pub fn center_for_angle(&self, angle_degrees: f64) -> Option<Vec2> {
+        let argument = 2.0 * angle_degrees.to_radians() + self.angle_offset;
+        let t = self.t_scale * argument.tan() + self.t_offset;
+        let point = [
+            self.center_start[0] + t * (self.center_end[0] - self.center_start[0]),
+            self.center_start[1] + t * (self.center_end[1] - self.center_start[1]),
+        ];
+        point.iter().all(|value| value.is_finite()).then_some(point)
+    }
 }
 
 /// How focus-dependent intrinsics behave outside the calibrated Hall range.
@@ -738,6 +871,19 @@ impl CalibrationDatabase {
                 if camera.mirror_type.is_none() {
                     camera.mirror_type = geometry.mirror_type.and_then(|t| t.enum_value().ok());
                 }
+                if camera.angle_optical_center_mapping.is_none()
+                    && let Some(mapping) = geometry.angle_optical_center_mapping.as_ref()
+                    && let (Some(center_start), Some(center_end)) =
+                        (mapping.center_start.as_ref(), mapping.center_end.as_ref())
+                {
+                    camera.angle_optical_center_mapping = Some(AngleOpticalCenterMapping {
+                        center_start: point2(center_start),
+                        center_end: point2(center_end),
+                        angle_offset: f64::from(mapping.angle_offset.unwrap_or(0.0)),
+                        t_scale: f64::from(mapping.t_scale.unwrap_or(0.0)),
+                        t_offset: f64::from(mapping.t_offset.unwrap_or(0.0)),
+                    });
+                }
                 let seen = seen_k.entry(name.clone()).or_default();
                 for bundle in &geometry.per_focus_calibration {
                     if let Some(k_mat) = bundle.intrinsics.as_ref().and_then(|i| i.k_mat.as_ref()) {
@@ -788,6 +934,25 @@ impl CalibrationDatabase {
                         center: point2(center),
                         normalization: point2(normalization),
                         coeffs: polynomial.coeffs.iter().map(|&c| f64::from(c)).collect(),
+                    });
+                }
+                if camera.cra.is_none()
+                    && let Some(cra) = geometry.distortion.as_ref().and_then(|d| d.cra.as_ref())
+                {
+                    camera.cra = Some(CraCalibration {
+                        center: cra.distortion_center.as_ref().map(point2),
+                        sensor_distance: cra.sensor_distance.map(f64::from),
+                        exit_pupil_distance: cra.exit_pupil_distance.map(f64::from),
+                        pixel_size: cra.pixel_size.map(f64::from),
+                        lens_hall_code: cra.lens_hall_code.map(f64::from),
+                        distance_hall_ratio: cra.distance_hall_ratio.map(f64::from),
+                        radial_samples: cra.cra.iter().map(point2).collect(),
+                        fitted_coefficients: cra.coeffs.iter().map(point2).collect(),
+                        fit_cost: cra.fit_cost.map(f64::from),
+                        valid_roi: cra
+                            .valid_roi
+                            .as_ref()
+                            .map(|roi| [roi.x(), roi.y(), roi.width(), roi.height()]),
                     });
                 }
             }
@@ -881,6 +1046,20 @@ fn mirror_model(system: &MirrorSystem, mapping: &MirrorActuatorMapping) -> Mirro
                 .as_ref()
                 .map(|q| q.model_coeffs.iter().map(|&c| f64::from(c)).collect())
                 .unwrap_or_default(),
+            use_rplus_for_left_segment: mapping
+                .quadratic_model
+                .as_ref()
+                .and_then(|q| q.use_rplus_for_left_segment),
+            use_rplus_for_right_segment: mapping
+                .quadratic_model
+                .as_ref()
+                .and_then(|q| q.use_rplus_for_right_segment),
+            inflection_value: mapping
+                .quadratic_model
+                .as_ref()
+                .and_then(|q| q.inflection_value)
+                .map(f64::from),
+            angle_mode: MirrorAngleMode::default(),
         },
     }
 }
@@ -903,6 +1082,11 @@ pub struct ModuleFocusState {
     pub contrast_distance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roi: Option<Vec2>,
+    /// Mirror Hall code recorded inside the autofocus result. This describes
+    /// the AF procedure and is diagnostic only; exposure geometry continues
+    /// to use `ModuleState::mirror_hall`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub af_mirror_hall: Option<f64>,
     pub lens_timeout: bool,
     pub mirror_timeout: bool,
 }
@@ -959,6 +1143,9 @@ pub fn module_states(messages: &LriMessages) -> Vec<ModuleState> {
                     roi: autofocus
                         .and_then(|info| info.roi_center.as_ref())
                         .map(point2),
+                    af_mirror_hall: autofocus
+                        .and_then(|info| info.mirror_position)
+                        .map(f64::from),
                     lens_timeout: autofocus
                         .and_then(|info| info.lens_timeout)
                         .unwrap_or(false),
@@ -1049,6 +1236,88 @@ mod tests {
             camera.focus_distance_for_hall(50.0, IntrinsicsMode::LinearHall),
             Some(500.0)
         );
+    }
+
+    #[test]
+    fn mirror_angle_model_switches_between_quadratic_and_measured_pairs() {
+        let mut actuator = MirrorActuator {
+            mean_std_normalize: true,
+            actuator_length_offset: 100.0,
+            actuator_length_scale: 10.0,
+            mirror_angle_offset: 40.0,
+            mirror_angle_scale: 2.0,
+            hall_angle_pairs: vec![(80.0, 36.0), (100.0, 40.0), (120.0, 45.0)],
+            // The second branch gives normalized angle -x, hence 37 degrees
+            // at Hall 85. The first measured-pair segment agrees initially.
+            quadratic_coeffs: vec![0.0, 0.0, 99.0, 0.0, -1.0, 0.0],
+            use_rplus_for_left_segment: Some(false),
+            use_rplus_for_right_segment: Some(true),
+            inflection_value: Some(0.0),
+            angle_mode: MirrorAngleMode::CurrentQuadratic,
+        };
+        let quadratic = actuator.angle_for_hall(85.0).unwrap();
+        assert!((quadratic - 37.0).abs() < 1.0e-12);
+        actuator.angle_mode = MirrorAngleMode::CalibrationPairsLinear;
+        let measured = actuator.angle_for_hall(85.0).unwrap();
+        assert!((measured - 37.0).abs() < 1.0e-12);
+
+        // A deliberately non-linear pair segment demonstrates the switch.
+        actuator.hall_angle_pairs[0].1 = 35.0;
+        assert!((actuator.angle_for_hall(85.0).unwrap() - 36.25).abs() < 1.0e-12);
+        actuator.angle_mode = MirrorAngleMode::CurrentQuadratic;
+        assert!((actuator.angle_for_hall(85.0).unwrap() - 37.0).abs() < 1.0e-12);
+        actuator.angle_mode = MirrorAngleMode::CalibrationQuadraticInverse;
+        assert!((actuator.angle_for_hall(85.0).unwrap() - 37.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn mirror_quadratic_inflection_confirms_angle_to_hall_direction() {
+        assert_eq!(
+            MirrorAngleMode::default(),
+            MirrorAngleMode::CalibrationQuadraticInverse
+        );
+        let actuator = MirrorActuator {
+            mean_std_normalize: true,
+            actuator_length_offset: 658.2000122070312,
+            actuator_length_scale: 207.60829162597656,
+            mirror_angle_offset: 40.70082473754883,
+            mirror_angle_scale: 4.018303394317627,
+            hall_angle_pairs: Vec::new(),
+            quadratic_coeffs: vec![
+                0.0,
+                0.0,
+                1.0,
+                0.005422568414360285,
+                -0.9999856948852539,
+                -0.0043380544520914555,
+            ],
+            use_rplus_for_left_segment: Some(false),
+            use_rplus_for_right_segment: Some(false),
+            inflection_value: Some(10230.3193359375),
+            angle_mode: MirrorAngleMode::CalibrationQuadraticInverse,
+        };
+        let [a, b, c] = actuator.quadratic_coeffs[3..6] else {
+            unreachable!()
+        };
+        let vertex_normalized_hall = c - b * b / (4.0 * a);
+        let vertex_hall = actuator.actuator_length_offset
+            - vertex_normalized_hall * actuator.actuator_length_scale;
+        assert!((vertex_hall - actuator.inflection_value.unwrap()).abs() < 0.001);
+        assert!((actuator.angle_for_hall(894.0).unwrap() - 45.2756615096).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn angle_optical_center_mapping_uses_reflected_double_angle() {
+        let mapping = AngleOpticalCenterMapping {
+            center_start: [10.0, 20.0],
+            center_end: [110.0, 220.0],
+            angle_offset: -std::f64::consts::FRAC_PI_2,
+            t_scale: 2.0,
+            t_offset: 0.25,
+        };
+        let point = mapping.center_for_angle(45.0).unwrap();
+        assert!((point[0] - 35.0).abs() < 1.0e-12);
+        assert!((point[1] - 70.0).abs() < 1.0e-12);
     }
 
     #[test]

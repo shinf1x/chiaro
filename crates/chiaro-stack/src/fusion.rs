@@ -346,6 +346,8 @@ pub fn fuse_night(
             height: module.raw.height,
             camera: module.camera.as_ref(),
             depth_evidence_enabled: true,
+            depth_evidence_reliability: 1.0,
+            angle_optical_center_prior_reference_px: None,
             nominal_focal_px: module
                 .camera
                 .as_ref()
