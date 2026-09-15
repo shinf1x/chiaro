@@ -48,8 +48,7 @@ factory geometry is used as a wide bootstrap proposal; once an intermediate
 rig exists, sparse active edges are re-seeded against that capture-specific
 geometry while retaining mutual, appearance-margin, reverse-closure, and
 constellation-validation gates. An "active" edge is therefore never merely
-transitive bookkeeping. `--debug-dir` writes an SVG/CSV/DOT camera
-graph for inspection. See
+transitive bookkeeping. See
 [`ANCHOR_GRAPH_ROUNDS.md`](ANCHOR_GRAPH_ROUNDS.md).
 
 The factory mirror-quadratic interpretation and CRA-derived focus/pupil model
@@ -112,14 +111,6 @@ Chiaro builds on Light L16 format research from
 [`gennyble/lri-rs`](https://github.com/gennyble/lri-rs), and
 [`dllu/lri-rs`](https://github.com/dllu/lri-rs). The latter recovered the
 original Protocol Buffer definitions from Lumen.
-
-### Anchor graph V5 diagnostics
-
-The V5 graph debugger distinguishes provisional direct edges from fully validated pair fields and reports preserved direct-seed attempt counts plus raw shared-track proposal support. See `ANCHOR_GRAPH_V5_FIX.md` for the local 2-core cycle rule and C4 onboarding changes.
-
-### Anchor graph V6 diagnostics
-
-The graph debugger distinguishes active propagation topology from the underlying direct-evidence graph. `PIPELINE_TRACE.txt` now reports raw held-out RMS together with median/p90/p95/p99, p99-trimmed RMS, >50 px tail count, and a per-camera held-out tail table. See `ANCHOR_GRAPH_V6_FIX.md`.
 
 ### Matching/depth V7 experiment
 

@@ -619,7 +619,6 @@ pub fn fuse_night(
         scale,
         &sources,
         depth_map.as_ref(),
-        None,
         &color_pipeline,
         &options.synth,
     )?;

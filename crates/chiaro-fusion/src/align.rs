@@ -1817,51 +1817,6 @@ fn photometric_gain(reference: &Plane, target: &Plane, warp: &Warp) -> Option<f3
     Some(ratios[ratios.len() / 2].clamp(0.25, 4.0))
 }
 
-/// Checkerboard composite of the reference luminance and the module warped
-/// into the reference frame, for visual alignment checks: with a good warp the
-/// tile boundaries are invisible; misalignment shows as broken edges. Both
-/// planes are half-resolution log luminance; `tile` is the tile size in plane
-/// pixels. Returns 16-bit grayscale samples and the plane size.
-pub fn debug_checkerboard(
-    reference: &Plane,
-    target: &Plane,
-    warp: &Warp,
-    tile: usize,
-) -> (Vec<u16>, usize, usize) {
-    let tile = tile.max(1);
-    let mut out = vec![0u16; reference.width * reference.height];
-    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-    for &v in &reference.data {
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
-    let range = (hi - lo).max(1e-6);
-    for y in 0..reference.height {
-        for x in 0..reference.width {
-            let use_target = ((x / tile) + (y / tile)) % 2 == 1;
-            let value = if use_target {
-                let rx = x as f32 * 2.0 + 0.5;
-                let ry = y as f32 * 2.0 + 0.5;
-                let sample = warp.sample(rx, ry);
-                if sample.visibility.blocks_sampling() || sample.confidence <= 0.0 {
-                    None
-                } else {
-                    sample
-                        .mapped
-                        .and_then(|q| target.sample((q[0] - 0.5) / 2.0, (q[1] - 0.5) / 2.0))
-                }
-            } else {
-                Some(reference.at(x, y))
-            };
-            out[y * reference.width + x] = match value {
-                Some(v) => (((v - lo) / range).clamp(0.0, 1.0) * 65535.0) as u16,
-                None => 0,
-            };
-        }
-    }
-    (out, reference.width, reference.height)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1948,26 +1903,6 @@ mod tests {
                 .all(|correspondence| correspondence.forward_backward_error_px
                     <= RIG_FEATURE_MAX_FORWARD_BACKWARD_ERROR),
         );
-    }
-
-    #[test]
-    fn checkerboard_does_not_render_occluded_target_samples() {
-        let mut reference = Plane::new(8, 8);
-        let mut target = Plane::new(8, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                reference.data[y * 8 + x] = (x + y) as f32;
-                target.data[y * 8 + x] = 7.0 - x as f32 * 0.1;
-            }
-        }
-        let mut warp = Warp::from_fn(16, 16, 4, Some);
-        warp.visibility.fill(WarpVisibility::Occluded);
-        let (samples, width, _) = debug_checkerboard(&reference, &target, &warp, 1);
-        // x=1 is a target tile and must be black even though the mapping and
-        // target sample are both finite. x=2 is a reference tile and remains.
-        assert_eq!(samples[1], 0);
-        assert!(samples[2] > 0);
-        assert_eq!(width, 8);
     }
 
     #[test]

@@ -139,10 +139,7 @@ Common options include:
   (0.5 m to 10 km by default);
 - `--no-highlight-correction` disables only the final display-oriented smooth
   shoulder; use `--highlight-recovery none` to preserve the RAW mosaic too;
-- `--color display|linear` controls output encoding; and
-- `--debug-dir` writes per-module alignment checkerboards, luminance/colour
-  source-ownership maps, quantitative inverse-depth, log-colour depth, and
-  colour-coded provenance control grids.
+- `--color display|linear` controls output encoding.
 
 Factory colour records can be inspected independently:
 

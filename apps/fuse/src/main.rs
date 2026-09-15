@@ -550,11 +550,6 @@ struct Cli {
     #[arg(long)]
     no_flat_field: bool,
 
-    /// Write a visual trace of physical, measured, rig-candidate and final
-    /// depth warps, plus confidence/visibility/ownership diagnostics.
-    #[arg(long, value_name = "DIRECTORY")]
-    debug_dir: Option<PathBuf>,
-
     /// Disable the bundled universal hot-pixel model.
     #[arg(long)]
     no_universal_hotpixel_model: bool,
@@ -595,7 +590,6 @@ fn main() -> Result<()> {
         cfa_held_out: cli.cfa_held_out.clone(),
         threads: cli.threads,
         flat_field: !cli.no_flat_field,
-        debug_dir: cli.debug_dir.clone(),
         ..FusionOptions::default()
     };
     options.align.refine = !cli.no_refine;
@@ -1177,32 +1171,6 @@ fn main() -> Result<()> {
             },
         );
     }
-    if let Some(audit) = &report.dense_depth_audit {
-        println!(
-            "dense-depth A/B audit (selected: {}; common anchor: {}):",
-            audit.selected_path, audit.common_anchor,
-        );
-        for (name, branch) in [("factory", &audit.factory), ("candidate", &audit.candidate)] {
-            println!(
-                "  {name:<9} {}/{} measured ({:.2}%), {} regularized, {} accepted target views, available {}; funnel {} selected -> {} neighbour -> {} component, {} supported fallback",
-                branch.measured_nodes,
-                branch.tested_nodes,
-                branch.reconstructed_fraction * 100.0,
-                branch.regularized_nodes,
-                branch.accepted_views,
-                branch.depth_available,
-                branch.direct_selected_nodes,
-                branch.neighbour_consistent_nodes,
-                branch.component_consistent_nodes,
-                branch.far_supported_nodes,
-            );
-        }
-        println!(
-            "  candidate-factory: {:+} measured nodes, {:+.2} percentage points",
-            audit.candidate.measured_nodes as i64 - audit.factory.measured_nodes as i64,
-            (audit.candidate.reconstructed_fraction - audit.factory.reconstructed_fraction) * 100.0,
-        );
-    }
     for module in &report.modules {
         let depth_support = module.depth.as_ref().map(|depth| {
             let unknown_fraction = if depth.tested_nodes == 0 {
@@ -1403,12 +1371,6 @@ fn main() -> Result<()> {
             |bytes| format!(", peak RSS {:.1} MiB", bytes as f64 / 1_048_576.0),
         ),
     );
-    if let Some(debug_dir) = &cli.debug_dir {
-        println!(
-            "visual pipeline trace: {}",
-            debug_dir.join("index.html").display()
-        );
-    }
     Ok(())
 }
 

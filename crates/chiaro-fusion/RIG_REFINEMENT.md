@@ -233,25 +233,17 @@ projection is not evidence that these bounds were exceeded. Only a residual
 outside the correct depth-conditioned prediction indicates that the affected
 camera cannot bootstrap itself into the optimizer.
 
-The physical population is used only if it contains at least 80 usable tracks.
-Debug-report runs additionally require 20 validation tracks after the spatial
-split. Otherwise the optimizer receives the finest reliable legacy
+The physical population is used only if it contains at least 80 usable tracks
+and 20 validation tracks after the spatial split. Otherwise the optimizer receives the finest reliable legacy
 correspondence population as a deterministic fallback. The JSON report states
 which source was actually used.
 
-## 5. Debug-only fit/validation split and what held-out RMS means
+## 5. Fit/validation split and what held-out RMS means
 
-When `--debug-dir` is supplied, tracks are split by deterministic hashes of
-256x256 full-resolution reference blocks. The validation fraction is 20%, and
-all tracks in one block go to the same side. Validation tracks never contribute
-to parameter observability, optimization, or fit-track membership updates.
-
-Without `--debug-dir`, there is no held-out split: all usable tracks contribute
-to the production estimate, `validation_evaluated` is false, and held-out
-numeric fields remain zero-valued storage rather than measured zero error. This
-policy is tied to whether diagnostics were requested, not to Rust's debug or
-release compilation profile; a release binary with `--debug-dir` still creates
-the independent audit split.
+Tracks are always split by deterministic hashes of 256x256 full-resolution
+reference blocks. The validation fraction is 20%, and all tracks in one block
+go to the same side. Validation tracks never contribute to parameter
+observability, optimization, or fit-track membership updates.
 
 The reported held-out RMS does require a depth, but it does not use a depth map
 estimated from the fit region. For each held-out multi-view track and for each
@@ -309,8 +301,7 @@ so sparse views cannot move the 3D points of well-constrained cameras.
 
 ## 7. Robust solve and persistent membership
 
-The solve uses the fit population—all usable tracks in production, or only the
-fit side of the split in a debug-report run. It begins with a calibrated
+The solve uses only the fit side of the spatial split. It begins with a calibrated
 epipolar/coplanarity objective and positive-depth checks. That initialization
 is retained only if it improves the actual finite-depth objective.
 
@@ -333,13 +324,13 @@ The physical candidate is accepted only if:
 - fit reprojection RMS decreases;
 - at least 80% of fit tracks remain at positive depth;
 - no fitted parameter reaches 98% of its bound;
-- in debug-report runs, held-out RMS improves by at least 0.5%, at least 80% of
+- held-out RMS improves by at least 0.5%, at least 80% of
   held-out tracks remain at positive depth, and no affected camera with at
   least 12 validation samples regresses by more than 5% plus 0.02 pixels.
 
 Held-out p95 reference lines of 6 reference-equivalent pixels and 0.10 degrees
-remain visible in debug diagnostics, but they are not absolute truth and do not
-veto a candidate that improves the independent split.
+are recorded in the JSON report, but they are not absolute truth and do not veto
+a candidate that improves the independent split.
 
 After acceptance, Chiaro installs the candidate rig and reruns the existing
 residual image alignment. The report compares patch-supported correction
@@ -373,36 +364,6 @@ The fusion report records:
   any non-vetoing warning;
 - the exact acceptance or fallback reason.
 
-### Visual pipeline trace
-
-Passing `--debug-dir DIRECTORY` also preserves the geometry at every destructive
-pipeline handoff and writes `DIRECTORY/index.html` for side-by-side inspection.
-Each non-reference camera has five checkerboards:
-
-1. `01-factory-physical`: the uncorrected physical projection at infinity;
-2. `02-measured-residual`: the image-measured residual alignment;
-3. `03-rig-candidate-physical`: the proposed rig even when validation rejects it;
-4. `04-active-pre-depth`: the accepted or fallback warp entering dense depth;
-5. `05-final-depth`: the warp actually handed to synthesis;
-6. `05a-factory-depth-audit`: factory `PhysicalRig` dense depth, forced without
-   `WarpSeeded` fallback;
-7. `05b-candidate-depth-audit`: proposed candidate `PhysicalRig` dense depth,
-   also forced even when rig validation rejected the candidate.
-
-The two audit branches exist only when a debug directory is requested. They
-both use stage 02 as the same perpendicular epipolar proposal/output fallback
-and isolate the effect of factory versus candidate finite-depth geometry
-without changing stage 05 or synthesis. When stage 05 is already the successful factory
-`PhysicalRig` solve, `05a` reuses that exact result; otherwise it runs on cloned
-alignment state. The candidate branch always runs independently. Each directory
-contains its own depth inverse/provenance/visualization images and per-camera
-checkerboard, confidence, visibility and displacement maps. The JSON and text
-reports record their measured/regularized node counts and per-camera support.
-The whole-run diagnostics additionally contain
-`rig-held-out-observations.svg`, which plots every paired held-out observation
-and highlights the global p95 tail, plus `rig-held-out-observations.csv` with
-the exact factory/candidate pixel, reference-equivalent and angular residuals.
-
 The dense physical stage does not treat stage 4 as an infinity observation. A
 scene-fitted homography already contains parallax from whichever surfaces
 dominated its fit; adding physical parallax to it would double-count that
@@ -431,13 +392,6 @@ Visibility is green for directly visible, amber for in-sensor but unknown, red
 for occluded, magenta for a depth boundary, and black for outside the target
 sensor or undefined. White confidence in the two pre-depth physical stages is
 only binary in-sensor projection validity, not measured alignment confidence.
-
-In debug-report runs, `rig-held-out-residual-field.svg` plots the factory and
-candidate held-out residual vectors over the image field. `PIPELINE_TRACE.txt`
-summarizes the rig,
-dense-depth, source-admission, rejection, ownership, Joint-CFA and resolution
-metrics without requiring manual JSON inspection. The existing depth and source
-ownership images remain linked from the HTML index.
 
 The rig summary also reports the actual evaluated depth hypotheses per
 reference candidate, a `level:candidate-count` refinement histogram, and both

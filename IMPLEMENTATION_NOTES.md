@@ -36,8 +36,7 @@ This tree adds `--rig-strategy anchor-graph` without replacing the existing
   - CLI selection, camera-graph budget and convergence controls;
   - per-round console diagnostics.
 - `crates/chiaro-fusion/src/pipeline.rs`
-  - `rig-anchor-camera-graph.svg`, `.csv`, and `.dot` debug output;
-  - camera graph embedded into the debug gallery.
+  - anchor-graph integration with the fusion pipeline.
 
 ## Defaults
 
@@ -93,8 +92,7 @@ Then compare the same capture:
 target/release/chiaro-fuse capture.lri -o physical.png \
   --calibration calibration.lri \
   --calibration zoom_calib_v0.lri \
-  --rig-strategy physical \
-  --debug-dir debug-physical
+  --rig-strategy physical
 
 target/release/chiaro-fuse capture.lri -o anchor.png \
   --calibration calibration.lri \
@@ -105,6 +103,5 @@ target/release/chiaro-fuse capture.lri -o anchor.png \
   --rig-anchor-initial-edges 18 \
   --rig-anchor-max-edges 24 \
   --rig-anchor-min-degree 3 \
-  --rig-anchor-edges-per-round 3 \
-  --debug-dir debug-anchor
+  --rig-anchor-edges-per-round 3
 ```

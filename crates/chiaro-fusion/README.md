@@ -203,23 +203,6 @@ a robust linear fit, and a strongly regularized quadratic candidate. Candidate
 fits remain diagnostic unless held-out accuracy, neutrals, inter-module
 agreement, and real-image stability all improve.
 
-With a debug directory, `<camera>_highlight-uncertainty.png` marks recovered
-RAW samples by inverse confidence in addition to the depth, alignment, and
-source-ownership diagnostics.
-
-Set `FusionOptions::debug_dir` to write per-module alignment checkerboards.
-Continuous scene edges across checkerboard boundaries are a quick visual check
-of the resulting warp. The same directory receives `source-luminance-ownership.png`
-and `source-color-ownership.png`; their camera-to-colour legend and exact owner
-fractions are recorded under `synthesis.source_contributions` in the JSON
-report. It also receives `depth-inverse.png`, `depth-visualization.png`, and
-`depth-provenance.png`. The first is quantitative 16-bit inverse depth; the
-second is a log-scaled far-blue to near-red rendering.
-The provenance image marks directly remeasured nodes green, a regularized
-finite node amber if one is explicitly supplied, global/infinite fallback blue,
-and unsupported nodes black. With default settings, finite final nodes are
-green: SGM proposes where to search but cannot create final depth by itself.
-
 See [Chiaro Fuse](../../apps/fuse/README.md) for command-line usage.
 See [capture-specific physical rig refinement](RIG_REFINEMENT.md) for the
 parameterization, acceptance gates, and initial real-capture validation.

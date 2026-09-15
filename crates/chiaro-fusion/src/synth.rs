@@ -22,9 +22,7 @@ use anyhow::{Result, bail};
 use chiaro::lri::NoiseModel;
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryState};
-use chiaro_hotpixel_core::png16::{
-    PngColor, write_png16_streaming_atomic_with_level_profiled, write_rgb16_native_atomic,
-};
+use chiaro_hotpixel_core::png16::{PngColor, write_png16_streaming_atomic_with_level_profiled};
 use std::path::Path;
 
 use crate::align::{ModuleAlignment, Warp, WarpSample, WarpVisibility};
@@ -567,8 +565,6 @@ pub struct SourceContributionReport {
     pub fusion_enabled: bool,
     /// Linear optical sampling density relative to the reference module.
     pub magnification: f32,
-    /// RGB legend colour used by the optional ownership diagnostics.
-    pub diagnostic_rgb: [u8; 3],
     /// Fraction of covered output pixels where this source supplied the
     /// largest pre-normalisation luminance weight.
     pub luminance_owner_fraction: f32,
@@ -938,8 +934,6 @@ pub struct SynthReport {
     /// local-detail contradictions. Agreeing modules remain fully blended.
     pub edge_rejected_fraction: f32,
     pub source_contributions: Vec<SourceContributionReport>,
-    /// Reference/output pixel stride of the ownership diagnostics.
-    pub ownership_diagnostic_step: usize,
     pub timings: SynthTimingReport,
 }
 
@@ -1140,7 +1134,6 @@ pub fn synthesize(
     scale: f32,
     sources: &[SynthSource<'_>],
     depth_map: Option<&DenseDepthMap>,
-    diagnostic_dir: Option<&Path>,
     color: &ColorPipeline,
     options: &SynthOptions,
 ) -> Result<SynthReport> {
@@ -1164,20 +1157,6 @@ pub fn synthesize(
     }
     let width = (crop.width * scale).round().max(1.0) as usize;
     let height = (crop.height * scale).round().max(1.0) as usize;
-    const OWNERSHIP_STEP: usize = 8;
-    let ownership_columns = width.div_ceil(OWNERSHIP_STEP);
-    let ownership_rows = height.div_ceil(OWNERSHIP_STEP);
-    let ownership_len = if diagnostic_dir.is_some() {
-        ownership_columns * ownership_rows
-    } else {
-        0
-    };
-    let luminance_ownership = (0..ownership_len)
-        .map(|_| std::sync::atomic::AtomicUsize::new(usize::MAX))
-        .collect::<Vec<_>>();
-    let color_ownership = (0..ownership_len)
-        .map(|_| std::sync::atomic::AtomicUsize::new(usize::MAX))
-        .collect::<Vec<_>>();
     let covered = std::sync::atomic::AtomicUsize::new(0);
     let edge_checked = std::sync::atomic::AtomicUsize::new(0);
     let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
@@ -1672,23 +1651,6 @@ pub fn synthesize(
                         if let Some((owner, _)) = color_owner {
                             local_source_counters[owner].color_owner += 1;
                         }
-                        if !luminance_ownership.is_empty()
-                            && u % OWNERSHIP_STEP == OWNERSHIP_STEP / 2
-                            && v % OWNERSHIP_STEP == OWNERSHIP_STEP / 2
-                        {
-                            let diagnostic_index =
-                                (v / OWNERSHIP_STEP) * ownership_columns + u / OWNERSHIP_STEP;
-                            if diagnostic_index < luminance_ownership.len() {
-                                luminance_ownership[diagnostic_index].store(
-                                    luminance_owner.map_or(usize::MAX, |(owner, _)| owner),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                color_ownership[diagnostic_index].store(
-                                    color_owner.map_or(usize::MAX, |(owner, _)| owner),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                        }
                         let mut target_luminance = luminance / luminance_weight;
                         if let Some(reconstructed) = resolution.finish() {
                             local_resolution_counters.candidates += 1;
@@ -1891,21 +1853,6 @@ pub fn synthesize(
         },
     )?;
 
-    if let Some(directory) = diagnostic_dir {
-        write_ownership_diagnostic(
-            &directory.join("source-luminance-ownership.png"),
-            ownership_columns,
-            ownership_rows,
-            &luminance_ownership,
-        )?;
-        write_ownership_diagnostic(
-            &directory.join("source-color-ownership.png"),
-            ownership_columns,
-            ownership_rows,
-            &color_ownership,
-        )?;
-    }
-
     let mut modules = usable
         .iter()
         .map(|(_, source)| (source.alignment.name.clone(), source.magnification))
@@ -1947,8 +1894,7 @@ pub fn synthesize(
     let source_contributions = usable
         .iter()
         .zip(&source_counters)
-        .enumerate()
-        .map(|(source_index, ((_, source), counters))| {
+        .map(|((_, source), counters)| {
             let sampled = counters.sampled.load(std::sync::atomic::Ordering::Relaxed);
             let visibility_checked = counters
                 .visibility_checked
@@ -1960,7 +1906,6 @@ pub fn synthesize(
                 camera: source.alignment.name.clone(),
                 fusion_enabled: source.fusion_enabled,
                 magnification: source.magnification,
-                diagnostic_rgb: ownership_color(source_index),
                 luminance_owner_fraction: fraction(
                     counters
                         .luminance_owner
@@ -2193,85 +2138,12 @@ pub fn synthesize(
             edge_checked.load(std::sync::atomic::Ordering::Relaxed),
         ),
         source_contributions,
-        ownership_diagnostic_step: OWNERSHIP_STEP,
         timings: SynthTimingReport {
             png_wall_seconds: png_timings.total_seconds,
             render_cpu_seconds: png_timings.render_cpu_seconds,
             filter_deflate_cpu_seconds: png_timings.filter_deflate_cpu_seconds,
         },
     })
-}
-
-fn ownership_color(index: usize) -> [u8; 3] {
-    const PALETTE: [[u8; 3]; 16] = [
-        [230, 25, 75],
-        [60, 180, 75],
-        [0, 130, 200],
-        [245, 130, 48],
-        [145, 30, 180],
-        [70, 240, 240],
-        [240, 50, 230],
-        [210, 245, 60],
-        [250, 190, 190],
-        [0, 128, 128],
-        [230, 190, 255],
-        [170, 110, 40],
-        [255, 250, 200],
-        [128, 0, 0],
-        [170, 255, 195],
-        [128, 128, 0],
-    ];
-    PALETTE[index % PALETTE.len()]
-}
-
-fn write_ownership_diagnostic(
-    path: &Path,
-    width: usize,
-    height: usize,
-    ownership: &[std::sync::atomic::AtomicUsize],
-) -> Result<()> {
-    let mut labels = ownership
-        .iter()
-        .map(|owner| owner.load(std::sync::atomic::Ordering::Relaxed))
-        .collect::<Vec<_>>();
-    // Ownership is decided per sampled pixel and is intentionally sensitive
-    // to fine texture. Two small majority passes make the diagnostic readable
-    // as regions without changing any synthesis weights.
-    for _ in 0..2 {
-        let source = labels.clone();
-        for row in 0..height {
-            for column in 0..width {
-                let mut counts = [0u8; 16];
-                for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        let (x, y) = (column as i32 + dx, row as i32 + dy);
-                        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-                            continue;
-                        }
-                        let label = source[y as usize * width + x as usize];
-                        if label < counts.len() {
-                            counts[label] += 1;
-                        }
-                    }
-                }
-                if let Some((label, &count)) = counts.iter().enumerate().max_by_key(|(_, n)| *n)
-                    && count >= 3
-                {
-                    labels[row * width + column] = label;
-                }
-            }
-        }
-    }
-    let mut pixels = Vec::with_capacity(width * height * 3);
-    for index in labels {
-        let color = if index == usize::MAX {
-            [0; 3]
-        } else {
-            ownership_color(index).map(|channel| u16::from(channel) * 257)
-        };
-        pixels.extend(color);
-    }
-    write_rgb16_native_atomic(path, width, height, &pixels)
 }
 
 fn fraction(count: usize, total: usize) -> f32 {
