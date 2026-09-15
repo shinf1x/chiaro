@@ -15,17 +15,21 @@ command-line application.
    pyramid for larger low-confidence regions. One bit of fractional RAW
    precision is reserved as radiometric headroom above sensor white.
 2. Resolve the factory camera model and obtain robust image correspondences.
-   A bounded capture-specific physical solve may refine observable camera
-   orientation and movable-mirror state, but is accepted only after independent
-   geometric validation, positive-depth checks, and a downstream residual-
-   correction gate. Project each accepted module into a reference view, refine
-   the remaining global alignment with image correlation, build a dense calibrated
-   inverse-depth cost field, and regularise coarse search hypotheses with
-   edge-aware eight-direction semi-global matching. A finer 4-pixel grid then
-   independently remeasures every accepted node with small or adaptive
-   bilateral support; coarse values and holes are never copied into the final
-   map. Each camera subsequently refines the shared depth continuously and
-   applies a bounded residual correction.
+   The selected rig strategy may refine observable orientation, mirror,
+   intrinsics, distortion, centre, and raster parameters within configured
+   bounds. A deterministic spatial split keeps validation tracks out of the
+   fit. Physical and anchor-graph candidates must pass the configured geometric
+   gates; a solved latent-graph candidate remains the single active rig and
+   reports validation failures as warnings. An unresolved latent solve is an
+   error rather than a factory-rig fallback. The selected model seeds a fresh
+   residual image alignment. The pipeline then builds a calibrated inverse-depth
+   cost field and regularises its coarse hypotheses with edge-aware
+   eight-direction semi-global matching. A finer grid (4 px by default) performs
+   direct measurement. Where that measurement is unresolved, coarse SGM and
+   completion may retain reduced-confidence regularized depth only at tested
+   nodes connected to direct evidence; untested regions remain holes and
+   unanchored components are rejected. Each camera subsequently refines the
+   shared depth continuously and applies a bounded residual correction.
 3. When requested, blend a low-confidence spatial highlight estimate toward a
    donor field only when at least two accepted, aligned modules provide
    consistent unclipped RAW radiance. Donors are regularised within each CFA
@@ -78,30 +82,24 @@ command-line application.
    sensor-white shoulder neutralises false colour from unequally clipped raw
    channels without introducing a hard highlight boundary.
 
-Every run also writes a `.fusion.json` report with physical-rig fit/validation,
-triangulation, correction and fallback diagnostics, alignment, RAW highlight
+Every run also writes a `.fusion.json` report with rig fit/validation,
+triangulation, correction and selection diagnostics, alignment, RAW highlight
 confidence/counts, cleanup availability and correction statistics, per-module
 crosstalk fit/validation measurements, the CCT prior and selected colour-profile
 weights, best/runner-up array scores, evidence coverage and confidence,
 report-only forced-profile chroma distributions and normalized disagreement,
 coverage, photometric, and timing diagnostics.
 
-The CCT-only and array-aware selectors and forced A/F11 modes are retained as
-experimental diagnostics. On the initial four-capture validation set, F11
-slightly reduced median chroma relative to D65 in every capture, while its
-inter-module disagreement advantage became small or reversed after normalizing
-by scene chroma. A increased both chroma and disagreement substantially. Thus
-none of the experimental choices has yet demonstrated a consistent improvement
-over D65, so the original fixed-D65 path remains the production default pending
-a broader calibrated corpus.
+The CCT-only and array-aware selectors and forced A/F11 modes are experimental.
+The supplied fixed-D65 profile remains the default.
 
 ## Calibration
 
-Captures embed part of the camera model and take priority when their calibration
-is newer. Device `calibration.lri` and `zoom_calib_v0.lri` files fill important
-gaps, including mirror-aiming data. Supply both whenever possible; alignment is
-likely to be poor without them. An overlay is merged only when its physical
-device id matches the capture.
+Captures embed part of the camera model and their headers take priority. Device
+`calibration.lri` and `zoom_calib_v0.lri` files fill missing records, including
+mirror-aiming data. Supply both whenever possible; alignment is likely to be
+poor without them. An overlay is merged only when its physical-device id
+matches the capture.
 
 Focus-dependent intrinsics and object-space focus distance are interpolated in
 lens Hall space and continued linearly just beyond the factory samples,
@@ -121,19 +119,18 @@ cryptographically to the factory map.
 
 - **Native** renders approximately the reference sensor's 13 MP resolution.
 - **Maximum** uses the finest participating module that covers the view, capped
-  by a caller-provided megapixel limit. The applications default this cap to
-  82 MP so the measured A/B magnification is not truncated below the L16's
-  approximately 81.6 MP wide-output class.
+  by a caller-provided megapixel limit.
 - **Scale** specifies canvas pixels per reference pixel directly.
+
+`SynthOptions` defaults to Native. Chiaro Fuse and Chiaro Gallery select Maximum
+by default with an 82 MP cap.
 
 The output is cropped to the focal length framed by the photographer by
 default. Full-reference rendering can be requested instead. Monochrome modules
 contribute luminance unless explicitly excluded.
 
-Resolution reconstruction is classical and deterministic: it uses no learned
-model or GPU. Local registration renders one half-resolution matching buffer
-at a time, and synthesis streams narrow output bands, so an 82 MP canvas does
-not require an 82 MP floating-point output allocation.
+Resolution reconstruction is deterministic and CPU-only. Synthesis streams
+narrow output bands instead of retaining a frame-sized floating-point canvas.
 
 `ResolutionReconstruction::JointCfa` is the standard-fusion default. It retains
 physical CFA phase, sensor position, calibrated noise, highlight provenance,
@@ -157,12 +154,13 @@ per solve, iterations, and physical sampling-phase spread.
 ## Important limitations
 
 - Alignment uses a global homography followed by classical dense multi-view
-  reconstruction. Textureless or contradictory areas remain explicit
-  global/far fallback rather than receiving spatially completed depth. Small
-  disconnected finite-depth islands are rejected as chance correlations; the
-  filter never grows a measured surface into an unsupported region. A finite
-  label must also improve measurably on the fitted global warp, preventing a
-  shallow distant-scene cost curve from being reported as physical depth.
+  reconstruction. Directly unresolved but observable areas may receive
+  reduced-confidence regularized depth only when connected to direct evidence;
+  untested areas remain explicit global/far fallback. Small disconnected
+  finite-depth islands and unanchored regularized components are rejected. A
+  finite label must also improve measurably on the fitted global warp,
+  preventing a shallow distant-scene cost curve from being reported as physical
+  depth.
   The default finite search spans 0.5 m to 10 km so distant landscape detail
   is not collapsed onto a 100 m boundary.
   Per-camera consistency either applies a directly supported finite surface,
@@ -205,9 +203,9 @@ agreement, and real-image stability all improve.
 
 See [Chiaro Fuse](../../apps/fuse/README.md) for command-line usage.
 See [capture-specific physical rig refinement](RIG_REFINEMENT.md) for the
-parameterization, acceptance gates, and initial real-capture validation.
-See [the real-capture CFA experiment](CFA_EXPERIMENT.md) for the current
-held-out measurements, ablations, resource costs, and production decision.
+parameterization and validation metrics.
+See [the real-capture CFA experiment](CFA_EXPERIMENT.md) for held-out
+measurements, ablations, and resource costs.
 
 ## Tests
 

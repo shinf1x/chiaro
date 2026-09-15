@@ -26,9 +26,9 @@ illuminants, selected weights, confidence, and whether a held-out-validated
 Macbeth refit was used. `array_color` records the CCT prior, selected simplex
 blend, best and runner-up scores, reliable sample/module/spatial coverage, and
 fallback reason when the array evidence is weak. `rig_refinement` records the
-bounded physical fit, fixed validation population, positive-depth and
-conditioning diagnostics, residual-vector field, downstream alignment gate,
-and selection/validation status. A completed `latent-graph` solve is always
+bounded rig fit, fixed validation population, positive-depth and conditioning
+diagnostics, residual-vector field, downstream alignment comparison, and
+selection/validation status. A completed `latent-graph` solve is always
 selected; validation failures remain visible as warnings instead of causing a
 factory-rig fallback.
 
@@ -48,11 +48,11 @@ Common options include:
 - `--cleanup-profile` applies an optional `.chiaro-cleanup` calibration and
   records per-module availability and correction statistics in the report;
 - `--resolution-reconstruction resample|multi-camera|joint-cfa` selects ordinary
-  pull resampling, the legacy locally aligned multiscale reconstruction, or
+  pull resampling, locally aligned multiscale reconstruction, or
   the default pre-demosaic Joint-CFA solver. Joint CFA solves calibrated
   physical samples jointly and falls back to the production MultiCamera result
   wherever independent local support is insufficient. MultiCamera remains
-  explicitly selectable for comparison and rollback;
+  explicitly selectable for comparison;
 - `--joint-cfa-solve-flat` is a diagnostic-only switch that restores solver
   attempts where the reference structure gate guarantees a zero-weight update;
   ordinary Joint-CFA rendering skips those attempts and reports the saved
@@ -79,9 +79,9 @@ Common options include:
   capture-specific residual does not improve held-out overlap measurements;
 - `--exclude-mono` omits monochrome luminance;
 - `--no-depth` keeps the global homography for depth-refinement comparisons;
-- `--no-rig-refine` disables the bounded capture-specific physical camera and
-  mirror refinement while retaining the existing residual image alignment;
-- `--rig-strategy physical|anchor-graph|latent-graph` selects the V10 physical
+- `--no-rig-refine` disables capture-specific rig optimization while retaining
+  residual image alignment;
+- `--rig-strategy physical|anchor-graph|latent-graph` selects the physical
   matcher, the persistent anchor/constellation graph, or the latent
   multi-hypothesis correspondence strategy. `latent-graph` merges common
   reference features into multi-view tracks, retains target-side self-similar
@@ -91,7 +91,7 @@ Common options include:
   candidate is the only active rig: it is not raced against the physical
   strategy and is not replaced by factory geometry when validation warns. If
   latent optimization cannot produce a candidate, fusion fails explicitly.
-  Anchor-graph mode uses the full
+  `physical` remains the CLI default. Anchor-graph mode uses the full
   available 2x2-CFA-cell luminance raster (not the older /4 neural raster),
   performs up to four iterative identity-growth rounds, re-triangulates and
   refits orientation between rounds, and keeps factory metric centres/mirror
@@ -99,7 +99,7 @@ Common options include:
 - `--rig-latent-candidates`, `--rig-latent-rounds`,
   `--rig-latent-min-similarity`, `--rig-latent-epipolar-band-px`, and
   `--rig-latent-neighbours` expose the main latent-assignment controls.
-  LatentGraph now carries a 15k response-sorted reference feature budget per
+  LatentGraph carries a 15k response-sorted reference feature budget per
   camera pair (with a high-recall retry for sparse high-magnification views);
 - `--rig-latent-membership-min-camera-observations`,
   `--rig-latent-membership-min-camera-fraction`,
@@ -169,7 +169,7 @@ baseline and withholds one non-reference module:
 
 ```bash
 chiaro-fuse capture.lri -o held-out-B2.png \
-  --resolution-reconstruction multi-camera \
+  --resolution-reconstruction joint-cfa \
   --cfa-held-out B2
 ```
 
@@ -193,16 +193,20 @@ analysis without using in-sample contributor residuals as quality evidence.
 Fusion builds a calibrated multi-camera inverse-depth cost field after global
 alignment. Eight-direction semi-global matching proposes coarse hypotheses;
 every accepted final node is independently remeasured on a finer grid using
-small or adaptive edge-aware support. Missing regions are not completed.
-Continuous per-camera depth and bounded residual refinement follow. Warp
+small or adaptive edge-aware support. Where direct measurement is unresolved,
+coarse SGM and edge-aware completion may retain reduced-confidence regularized
+depth only at tested, observable nodes connected to direct evidence; untested
+regions remain holes. Continuous per-camera depth and bounded residual
+refinement follow. Warp
 discontinuities are suppressed at visible scene edges, and robust
 reference-guided synthesis rejects contradictory edge samples while retaining
 agreeing module detail. Luminance and colour consistency are evaluated
 separately so defocused chromatic fringes cannot survive merely by matching
 brightness. Focus distance interpolated from the captured lens position and
 supported near-side residual parallax suppress a magnified source focused
-behind nearby content. Fine structure stays reference-anchored unless a sharper source
-reproduces the same direction, in which case the zoom module can own the detail.
+behind nearby content. Fine structure stays reference-anchored unless a sharper
+source reproduces the same direction, in which case the zoom module can own the
+detail.
 Thin branches and wires retain centre-surround protection. Distant or ambiguous
 areas retain the global warp;
 detail that moved differently in every exposure cannot be reconstructed.
@@ -213,12 +217,10 @@ unclipped modules agree. The default adaptive crosstalk stage retains the
 factory 17x13 matrix mesh as a prior and fits only a small, white-balance-aware
 residual from smooth aligned regions. Display-ready output retains the smooth
 sensor-white shoulder as a final neutral safeguard.
-Factory colour conversion searches non-negative A/F11/D65 blends against
-reliable aligned inter-module chroma while retaining capture white balance/CCT
-as a soft prior and fallback. This distinguishes warm LED spectra from tungsten
-when their nominal colour temperatures are similar. A conservative
-Macbeth refit is reported but is promoted only if held-out accuracy, neutral
-stability, and inter-module consistency all improve; current device data keeps
-the supplied factory matrices.
+The experimental array-aware colour mode searches non-negative A/F11/D65
+blends against reliable aligned inter-module chroma while retaining capture
+white balance/CCT as a soft prior and fallback. The default remains the supplied
+D65 factory profile. A Macbeth refit is used only when calibration metadata
+marks a held-out-validated matrix as available.
 Night-sky captures may retain visible module boundaries. Use Chiaro Hotpixel
 and a stacker for astrophotography.
