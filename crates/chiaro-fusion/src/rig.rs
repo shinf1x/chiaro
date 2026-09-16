@@ -23,6 +23,7 @@ mod latent_graph;
 use std::{
     collections::{HashMap, HashSet},
     thread,
+    time::Instant,
 };
 
 use serde::Serialize;
@@ -32,7 +33,9 @@ pub use anchor_graph::{
     AnchorGraphCameraReport, AnchorGraphEdgeReport, AnchorGraphPairReport, AnchorGraphReport,
     AnchorGraphRoundReport,
 };
-pub use latent_graph::{LatentCameraSupportReport, LatentMatchReport, LatentMatchRoundReport};
+pub use latent_graph::{
+    LatentCameraSupportReport, LatentMatchReport, LatentMatchRoundReport, LatentMatchTimingReport,
+};
 use latent_graph::{
     LatentCandidateState, LatentMembershipState, build_latent_tracks,
     update_assignments as update_latent_assignments,
@@ -56,11 +59,11 @@ const INVALID_REPROJECTION_PENALTY_PX: f64 = 64.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RigRefinementStrategy {
-    #[default]
     Physical,
     AnchorGraph,
     /// Keep several visually plausible observations per camera and alternate
     /// correspondence assignment with the physical rig solve.
+    #[default]
     LatentGraph,
 }
 
@@ -290,10 +293,6 @@ pub struct RigRefinementOptions {
     /// Strict optical-centre correction bound per world axis, in the factory
     /// calibration's distance units (millimetres on L16).
     pub max_center_offset: f64,
-    /// Dimensionless shared B/C-group scale applied to CRA/Hall focus travel
-    /// along each physical camera's optical axis. Zero disables the nested
-    /// physical pupil-shift experiment.
-    pub max_focus_pupil_scale: f64,
     /// Strict calibration-raster origin correction bound per sensor axis.
     pub max_sensor_offset_px: f64,
     /// LatentGraph common focal correction bound as a fractional change from
@@ -319,7 +318,6 @@ pub struct RigRefinementOptions {
     pub mirror_prior_sigma_degrees: f64,
     /// Gaussian factory prior scale for each optical-centre axis.
     pub center_prior_sigma: f64,
-    pub focus_pupil_prior_sigma: f64,
     /// Gaussian factory prior scale for each sensor-raster axis.
     pub sensor_offset_prior_sigma_px: f64,
     /// Gaussian prior sigma for the fractional common focal-scale correction.
@@ -433,7 +431,7 @@ impl Default for RigRefinementOptions {
     fn default() -> Self {
         Self {
             enabled: true,
-            strategy: RigRefinementStrategy::Physical,
+            strategy: RigRefinementStrategy::LatentGraph,
             anchor_max_rounds: 4,
             anchor_min_factory_overlap: 0.20,
             anchor_initial_active_edges: 18,
@@ -528,7 +526,6 @@ impl Default for RigRefinementOptions {
             // absorb an orientation correction (or explode on weak parallax).
             max_mirror_degrees: 2.0,
             max_center_offset: 5.0,
-            max_focus_pupil_scale: 0.0,
             max_sensor_offset_px: 64.0,
             max_focal_scale_delta: 0.02,
             max_focal_aspect_delta: 0.01,
@@ -539,7 +536,6 @@ impl Default for RigRefinementOptions {
             orientation_prior_sigma_degrees: 3.0,
             mirror_prior_sigma_degrees: 0.35,
             center_prior_sigma: 1.0,
-            focus_pupil_prior_sigma: 0.5,
             sensor_offset_prior_sigma_px: 12.0,
             focal_scale_prior_sigma: 0.004,
             focal_aspect_prior_sigma: 0.002,
@@ -652,6 +648,48 @@ pub struct RigRefinementOutcome {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct RigBundleTimingReport {
+    pub passes: usize,
+    pub total_seconds: f64,
+    pub bearing_seconds: f64,
+    pub intrinsic_seconds: f64,
+    pub center_seconds: f64,
+    pub nuisance_polish_seconds: f64,
+    pub final_bearing_polish_seconds: f64,
+    /// Coordinate-descent slots that actually had a non-zero trust region.
+    pub active_parameter_steps: usize,
+    /// Frozen stage parameters skipped before any finite-difference work.
+    pub frozen_parameter_steps_skipped: usize,
+    /// Full trial-objective evaluations performed by coordinate descent.
+    pub trial_evaluations: usize,
+    /// Newton candidates that exactly reused an already evaluated +/- point.
+    pub endpoint_candidate_reuses: usize,
+    pub unaccounted_seconds: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RigRefinementTimingReport {
+    pub total_seconds: f64,
+    pub setup_seconds: f64,
+    pub correspondence_build_seconds: f64,
+    pub validation_split_seconds: f64,
+    pub bearing_bootstrap_seconds: f64,
+    pub fit_preparation_seconds: f64,
+    pub observability_seconds: f64,
+    pub final_bearing_seconds: f64,
+    pub latent_assignment_seconds: f64,
+    pub initial_bundle_seconds: f64,
+    pub membership_seconds: f64,
+    pub outer_bundle_seconds: f64,
+    pub evaluation_seconds: f64,
+    pub diagnostics_seconds: f64,
+    /// Time not covered by the named top-level buckets above. This is useful
+    /// for catching expensive glue code that deserves its own timer later.
+    pub unaccounted_seconds: f64,
+    pub bundle: RigBundleTimingReport,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct RigRefinementReport {
     pub enabled: bool,
     pub strategy: RigRefinementStrategy,
@@ -662,6 +700,7 @@ pub struct RigRefinementReport {
     /// Result of the independent held-out/physical-quality gate. This remains
     /// diagnostic for LatentGraph even though it no longer controls selection.
     pub validation_passed: bool,
+    pub timings: RigRefinementTimingReport,
     pub mirror_angle_mode: MirrorAngleMode,
     pub factory_model: Vec<RigFactoryModelReport>,
     /// Detailed matching/propagation diagnostics for the anchor-graph path.
@@ -928,7 +967,6 @@ pub struct RigCameraCorrectionReport {
     pub orientation_offset_degrees: [f64; 3],
     pub mirror_angle_offset_degrees: f64,
     pub center_offset_world: [f64; 3],
-    pub focus_pupil_scale: f64,
     pub sensor_offset_px: [f64; 2],
     /// Fractional common focal change from factory (0.001 = +0.1%).
     pub focal_scale_delta: f64,
@@ -1075,7 +1113,6 @@ enum ParameterKind {
     Orientation(usize),
     Mirror,
     Center(usize),
-    FocusPupilScale(char),
     Sensor(usize),
     FocalScale,
     FocalAspect,
@@ -1087,9 +1124,8 @@ enum ParameterKind {
 #[derive(Clone, Copy, Debug)]
 struct ParameterSpec {
     camera: usize,
-    /// Cameras changed together by this parameter. Ordinary camera-local
-    /// parameters contain exactly `camera`; shared pupil scales contain the
-    /// complete focal group, including the reference camera when applicable.
+    /// Cameras changed together by this parameter. Current production
+    /// parameters are camera-local, so this mask normally contains `camera`.
     affected_cameras: u16,
     kind: ParameterKind,
     bound: f64,
@@ -1138,6 +1174,32 @@ impl Evaluation {
     }
 }
 
+fn finalize_rig_timings(report: &mut RigRefinementReport, total_started: &Instant) {
+    report.timings.total_seconds = total_started.elapsed().as_secs_f64();
+    let bundle_accounted = report.timings.bundle.bearing_seconds
+        + report.timings.bundle.intrinsic_seconds
+        + report.timings.bundle.center_seconds
+        + report.timings.bundle.nuisance_polish_seconds
+        + report.timings.bundle.final_bearing_polish_seconds;
+    report.timings.bundle.unaccounted_seconds =
+        (report.timings.bundle.total_seconds - bundle_accounted).max(0.0);
+    let accounted = report.timings.setup_seconds
+        + report.timings.correspondence_build_seconds
+        + report.timings.validation_split_seconds
+        + report.timings.bearing_bootstrap_seconds
+        + report.timings.fit_preparation_seconds
+        + report.timings.observability_seconds
+        + report.timings.final_bearing_seconds
+        + report.timings.latent_assignment_seconds
+        + report.timings.initial_bundle_seconds
+        + report.timings.membership_seconds
+        + report.timings.outer_bundle_seconds
+        + report.timings.evaluation_seconds
+        + report.timings.diagnostics_seconds;
+    report.timings.unaccounted_seconds =
+        (report.timings.total_seconds - accounted).max(0.0);
+}
+
 /// Fit a bounded capture-specific physical model. The pipeline reserves an
 /// independent deterministic spatial split in both diagnostic and production
 /// runs; callers may still disable validation explicitly for synthetic tests.
@@ -1148,6 +1210,8 @@ pub fn refine_capture_rig(
     intrinsics_mode: IntrinsicsMode,
     options: &RigRefinementOptions,
 ) -> RigRefinementOutcome {
+    let total_started = Instant::now();
+    let setup_started = Instant::now();
     let mut report = RigRefinementReport {
         enabled: options.enabled,
         strategy: options.strategy,
@@ -1173,6 +1237,7 @@ pub fn refine_capture_rig(
     let zero = vec![CameraRefinement::default(); cameras.len()];
     if !options.enabled {
         report.fallback_reason = Some("disabled".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
@@ -1180,6 +1245,7 @@ pub fn refine_capture_rig(
     }
     if cameras.len() != provisional_alignments.len() || reference_index >= cameras.len() {
         report.fallback_reason = Some("camera/alignment population mismatch".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
@@ -1188,12 +1254,15 @@ pub fn refine_capture_rig(
     let Some(factory_cameras) = resolve_cameras(cameras, &zero, intrinsics_mode) else {
         report.fallback_reason =
             Some("one or more physical camera models are unavailable".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     };
+    report.timings.setup_seconds = setup_started.elapsed().as_secs_f64();
     let validation_modulus = (1.0 / options.validation_fraction.clamp(0.05, 0.5)).round() as u64;
+    let correspondence_build_started = Instant::now();
     let (raw_tracks, pairwise_matches, mut latent_candidates): (
         Vec<Track>,
         usize,
@@ -1208,6 +1277,7 @@ pub fn refine_capture_rig(
                 intrinsics_mode,
                 validation_modulus,
                 options,
+                None,
             );
             report.anchor_graph = Some(graph.report);
             report.physical_match_used = false;
@@ -1338,6 +1408,8 @@ pub fn refine_capture_rig(
             (raw_tracks, pairwise_matches, None)
         }
     };
+    report.timings.correspondence_build_seconds =
+        correspondence_build_started.elapsed().as_secs_f64();
     report.pairwise_matches = pairwise_matches;
     report.tracks = raw_tracks.len();
     report.tracks_three_plus = raw_tracks
@@ -1375,12 +1447,14 @@ pub fn refine_capture_rig(
             tracks.len(),
             options.min_tracks
         ));
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     }
 
+    let validation_split_started = Instant::now();
     // Freeze the spatial held-out split before *any* candidate-dependent
     // geometry is estimated. The fit side may subsequently be triangulated,
     // pruned and membership-refined; validation correspondence membership is
@@ -1463,17 +1537,21 @@ pub fn refine_capture_rig(
             preliminary_fit.len(),
             preliminary_validation.len()
         ));
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     }
 
+    report.timings.validation_split_seconds = validation_split_started.elapsed().as_secs_f64();
+
     // Phase 1: fit only bearing-changing parameters from robust world-bearing
     // alignment, using all independently verified FIT correspondences. For
     // this low-parallax capture an infinity/bearing objective is much better
     // conditioned than essential-matrix cheirality; nearby finite points are
     // tolerated by the robust loss and metric depth is solved only afterward.
+    let bearing_bootstrap_started = Instant::now();
     let bootstrap_specs = parameter_specs(cameras, reference_index, &preliminary_fit, options)
         .into_iter()
         .filter(|spec| {
@@ -1505,11 +1583,13 @@ pub fn refine_capture_rig(
     else {
         report.fallback_reason =
             Some("bearing bootstrap camera model could not be resolved".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     };
+    report.timings.bearing_bootstrap_seconds = bearing_bootstrap_started.elapsed().as_secs_f64();
 
     // Candidate-dependent triangulation is allowed on the FIT population. It
     // is used only to decide which nuisance parameters are observable and to
@@ -1563,6 +1643,7 @@ pub fn refine_capture_rig(
         if let (Some(candidates), Some(latent_report)) =
             (latent_candidates.as_ref(), report.latent_match.as_mut())
         {
+            let assignment_started = Instant::now();
             update_latent_assignments(
                 &mut fit_assignment_tracks,
                 candidates,
@@ -1571,11 +1652,15 @@ pub fn refine_capture_rig(
                 latent_assignment_round,
                 latent_report,
             );
+            report.timings.latent_assignment_seconds +=
+                assignment_started.elapsed().as_secs_f64();
         }
     }
     let fit_assignment_refs = fit_assignment_tracks.iter().collect::<Vec<_>>();
     let all_cameras = vec![true; cameras.len()];
+    let fit_preparation_started = Instant::now();
     let bootstrap_fit_tracks = prepare_fit(&fit_assignment_refs, &bootstrap_cameras, &all_cameras);
+    report.timings.fit_preparation_seconds += fit_preparation_started.elapsed().as_secs_f64();
     if bootstrap_fit_tracks.len() < options.min_tracks {
         report.rejected_degenerate_tracks += preliminary_fit.len() - bootstrap_fit_tracks.len();
         report.fallback_reason = Some(format!(
@@ -1583,6 +1668,7 @@ pub fn refine_capture_rig(
             bootstrap_fit_tracks.len(),
             options.min_tracks,
         ));
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
@@ -1594,6 +1680,7 @@ pub fn refine_capture_rig(
     // around the epipolar solution rather than around the known-worse factory
     // seed.
     let bootstrap_fit_refs = bootstrap_fit_tracks.iter().collect::<Vec<_>>();
+    let observability_started = Instant::now();
     let candidate_specs = parameter_specs(cameras, reference_index, &bootstrap_fit_refs, options);
     let candidate_base_parameters =
         remap_parameters(&bootstrap_parameters, &bootstrap_specs, &candidate_specs);
@@ -1606,8 +1693,10 @@ pub fn refine_capture_rig(
         options,
     );
     report.parameter_observability = parameter_observability;
+    report.timings.observability_seconds = observability_started.elapsed().as_secs_f64();
     if specs.is_empty() {
         report.fallback_reason = Some("no observable non-reference physical parameters".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
@@ -1635,6 +1724,7 @@ pub fn refine_capture_rig(
     let epipolar_seed_refs = epipolar_seed_tracks.iter().collect::<Vec<_>>();
     let final_bearing_specs =
         bearing_trust_region_specs(&specs, &epipolar_seed_refs, cameras.len());
+    let final_bearing_started = Instant::now();
     let (initialized, _, final_epipolar_iterations) = coordinate_optimize_rig(
         seeded_parameters,
         &final_bearing_specs,
@@ -1644,6 +1734,7 @@ pub fn refine_capture_rig(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bearing { reference_index },
+        None,
     );
     let initialized_refinements = refinements_from_parameters(cameras.len(), &initialized, &specs);
     let Some(initialized_cameras) =
@@ -1651,11 +1742,13 @@ pub fn refine_capture_rig(
     else {
         report.fallback_reason =
             Some("initialized physical model could not be resolved".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     };
+    report.timings.final_bearing_seconds = final_bearing_started.elapsed().as_secs_f64();
 
     // Re-score once more under the final bearing initialization before the
     // finite-depth fit population is frozen. This is still fit-only and uses no
@@ -1667,6 +1760,7 @@ pub fn refine_capture_rig(
         if let (Some(candidates), Some(latent_report)) =
             (latent_candidates.as_ref(), report.latent_match.as_mut())
         {
+            let assignment_started = Instant::now();
             update_latent_assignments(
                 &mut epipolar_seed_tracks,
                 candidates,
@@ -1675,14 +1769,18 @@ pub fn refine_capture_rig(
                 latent_assignment_round,
                 latent_report,
             );
+            report.timings.latent_assignment_seconds +=
+                assignment_started.elapsed().as_secs_f64();
         }
     }
     let epipolar_seed_track_refs = epipolar_seed_tracks.iter().collect::<Vec<_>>();
+    let fit_preparation_started = Instant::now();
     let mut fit_tracks = prepare_fit(
         &epipolar_seed_track_refs,
         &initialized_cameras,
         &observable_camera,
     );
+    report.timings.fit_preparation_seconds += fit_preparation_started.elapsed().as_secs_f64();
     report.rejected_degenerate_tracks += preliminary_fit.len().saturating_sub(fit_tracks.len());
 
     // Validation tracks are intentionally *not* triangulation-pruned with the
@@ -1700,6 +1798,7 @@ pub fn refine_capture_rig(
             fit_tracks.len(),
             validation_tracks.len()
         ));
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
@@ -1710,6 +1809,7 @@ pub fn refine_capture_rig(
     let factory_parameters = vec![0.0; specs.len()];
     let initial_fit = fit_tracks.iter().collect::<Vec<_>>();
     let initialization_iterations = bootstrap_iterations + final_epipolar_iterations;
+    let initial_bundle_started = Instant::now();
     let (mut parameters, _, bundle_iterations) = staged_bundle_optimize_rig(
         initialized,
         &specs,
@@ -1718,7 +1818,9 @@ pub fn refine_capture_rig(
         &initial_fit,
         intrinsics_mode,
         options,
+        &mut report.timings.bundle,
     );
+    report.timings.initial_bundle_seconds = initial_bundle_started.elapsed().as_secs_f64();
     drop(initial_fit);
     let mut iterations = initialization_iterations + bundle_iterations;
     let mut membership_iterations = 0usize;
@@ -1759,7 +1861,8 @@ pub fn refine_capture_rig(
             && latent_assignment_round < options.latent_max_assignment_iterations
         {
             latent_assignment_round += 1;
-            match (latent_candidates.as_ref(), report.latent_match.as_mut()) {
+            let assignment_started = Instant::now();
+            let switches = match (latent_candidates.as_ref(), report.latent_match.as_mut()) {
                 (Some(candidates), Some(latent_report)) => update_latent_assignments(
                     &mut fit_tracks,
                     candidates,
@@ -1769,12 +1872,16 @@ pub fn refine_capture_rig(
                     latent_report,
                 ),
                 _ => 0,
-            }
+            };
+            report.timings.latent_assignment_seconds +=
+                assignment_started.elapsed().as_secs_f64();
+            switches
         } else {
             0
         };
 
         let tracks_before_membership = fit_tracks.len();
+        let membership_started = Instant::now();
         let (rejected_observations, rejected_tracks, membership_changed) = if latent_switches > 0 {
             (0, 0, false)
         } else if latent_strategy {
@@ -1799,6 +1906,7 @@ pub fn refine_capture_rig(
                 rejected_observations > 0 || rejected_tracks > 0,
             )
         };
+        report.timings.membership_seconds += membership_started.elapsed().as_secs_f64();
         if membership_changed {
             membership_iterations += 1;
             membership_rejected_observations += rejected_observations;
@@ -1818,12 +1926,14 @@ pub fn refine_capture_rig(
                 fit_tracks.len(),
                 options.min_tracks,
             ));
+            finalize_rig_timings(&mut report, &total_started);
             return RigRefinementOutcome {
                 refinements: zero,
                 report,
             };
         }
         let current_fit = fit_tracks.iter().collect::<Vec<_>>();
+        let outer_bundle_started = Instant::now();
         let (next_parameters, _, next_iterations) = staged_bundle_optimize_rig(
             parameters,
             &specs,
@@ -1832,7 +1942,9 @@ pub fn refine_capture_rig(
             &current_fit,
             intrinsics_mode,
             options,
+            &mut report.timings.bundle,
         );
+        report.timings.outer_bundle_seconds += outer_bundle_started.elapsed().as_secs_f64();
         parameters = next_parameters;
         iterations += next_iterations;
     }
@@ -1850,12 +1962,14 @@ pub fn refine_capture_rig(
     let Some(candidate_cameras) = resolve_cameras(cameras, &candidate_refinements, intrinsics_mode)
     else {
         report.fallback_reason = Some("candidate physical model could not be resolved".to_owned());
+        finalize_rig_timings(&mut report, &total_started);
         return RigRefinementOutcome {
             refinements: zero,
             report,
         };
     };
     let fit = fit_tracks.iter().collect::<Vec<_>>();
+    let evaluation_started = Instant::now();
     let before_objective = objective(
         &factory_parameters,
         &specs,
@@ -1871,6 +1985,8 @@ pub fn refine_capture_rig(
         evaluate_validation_leave_one_out(&validation, &factory_cameras, options, true);
     let validation_after =
         evaluate_validation_leave_one_out(&validation, &candidate_cameras, options, true);
+    report.timings.evaluation_seconds = evaluation_started.elapsed().as_secs_f64();
+    let diagnostics_started = Instant::now();
     let fit_residuals_before = residual_distribution(&fit_before.residuals);
     let fit_residuals_after = residual_distribution(&fit_after.residuals);
     let held_out_residuals_before = options
@@ -2197,6 +2313,9 @@ pub fn refine_capture_rig(
     } else {
         report.fallback_reason = validation_failure_reason;
     }
+
+    report.timings.diagnostics_seconds = diagnostics_started.elapsed().as_secs_f64();
+    finalize_rig_timings(&mut report, &total_started);
 
     RigRefinementOutcome {
         refinements: if accepted {
@@ -4140,37 +4259,47 @@ fn enforce_rank_two(matrix: Mat3) -> Option<Mat3> {
     Some(rank_two.map(|row| row.map(|value| value / magnitude)))
 }
 
-fn fit_fallback_fundamental(
+#[derive(Clone, Copy, Debug)]
+struct PreparedFallbackEpipolarPoint {
+    reference: Vec2,
+    target: Vec2,
+}
+
+fn prepare_fallback_epipolar_points(
     correspondences: &[AlignmentCorrespondence],
-    indices: &[usize],
     reference_camera: &ResolvedCamera,
     target_camera: &ResolvedCamera,
+) -> Vec<Option<PreparedFallbackEpipolarPoint>> {
+    correspondences
+        .iter()
+        .map(|correspondence| {
+            Some(PreparedFallbackEpipolarPoint {
+                reference: reference_camera
+                    .pixel_to_normalized_camera(correspondence.reference_pixel)?,
+                target: target_camera.pixel_to_normalized_camera(correspondence.target_pixel)?,
+            })
+        })
+        .collect()
+}
+
+fn fit_fallback_fundamental_prepared(
+    prepared: &[Option<PreparedFallbackEpipolarPoint>],
+    indices: &[usize],
 ) -> Option<Mat3> {
     if indices.len() < 8 {
         return None;
     }
-    // Work in distortion-corrected normalized camera coordinates. The old
-    // fallback fitted F directly to distorted raster pixels, which lets lens
-    // distortion (especially on the narrow-FOV C modules near the edge) leak
-    // into the epipolar model and weaken the RANSAC identity test.
     let reference = indices
         .iter()
-        .map(|&index| {
-            reference_camera.pixel_to_normalized_camera(correspondences[index].reference_pixel)
-        })
+        .map(|&index| prepared.get(index).copied().flatten().map(|point| point.reference))
         .collect::<Option<Vec<_>>>()?;
     let target = indices
         .iter()
-        .map(|&index| target_camera.pixel_to_normalized_camera(correspondences[index].target_pixel))
+        .map(|&index| prepared.get(index).copied().flatten().map(|point| point.target))
         .collect::<Option<Vec<_>>>()?;
     let (reference, reference_transform) = normalize_epipolar_points(&reference)?;
     let (target, target_transform) = normalize_epipolar_points(&target)?;
 
-    // Homogeneous least squares: the smallest eigenvector of A^T A minimises
-    // x2^T E x1 in calibrated coordinates. Enforce the mandatory rank-2
-    // epipolar-matrix constraint
-    // before denormalisation; otherwise the ninth degree of freedom can make
-    // a minimal sample spuriously explain repeated-structure outliers.
     let mut normal = [[0.0f64; 9]; 9];
     for (reference, target) in reference.iter().zip(&target) {
         let row = [
@@ -4217,23 +4346,15 @@ fn fit_fallback_fundamental(
     Some(denormalized.map(|row| row.map(|value| value / magnitude)))
 }
 
-fn fallback_epipolar_error(
+#[inline]
+fn fallback_epipolar_error_prepared(
     epipolar: &Mat3,
-    correspondence: &AlignmentCorrespondence,
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
+    point: PreparedFallbackEpipolarPoint,
+    reference_focal_scale_px: f64,
+    target_focal_scale_px: f64,
 ) -> f64 {
-    let Some(reference_xy) =
-        reference_camera.pixel_to_normalized_camera(correspondence.reference_pixel)
-    else {
-        return f64::INFINITY;
-    };
-    let Some(target_xy) = target_camera.pixel_to_normalized_camera(correspondence.target_pixel)
-    else {
-        return f64::INFINITY;
-    };
-    let reference = [reference_xy[0], reference_xy[1], 1.0];
-    let target = [target_xy[0], target_xy[1], 1.0];
+    let reference = [point.reference[0], point.reference[1], 1.0];
+    let target = [point.target[0], point.target[1], 1.0];
     let target_line = mul_vec(epipolar, reference);
     let reference_line = mul_vec(&math::transpose(epipolar), target);
     let numerator = dot(target, target_line).abs();
@@ -4248,11 +4369,8 @@ fn fallback_epipolar_error(
     {
         return f64::INFINITY;
     }
-    // Symmetric point-to-epipolar-line distance, converted from normalized
-    // camera coordinates back to an approximate sensor-pixel scale separately
-    // in each view. This keeps B<->C pairs on the same acceptance threshold.
-    let target_pixels = numerator / target_denominator * target_camera.focal_scale_px();
-    let reference_pixels = numerator / reference_denominator * reference_camera.focal_scale_px();
+    let target_pixels = numerator / target_denominator * target_focal_scale_px;
+    let reference_pixels = numerator / reference_denominator * reference_focal_scale_px;
     ((target_pixels * target_pixels + reference_pixels * reference_pixels) * 0.5).sqrt()
 }
 
@@ -4283,37 +4401,6 @@ fn basis_from_two_directions(first: Vec3, second: Vec3) -> Option<Mat3> {
     ])
 }
 
-fn relative_rotation_from_two_matches(
-    first: &AlignmentCorrespondence,
-    second: &AlignmentCorrespondence,
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
-) -> Option<Mat3> {
-    let target_basis = basis_from_two_directions(
-        target_camera.pixel_to_camera_direction(first.target_pixel),
-        target_camera.pixel_to_camera_direction(second.target_pixel),
-    )?;
-    let reference_basis = basis_from_two_directions(
-        reference_camera.pixel_to_camera_direction(first.reference_pixel),
-        reference_camera.pixel_to_camera_direction(second.reference_pixel),
-    )?;
-    Some(math::mul(&reference_basis, &math::transpose(&target_basis)))
-}
-
-fn fallback_rotation_error_degrees(
-    rotation: &Mat3,
-    correspondence: &AlignmentCorrespondence,
-    reference_camera: &ResolvedCamera,
-    target_camera: &ResolvedCamera,
-) -> f64 {
-    let target = target_camera.pixel_to_camera_direction(correspondence.target_pixel);
-    let reference = reference_camera.pixel_to_camera_direction(correspondence.reference_pixel);
-    let predicted = normalize(mul_vec(rotation, target));
-    let sine = norm(cross(predicted, reference));
-    let cosine = dot(predicted, reference).clamp(-1.0, 1.0);
-    sine.atan2(cosine).to_degrees().abs()
-}
-
 fn fallback_rotation_inliers(
     correspondences: &[AlignmentCorrespondence],
     reference_camera: &ResolvedCamera,
@@ -4322,6 +4409,17 @@ fn fallback_rotation_inliers(
     if correspondences.len() < FALLBACK_ROTATION_MIN_INLIERS {
         return Vec::new();
     }
+    // Cache distortion-corrected bearing directions. The RANSAC evaluates the
+    // same immutable observations thousands of times.
+    let prepared = correspondences
+        .iter()
+        .map(|correspondence| {
+            (
+                reference_camera.pixel_to_camera_direction(correspondence.reference_pixel),
+                target_camera.pixel_to_camera_direction(correspondence.target_pixel),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut state = 0xA076_1D64_78BD_642Fu64 ^ correspondences.len() as u64;
     let mut next = |limit: usize| {
         state ^= state >> 12;
@@ -4337,23 +4435,23 @@ fn fallback_rotation_inliers(
         if second == first {
             second = (second + 1) % correspondences.len();
         }
-        let Some(rotation) = relative_rotation_from_two_matches(
-            &correspondences[first],
-            &correspondences[second],
-            reference_camera,
-            target_camera,
-        ) else {
+        let Some(target_basis) = basis_from_two_directions(prepared[first].1, prepared[second].1)
+        else {
             continue;
         };
+        let Some(reference_basis) =
+            basis_from_two_directions(prepared[first].0, prepared[second].0)
+        else {
+            continue;
+        };
+        let rotation = math::mul(&reference_basis, &math::transpose(&target_basis));
         let mut inliers = Vec::new();
         let mut error_sum = 0.0;
-        for (index, correspondence) in correspondences.iter().enumerate() {
-            let error = fallback_rotation_error_degrees(
-                &rotation,
-                correspondence,
-                reference_camera,
-                target_camera,
-            );
+        for (index, &(reference, target)) in prepared.iter().enumerate() {
+            let predicted = normalize(mul_vec(&rotation, target));
+            let sine = norm(cross(predicted, reference));
+            let cosine = dot(predicted, reference).clamp(-1.0, 1.0);
+            let error = sine.atan2(cosine).to_degrees().abs();
             if error <= FALLBACK_ROTATION_RANSAC_THRESHOLD_DEGREES {
                 inliers.push(index);
                 error_sum += error;
@@ -4403,6 +4501,16 @@ fn fallback_epipolar_inliers(
     };
 
     let threshold = FALLBACK_EPIPOLAR_RANSAC_THRESHOLD_REFERENCE_PX;
+    // Undistortion is by far the most expensive scalar operation in this RANSAC.
+    // Every correspondence is immutable for the duration of the consensus test,
+    // so normalize each image point once rather than thousands of times.
+    let prepared = prepare_fallback_epipolar_points(
+        correspondences,
+        reference_camera,
+        target_camera,
+    );
+    let reference_focal_scale_px = reference_camera.focal_scale_px();
+    let target_focal_scale_px = target_camera.focal_scale_px();
     let mut state = 0xD1B5_4A32_D192_ED03u64 ^ correspondences.len() as u64;
     let mut next = |limit: usize| {
         state = state
@@ -4431,21 +4539,20 @@ fn fallback_epipolar_inliers(
                 }
             }
         }
-        let Some(fundamental) =
-            fit_fallback_fundamental(correspondences, &sample, reference_camera, target_camera)
-        else {
+        let Some(fundamental) = fit_fallback_fundamental_prepared(&prepared, &sample) else {
             continue;
         };
         let mut inlier_count = 0usize;
         let mut error_sum = 0.0;
         for &index in &score_indices {
-            let correspondence = &correspondences[index];
-            let error = fallback_epipolar_error(
-                &fundamental,
-                correspondence,
-                reference_camera,
-                target_camera,
-            );
+            let error = prepared[index].map_or(f64::INFINITY, |point| {
+                fallback_epipolar_error_prepared(
+                    &fundamental,
+                    point,
+                    reference_focal_scale_px,
+                    target_focal_scale_px,
+                )
+            });
             if error <= threshold {
                 inlier_count += 1;
                 error_sum += error;
@@ -4466,13 +4573,15 @@ fn fallback_epipolar_inliers(
     let best = correspondences
         .iter()
         .enumerate()
-        .filter(|(_, correspondence)| {
-            fallback_epipolar_error(
-                &best_fundamental,
-                correspondence,
-                reference_camera,
-                target_camera,
-            ) <= threshold
+        .filter(|(index, _)| {
+            prepared[*index].is_some_and(|point| {
+                fallback_epipolar_error_prepared(
+                    &best_fundamental,
+                    point,
+                    reference_focal_scale_px,
+                    target_focal_scale_px,
+                ) <= threshold
+            })
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -4485,21 +4594,21 @@ fn fallback_epipolar_inliers(
 
     // One all-inlier refit removes the minimal-sample noise, followed by a
     // final deterministic inlier classification.
-    let Some(fundamental) =
-        fit_fallback_fundamental(correspondences, &best, reference_camera, target_camera)
-    else {
+    let Some(fundamental) = fit_fallback_fundamental_prepared(&prepared, &best) else {
         return best;
     };
     let refined = correspondences
         .iter()
         .enumerate()
-        .filter(|(_, correspondence)| {
-            fallback_epipolar_error(
-                &fundamental,
-                correspondence,
-                reference_camera,
-                target_camera,
-            ) <= threshold
+        .filter(|(index, _)| {
+            prepared[*index].is_some_and(|point| {
+                fallback_epipolar_error_prepared(
+                    &fundamental,
+                    point,
+                    reference_focal_scale_px,
+                    target_focal_scale_px,
+                ) <= threshold
+            })
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -4702,6 +4811,7 @@ fn bearing_bootstrap(
             intrinsics_mode,
             options,
             IncrementalObjectiveMode::Bearing { reference_index },
+            None,
         );
         for (local_index, &global_index) in global_indices.iter().enumerate() {
             assembled[global_index] = best_parameters[local_index];
@@ -4819,10 +4929,7 @@ fn parameter_specs(
                     && median_parallax >= MIN_CENTER_PARALLAX_DEGREES
             }
         };
-        if center_policy_allows
-            && options.max_center_offset > 0.0
-            && options.max_focus_pupil_scale <= 0.0
-        {
+        if center_policy_allows && options.max_center_offset > 0.0 {
             for axis in 0..3 {
                 specs.push(ParameterSpec {
                     camera,
@@ -4985,39 +5092,6 @@ fn parameter_specs(
             });
         }
     }
-    if options.strategy == RigRefinementStrategy::LatentGraph && options.max_focus_pupil_scale > 0.0
-    {
-        for group in ['B', 'C'] {
-            let affected_cameras = cameras
-                .iter()
-                .enumerate()
-                .filter(|(camera, input)| {
-                    input.name.starts_with(group)
-                        && input.state.is_some()
-                        && input.calibration.is_some_and(|calibration| {
-                            calibration.cra.as_ref().is_some_and(|cra| {
-                                cra.sensor_distance.is_some() && cra.distance_hall_ratio.is_some()
-                            })
-                        })
-                        && (*camera == reference_index
-                            || observations[*camera] >= bearing_min_observations)
-                })
-                .fold(0u16, |mask, (camera, _)| mask | (1u16 << camera));
-            if affected_cameras.count_ones() < 2 {
-                continue;
-            }
-            let camera = affected_cameras.trailing_zeros() as usize;
-            specs.push(ParameterSpec {
-                camera,
-                affected_cameras,
-                kind: ParameterKind::FocusPupilScale(group),
-                bound: options.max_focus_pupil_scale,
-                prior_sigma: options.focus_pupil_prior_sigma,
-                difference_step: 0.025,
-                maximum_update: 0.15,
-            });
-        }
-    }
     specs
 }
 
@@ -5032,7 +5106,6 @@ fn parameter_name(kind: ParameterKind) -> String {
         ParameterKind::Center(1) => "center_y".to_owned(),
         ParameterKind::Center(2) => "center_z".to_owned(),
         ParameterKind::Center(axis) => format!("center_{axis}"),
-        ParameterKind::FocusPupilScale(group) => format!("focus_pupil_scale_{group}"),
         ParameterKind::Sensor(0) => "sensor_x".to_owned(),
         ParameterKind::Sensor(1) => "sensor_y".to_owned(),
         ParameterKind::Sensor(axis) => format!("sensor_{axis}"),
@@ -5495,14 +5568,8 @@ fn filter_observable_parameter_specs(
                 candidates[second].kind,
                 ParameterKind::DistortionRadial(_) | ParameterKind::DistortionTangential(_)
             );
-            let first_is_center = matches!(
-                candidates[first].kind,
-                ParameterKind::Center(_) | ParameterKind::FocusPupilScale(_)
-            );
-            let second_is_center = matches!(
-                candidates[second].kind,
-                ParameterKind::Center(_) | ParameterKind::FocusPupilScale(_)
-            );
+            let first_is_center = matches!(candidates[first].kind, ParameterKind::Center(_));
+            let second_is_center = matches!(candidates[second].kind, ParameterKind::Center(_));
             let first_is_orientation =
                 matches!(candidates[first].kind, ParameterKind::Orientation(_));
             let second_is_orientation =
@@ -5580,7 +5647,7 @@ fn filter_observable_parameter_specs(
     order.sort_by(|&left, &right| {
         let priority = |kind: ParameterKind| match kind {
             ParameterKind::Orientation(_) | ParameterKind::Mirror => 3u8,
-            ParameterKind::Center(_) | ParameterKind::FocusPupilScale(_) => 1u8,
+            ParameterKind::Center(_) => 1u8,
             _ => 2u8,
         };
         priority(candidates[right].kind)
@@ -5659,7 +5726,6 @@ fn refinements_from_parameters(
     let mut orientations = vec![[0.0; 3]; camera_count];
     let mut mirrors = vec![0.0; camera_count];
     let mut centers = vec![[0.0; 3]; camera_count];
-    let mut focus_pupil_scales = vec![0.0; camera_count];
     let mut sensors = vec![[0.0; 2]; camera_count];
     let mut focal_scales = vec![0.0; camera_count];
     let mut focal_aspects = vec![0.0; camera_count];
@@ -5670,13 +5736,6 @@ fn refinements_from_parameters(
             ParameterKind::Orientation(axis) => orientations[spec.camera][axis] = value,
             ParameterKind::Mirror => mirrors[spec.camera] = value,
             ParameterKind::Center(axis) => centers[spec.camera][axis] = value,
-            ParameterKind::FocusPupilScale(_) => {
-                for (camera, scale) in focus_pupil_scales.iter_mut().enumerate() {
-                    if spec.affected_cameras & (1u16 << camera) != 0 {
-                        *scale = value;
-                    }
-                }
-            }
             ParameterKind::Sensor(axis) => sensors[spec.camera][axis] = value,
             ParameterKind::FocalScale => focal_scales[spec.camera] = value,
             ParameterKind::FocalAspect => focal_aspects[spec.camera] = value,
@@ -5700,8 +5759,6 @@ fn refinements_from_parameters(
             orientation_offset_degrees: (orientations[camera] != [0.0; 3])
                 .then_some(orientations[camera]),
             center_offset_world: (centers[camera] != [0.0; 3]).then_some(centers[camera]),
-            focus_pupil_scale: (focus_pupil_scales[camera] != 0.0)
-                .then_some(focus_pupil_scales[camera]),
             sensor_offset_px: (sensors[camera] != [0.0; 2]).then_some(sensors[camera]),
             focal_scale_delta: (focal_scales[camera] != 0.0).then_some(focal_scales[camera]),
             focal_aspect_delta: (focal_aspects[camera] != 0.0).then_some(focal_aspects[camera]),
@@ -5711,6 +5768,66 @@ fn refinements_from_parameters(
                 .then_some(distortion_deltas[camera]),
         })
         .collect()
+}
+
+fn refinement_for_camera_with_override(
+    camera: usize,
+    parameters: &[f64],
+    specs: &[ParameterSpec],
+    override_parameter: Option<(usize, f64)>,
+) -> CameraRefinement {
+    let mut orientation = [0.0; 3];
+    let mut mirror = 0.0;
+    let mut center = [0.0; 3];
+    let mut sensor = [0.0; 2];
+    let mut focal_scale = 0.0;
+    let mut focal_aspect = 0.0;
+    let mut distortion_center = [0.0; 2];
+    let mut distortion_delta = [0.0; 4];
+    for (index, (&stored_value, spec)) in parameters.iter().zip(specs).enumerate() {
+        if spec.affected_cameras & (1u16 << camera) == 0 {
+            continue;
+        }
+        let value = override_parameter
+            .filter(|(parameter, _)| *parameter == index)
+            .map_or(stored_value, |(_, value)| value);
+        match spec.kind {
+            ParameterKind::Orientation(axis) if spec.camera == camera => orientation[axis] = value,
+            ParameterKind::Mirror if spec.camera == camera => mirror = value,
+            ParameterKind::Center(axis) if spec.camera == camera => center[axis] = value,
+            ParameterKind::Sensor(axis) if spec.camera == camera => sensor[axis] = value,
+            ParameterKind::FocalScale if spec.camera == camera => focal_scale = value,
+            ParameterKind::FocalAspect if spec.camera == camera => focal_aspect = value,
+            ParameterKind::DistortionCenter(axis) if spec.camera == camera && axis < 2 => {
+                distortion_center[axis] = value
+            }
+            ParameterKind::DistortionRadial(axis) if spec.camera == camera && axis < 2 => {
+                distortion_delta[axis] = value
+            }
+            ParameterKind::DistortionTangential(axis) if spec.camera == camera && axis < 2 => {
+                distortion_delta[axis + 2] = value
+            }
+            ParameterKind::Orientation(_)
+            | ParameterKind::Mirror
+            | ParameterKind::Center(_)
+            | ParameterKind::Sensor(_)
+            | ParameterKind::FocalScale
+            | ParameterKind::FocalAspect
+            | ParameterKind::DistortionCenter(_)
+            | ParameterKind::DistortionRadial(_)
+            | ParameterKind::DistortionTangential(_) => {}
+        }
+    }
+    CameraRefinement {
+        mirror_angle_offset_degrees: mirror,
+        orientation_offset_degrees: (orientation != [0.0; 3]).then_some(orientation),
+        center_offset_world: (center != [0.0; 3]).then_some(center),
+        sensor_offset_px: (sensor != [0.0; 2]).then_some(sensor),
+        focal_scale_delta: (focal_scale != 0.0).then_some(focal_scale),
+        focal_aspect_delta: (focal_aspect != 0.0).then_some(focal_aspect),
+        distortion_center_offset_px: (distortion_center != [0.0; 2]).then_some(distortion_center),
+        distortion_delta: (distortion_delta != [0.0; 4]).then_some(distortion_delta),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5778,14 +5895,13 @@ fn invalid_bundle_observation_cost(
     observation_balance(observation, track_size) * huber(normalized, options.huber_delta)
 }
 
-fn bundle_track_contribution(
+fn bundle_track_contribution_with_rays(
     track: &Track,
     cameras: &[ResolvedCamera],
     options: &RigRefinementOptions,
-    rays: &mut Vec<crate::geometry::Ray>,
+    rays: &[crate::geometry::Ray],
 ) -> TrackObjectiveContribution {
-    let Some(triangulated) = triangulate_with_rays(&track.observations, cameras, options, rays)
-    else {
+    let Some(triangulated) = triangulate_precomputed(&track.observations, rays, options) else {
         return TrackObjectiveContribution {
             cost: track_authority_weight(track, options)
                 * track
@@ -5828,28 +5944,38 @@ fn bundle_track_contribution(
     result
 }
 
-fn bearing_track_contribution(
+fn bundle_track_contribution(
     track: &Track,
     cameras: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+    rays: &mut Vec<crate::geometry::Ray>,
+) -> TrackObjectiveContribution {
+    fill_observation_rays(&track.observations, cameras, rays);
+    bundle_track_contribution_with_rays(track, cameras, options, rays)
+}
+
+fn bearing_track_contribution_with_rays(
+    track: &Track,
+    cameras: &[ResolvedCamera],
+    rays: &[crate::geometry::Ray],
     reference_index: usize,
     options: &RigRefinementOptions,
 ) -> TrackObjectiveContribution {
-    let Some(reference) = track
+    let Some(reference_position) = track
         .observations
         .iter()
-        .find(|observation| observation.camera == reference_index)
+        .position(|observation| observation.camera == reference_index)
     else {
         return TrackObjectiveContribution::default();
     };
-    let reference_ray = cameras[reference_index].pixel_to_ray(reference.pixel);
+    let reference = &track.observations[reference_position];
+    let reference_ray = rays[reference_position];
     let mut result = TrackObjectiveContribution::default();
-    for observation in track
-        .observations
-        .iter()
-        .filter(|observation| observation.camera != reference_index)
-    {
+    for (observation, &target_ray) in track.observations.iter().zip(rays) {
+        if observation.camera == reference_index {
+            continue;
+        }
         let target_camera = &cameras[observation.camera];
-        let target_ray = target_camera.pixel_to_ray(observation.pixel);
         // For a distant scene, corresponding world rays should be almost
         // parallel. Finite parallax remains as a bounded robust residual, but
         // unlike the essential/cheirality objective there are no mirrored
@@ -5871,28 +5997,28 @@ fn bearing_track_contribution(
     result
 }
 
-fn epipolar_track_contribution(
+fn epipolar_track_contribution_with_rays(
     track: &Track,
     cameras: &[ResolvedCamera],
+    rays: &[crate::geometry::Ray],
     reference_index: usize,
     options: &RigRefinementOptions,
 ) -> TrackObjectiveContribution {
-    let Some(reference) = track
+    let Some(reference_position) = track
         .observations
         .iter()
-        .find(|observation| observation.camera == reference_index)
+        .position(|observation| observation.camera == reference_index)
     else {
         return TrackObjectiveContribution::default();
     };
-    let reference_ray = cameras[reference_index].pixel_to_ray(reference.pixel);
+    let reference = &track.observations[reference_position];
+    let reference_ray = rays[reference_position];
     let mut result = TrackObjectiveContribution::default();
-    for observation in track
-        .observations
-        .iter()
-        .filter(|observation| observation.camera != reference_index)
-    {
+    for (observation, &target_ray) in track.observations.iter().zip(rays) {
+        if observation.camera == reference_index {
+            continue;
+        }
         let target_camera = &cameras[observation.camera];
-        let target_ray = target_camera.pixel_to_ray(observation.pixel);
         let baseline = sub(target_ray.origin, reference_ray.origin);
         let baseline_length = norm(baseline);
         if baseline_length <= 1.0e-9 {
@@ -5924,6 +6050,26 @@ fn epipolar_track_contribution(
     result
 }
 
+fn track_contribution_with_rays(
+    track: &Track,
+    cameras: &[ResolvedCamera],
+    rays: &[crate::geometry::Ray],
+    mode: IncrementalObjectiveMode,
+    options: &RigRefinementOptions,
+) -> TrackObjectiveContribution {
+    match mode {
+        IncrementalObjectiveMode::Bundle => {
+            bundle_track_contribution_with_rays(track, cameras, options, rays)
+        }
+        IncrementalObjectiveMode::Bearing { reference_index } => {
+            bearing_track_contribution_with_rays(track, cameras, rays, reference_index, options)
+        }
+        IncrementalObjectiveMode::Epipolar { reference_index } => {
+            epipolar_track_contribution_with_rays(track, cameras, rays, reference_index, options)
+        }
+    }
+}
+
 struct RigTrialEvaluation {
     parameter: usize,
     value: f64,
@@ -5943,7 +6089,14 @@ struct IncrementalRigObjective<'a> {
     mode: IncrementalObjectiveMode,
     templates: Vec<ResolvedCameraTemplate>,
     cameras: Vec<ResolvedCamera>,
-    tracks_by_camera: Vec<Vec<usize>>,
+    /// Exact affected-track list for each parameter. Building this once avoids
+    /// repeatedly concatenating/sorting/deduplicating camera support lists for
+    /// every +/- finite-difference trial.
+    tracks_by_parameter: Vec<Vec<usize>>,
+    /// Rays for the currently committed camera state. A coordinate trial only
+    /// changes rays observed by its affected camera(s); all other expensive
+    /// pixel->ray distortion inversions are reused exactly.
+    rays_by_track: Vec<Vec<crate::geometry::Ray>>,
     contributions: Vec<TrackObjectiveContribution>,
     total_cost: f64,
     total_samples: usize,
@@ -5981,24 +6134,38 @@ impl<'a> IncrementalRigObjective<'a> {
                 }
             }
         }
-        let mut ray_scratch = Vec::new();
+        let tracks_by_parameter = specs
+            .iter()
+            .map(|spec| {
+                let mut affected = Vec::new();
+                for camera in 0..cameras.len() {
+                    if spec.affected_cameras & (1u16 << camera) != 0 {
+                        affected.extend(tracks_by_camera[camera].iter().copied());
+                    }
+                }
+                affected.sort_unstable();
+                affected.dedup();
+                affected
+            })
+            .collect::<Vec<_>>();
+
+        let mut rays_by_track = Vec::with_capacity(tracks.len());
         let mut contributions = Vec::with_capacity(tracks.len());
         let mut total_cost = 0.0;
         let mut total_samples = 0usize;
         for track in tracks {
-            let contribution = match mode {
-                IncrementalObjectiveMode::Bundle => {
-                    bundle_track_contribution(track, &cameras, options, &mut ray_scratch)
-                }
-                IncrementalObjectiveMode::Bearing { reference_index } => {
-                    bearing_track_contribution(track, &cameras, reference_index, options)
-                }
-                IncrementalObjectiveMode::Epipolar { reference_index } => {
-                    epipolar_track_contribution(track, &cameras, reference_index, options)
-                }
-            };
+            let mut rays = Vec::with_capacity(track.observations.len());
+            fill_observation_rays(&track.observations, &cameras, &mut rays);
+            let contribution = track_contribution_with_rays(
+                track,
+                &cameras,
+                &rays,
+                mode,
+                options,
+            );
             total_cost += contribution.cost;
             total_samples += contribution.samples;
+            rays_by_track.push(rays);
             contributions.push(contribution);
         }
         let prior_sum = parameters
@@ -6014,7 +6181,8 @@ impl<'a> IncrementalRigObjective<'a> {
             mode,
             templates,
             cameras,
-            tracks_by_camera,
+            tracks_by_parameter,
+            rays_by_track,
             contributions,
             total_cost,
             total_samples,
@@ -6057,17 +6225,19 @@ impl<'a> IncrementalRigObjective<'a> {
                 ),
             };
         }
-        let mut trial_parameters = self.parameters.clone();
-        trial_parameters[parameter] = value;
-        let refinements =
-            refinements_from_parameters(self.cameras.len(), &trial_parameters, self.specs);
         let mut cameras = self.cameras.clone();
         let mut cameras_for_commit = Vec::new();
         for camera in 0..cameras.len() {
             if spec.affected_cameras & (1u16 << camera) == 0 {
                 continue;
             }
-            let Ok(trial_camera) = self.templates[camera].resolve(&refinements[camera]) else {
+            let refinement = refinement_for_camera_with_override(
+                camera,
+                &self.parameters,
+                self.specs,
+                Some((parameter, value)),
+            );
+            let Ok(trial_camera) = self.templates[camera].resolve(&refinement) else {
                 return self.invalid_trial(parameter, value, prior_sum);
             };
             cameras[camera] = trial_camera.clone();
@@ -6075,30 +6245,26 @@ impl<'a> IncrementalRigObjective<'a> {
         }
         let mut total_cost = self.total_cost;
         let mut total_samples = self.total_samples;
-        let mut affected = Vec::new();
-        for camera in 0..self.cameras.len() {
-            if spec.affected_cameras & (1u16 << camera) != 0 {
-                affected.extend(self.tracks_by_camera[camera].iter().copied());
-            }
-        }
-        affected.sort_unstable();
-        affected.dedup();
+        let affected = &self.tracks_by_parameter[parameter];
         let mut changed_tracks = Vec::with_capacity(affected.len());
         let mut ray_scratch = Vec::new();
-        for track_index in affected {
+        for &track_index in affected {
             let old = self.contributions[track_index];
             let track = self.tracks[track_index];
-            let new = match self.mode {
-                IncrementalObjectiveMode::Bundle => {
-                    bundle_track_contribution(track, &cameras, self.options, &mut ray_scratch)
+            ray_scratch.clear();
+            ray_scratch.extend_from_slice(&self.rays_by_track[track_index]);
+            for (observation, ray) in track.observations.iter().zip(&mut ray_scratch) {
+                if spec.affected_cameras & (1u16 << observation.camera) != 0 {
+                    *ray = cameras[observation.camera].pixel_to_ray(observation.pixel);
                 }
-                IncrementalObjectiveMode::Bearing { reference_index } => {
-                    bearing_track_contribution(track, &cameras, reference_index, self.options)
-                }
-                IncrementalObjectiveMode::Epipolar { reference_index } => {
-                    epipolar_track_contribution(track, &cameras, reference_index, self.options)
-                }
-            };
+            }
+            let new = track_contribution_with_rays(
+                track,
+                &cameras,
+                &ray_scratch,
+                self.mode,
+                self.options,
+            );
             total_cost += new.cost - old.cost;
             total_samples = total_samples - old.samples + new.samples;
             changed_tracks.push((track_index, new));
@@ -6137,10 +6303,19 @@ impl<'a> IncrementalRigObjective<'a> {
             return;
         }
         self.parameters[trial.parameter] = trial.value;
+        let affected_cameras = self.specs[trial.parameter].affected_cameras;
         for (camera_index, camera) in trial.cameras {
             self.cameras[camera_index] = camera;
         }
+        let cameras = &self.cameras;
         for (track_index, contribution) in trial.changed_tracks {
+            let track = self.tracks[track_index];
+            let rays = &mut self.rays_by_track[track_index];
+            for (observation, ray) in track.observations.iter().zip(rays) {
+                if affected_cameras & (1u16 << observation.camera) != 0 {
+                    *ray = cameras[observation.camera].pixel_to_ray(observation.pixel);
+                }
+            }
             self.contributions[track_index] = contribution;
         }
         self.total_cost = trial.total_cost;
@@ -6208,7 +6383,10 @@ fn staged_bundle_optimize_rig<'a>(
     tracks: &'a [&'a Track],
     intrinsics_mode: IntrinsicsMode,
     options: &'a RigRefinementOptions,
+    timings: &mut RigBundleTimingReport,
 ) -> (Vec<f64>, f64, usize) {
+    let pass_started = Instant::now();
+    timings.passes += 1;
     if specs.is_empty() {
         return (parameters, f64::INFINITY, 0);
     }
@@ -6224,6 +6402,7 @@ fn staged_bundle_optimize_rig<'a>(
         }
     }
     let sweeps = max_iterations.clamp(1, 2);
+    let bearing_started = Instant::now();
     let (parameters, _, bearing_iterations) = coordinate_optimize_rig(
         parameters,
         &bearing_specs,
@@ -6233,7 +6412,9 @@ fn staged_bundle_optimize_rig<'a>(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bundle,
+        Some(timings),
     );
+    timings.bearing_seconds += bearing_started.elapsed().as_secs_f64();
 
     // Stage B1: solve image-plane nuisance directions first while holding both
     // bearing and metric centre fixed. Releasing centre at the same time would
@@ -6245,11 +6426,11 @@ fn staged_bundle_optimize_rig<'a>(
             ParameterKind::Orientation(_)
                 | ParameterKind::Mirror
                 | ParameterKind::Center(_)
-                | ParameterKind::FocusPupilScale(_)
         ) {
             spec.maximum_update = 0.0;
         }
     }
+    let intrinsic_started = Instant::now();
     let (parameters, _, intrinsic_iterations) = coordinate_optimize_rig(
         parameters,
         &intrinsic_specs,
@@ -6259,22 +6440,22 @@ fn staged_bundle_optimize_rig<'a>(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bundle,
+        Some(timings),
     );
+    timings.intrinsic_seconds += intrinsic_started.elapsed().as_secs_f64();
 
     // Stage B2: expose only independently observable optical-centre axes.
     // Strong factory priors and small coordinate steps make this a baseline
     // polish rather than a second unconstrained structure-from-motion solve.
     let mut center_specs = specs.to_vec();
     for spec in &mut center_specs {
-        if matches!(
-            spec.kind,
-            ParameterKind::Center(_) | ParameterKind::FocusPupilScale(_)
-        ) {
+        if matches!(spec.kind, ParameterKind::Center(_)) {
             spec.maximum_update = spec.maximum_update.min(0.20);
         } else {
             spec.maximum_update = 0.0;
         }
     }
+    let center_started = Instant::now();
     let (parameters, _, center_iterations) = coordinate_optimize_rig(
         parameters,
         &center_specs,
@@ -6284,7 +6465,9 @@ fn staged_bundle_optimize_rig<'a>(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bundle,
+        Some(timings),
     );
+    timings.center_seconds += center_started.elapsed().as_secs_f64();
 
     // Stage B3: one small joint nuisance polish after centre refinement.
     let mut nuisance_polish_specs = specs.to_vec();
@@ -6294,10 +6477,7 @@ fn staged_bundle_optimize_rig<'a>(
             ParameterKind::Orientation(_) | ParameterKind::Mirror
         ) {
             spec.maximum_update = 0.0;
-        } else if matches!(
-            spec.kind,
-            ParameterKind::Center(_) | ParameterKind::FocusPupilScale(_)
-        ) {
+        } else if matches!(spec.kind, ParameterKind::Center(_)) {
             spec.maximum_update = spec.maximum_update.min(0.10);
         } else if matches!(spec.kind, ParameterKind::DistortionCenter(_)) {
             spec.maximum_update = spec.maximum_update.min(0.35);
@@ -6305,6 +6485,7 @@ fn staged_bundle_optimize_rig<'a>(
             spec.maximum_update *= 0.5;
         }
     }
+    let nuisance_polish_started = Instant::now();
     let (parameters, _, nuisance_polish_iterations) = coordinate_optimize_rig(
         parameters,
         &nuisance_polish_specs,
@@ -6314,7 +6495,9 @@ fn staged_bundle_optimize_rig<'a>(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bundle,
+        Some(timings),
     );
+    timings.nuisance_polish_seconds += nuisance_polish_started.elapsed().as_secs_f64();
 
     // Stage C: one tiny bearing polish with nuisance parameters frozen. This
     // lets the common scene skeleton absorb the consequence of the nuisance
@@ -6330,6 +6513,7 @@ fn staged_bundle_optimize_rig<'a>(
             spec.maximum_update = 0.0;
         }
     }
+    let final_bearing_polish_started = Instant::now();
     let (parameters, objective, polish_iterations) = coordinate_optimize_rig(
         parameters,
         &polish_specs,
@@ -6339,7 +6523,11 @@ fn staged_bundle_optimize_rig<'a>(
         intrinsics_mode,
         options,
         IncrementalObjectiveMode::Bundle,
+        Some(timings),
     );
+    timings.final_bearing_polish_seconds +=
+        final_bearing_polish_started.elapsed().as_secs_f64();
+    timings.total_seconds += pass_started.elapsed().as_secs_f64();
     (
         parameters,
         objective,
@@ -6360,6 +6548,7 @@ fn coordinate_optimize_rig<'a>(
     intrinsics_mode: IntrinsicsMode,
     options: &'a RigRefinementOptions,
     mode: IncrementalObjectiveMode,
+    mut bundle_stats: Option<&mut RigBundleTimingReport>,
 ) -> (Vec<f64>, f64, usize) {
     let Some(mut objective) = IncrementalRigObjective::new(
         parameters.clone(),
@@ -6378,6 +6567,23 @@ fn coordinate_optimize_rig<'a>(
         let sweep_before = current_objective;
         for parameter in 0..objective.parameters.len() {
             let spec = specs[parameter];
+
+            // Staged bundle adjustment freezes most DOFs in each phase by
+            // setting maximum_update to zero. The old loop still evaluated the
+            // expensive +/- finite differences for those parameters and only
+            // discovered afterwards that candidate_value == centre. Skip them
+            // before any camera resolution, ray construction, or triangulation.
+            if !spec.maximum_update.is_finite()
+                || spec.maximum_update <= 0.0
+                || !spec.difference_step.is_finite()
+                || spec.difference_step <= 0.0
+            {
+                if let Some(stats) = bundle_stats.as_deref_mut() {
+                    stats.frozen_parameter_steps_skipped += 1;
+                }
+                continue;
+            }
+
             // The epipolar bootstrap exists to recover a potentially large
             // bearing error before finite-depth bundle adjustment. Centre and
             // raster shifts are weakly/degenerately observed in distant L16
@@ -6393,11 +6599,15 @@ fn coordinate_optimize_rig<'a>(
             ) {
                 continue;
             }
+            if let Some(stats) = bundle_stats.as_deref_mut() {
+                stats.active_parameter_steps += 1;
+            }
+
             let centre = objective.parameters[parameter];
             let step = spec.difference_step;
             let minus_value = (centre - step).max(-spec.bound);
             let plus_value = (centre + step).min(spec.bound);
-            let (minus, plus) = if objective.tracks_by_camera[spec.camera].len() >= 64 {
+            let (minus, plus) = if objective.tracks_by_parameter[parameter].len() >= 64 {
                 let shared = &objective;
                 thread::scope(|scope| {
                     let minus_handle =
@@ -6414,6 +6624,9 @@ fn coordinate_optimize_rig<'a>(
                     objective.evaluate_trial(parameter, plus_value),
                 )
             };
+            if let Some(stats) = bundle_stats.as_deref_mut() {
+                stats.trial_evaluations += 2;
+            }
             let f_minus = minus.objective;
             let f_plus = plus.objective;
             let gradient = (f_plus - f_minus) / (2.0 * step);
@@ -6429,7 +6642,41 @@ fn coordinate_optimize_rig<'a>(
             if candidate_value == centre {
                 continue;
             }
+
+            // When the Newton/trust-region result lands exactly on one of the
+            // two finite-difference samples, reuse that already computed trial.
+            // The old code evaluated the same objective a third time.
+            if candidate_value == minus_value {
+                if let Some(stats) = bundle_stats.as_deref_mut() {
+                    stats.endpoint_candidate_reuses += 1;
+                }
+                if f_minus < current_objective {
+                    current_objective = f_minus;
+                    objective.commit(minus);
+                } else if f_plus < current_objective {
+                    current_objective = f_plus;
+                    objective.commit(plus);
+                }
+                continue;
+            }
+            if candidate_value == plus_value {
+                if let Some(stats) = bundle_stats.as_deref_mut() {
+                    stats.endpoint_candidate_reuses += 1;
+                }
+                if f_plus < current_objective {
+                    current_objective = f_plus;
+                    objective.commit(plus);
+                } else if f_minus < current_objective {
+                    current_objective = f_minus;
+                    objective.commit(minus);
+                }
+                continue;
+            }
+
             let candidate = objective.evaluate_trial(parameter, candidate_value);
+            if let Some(stats) = bundle_stats.as_deref_mut() {
+                stats.trial_evaluations += 1;
+            }
             if candidate.objective < current_objective {
                 current_objective = candidate.objective;
                 objective.commit(candidate);
@@ -7296,7 +7543,6 @@ fn correction_reports(
             orientation_offset_degrees: refinement.orientation_offset_degrees.unwrap_or([0.0; 3]),
             mirror_angle_offset_degrees: refinement.mirror_angle_offset_degrees,
             center_offset_world: refinement.center_offset_world.unwrap_or([0.0; 3]),
-            focus_pupil_scale: refinement.focus_pupil_scale.unwrap_or(0.0),
             sensor_offset_px: refinement.sensor_offset_px.unwrap_or([0.0; 2]),
             focal_scale_delta: refinement.focal_scale_delta.unwrap_or(0.0),
             focal_aspect_delta: refinement.focal_aspect_delta.unwrap_or(0.0),
@@ -7633,6 +7879,15 @@ mod tests {
         align::{AlignmentCorrespondence, AlignmentReport, Warp},
         calibration::{CanonicalPose, IntrinsicsBundle, PolynomialDistortion},
     };
+
+    #[test]
+    fn latent_graph_is_the_default_strategy() {
+        assert_eq!(RigRefinementStrategy::default(), RigRefinementStrategy::LatentGraph);
+        assert_eq!(
+            RigRefinementOptions::default().strategy,
+            RigRefinementStrategy::LatentGraph,
+        );
+    }
 
     #[test]
     fn latent_graph_selects_a_solved_candidate_without_factory_fallback() {
@@ -8662,19 +8917,51 @@ mod tests {
     }
 
     #[test]
-    fn focus_pupil_parameter_is_shared_only_with_its_affected_group() {
-        let specs = [ParameterSpec {
-            camera: 0,
-            affected_cameras: 0b0101,
-            kind: ParameterKind::FocusPupilScale('B'),
-            bound: 1.0,
-            prior_sigma: 0.5,
-            difference_step: 0.025,
-            maximum_update: 0.15,
-        }];
-        let refinements = refinements_from_parameters(3, &[0.25], &specs);
-        assert_eq!(refinements[0].focus_pupil_scale, Some(0.25));
-        assert_eq!(refinements[1].focus_pupil_scale, None);
-        assert_eq!(refinements[2].focus_pupil_scale, Some(0.25));
+    fn single_camera_refinement_matches_bulk_parameter_decode() {
+        let specs = [
+            ParameterSpec {
+                camera: 0,
+                affected_cameras: 0b0001,
+                kind: ParameterKind::Orientation(1),
+                bound: 2.0,
+                prior_sigma: 1.0,
+                difference_step: 0.02,
+                maximum_update: 0.2,
+            },
+            ParameterSpec {
+                camera: 2,
+                affected_cameras: 0b0100,
+                kind: ParameterKind::Sensor(0),
+                bound: 8.0,
+                prior_sigma: 2.0,
+                difference_step: 0.25,
+                maximum_update: 2.0,
+            },
+            ParameterSpec {
+                camera: 2,
+                affected_cameras: 0b0100,
+                kind: ParameterKind::DistortionRadial(0),
+                bound: 0.1,
+                prior_sigma: 0.02,
+                difference_step: 0.001,
+                maximum_update: 0.004,
+            },
+        ];
+        let parameters = [0.3, -1.25, 0.015];
+        let bulk = refinements_from_parameters(3, &parameters, &specs);
+        for camera in 0..3 {
+            let single =
+                refinement_for_camera_with_override(camera, &parameters, &specs, None);
+            assert_eq!(single.orientation_offset_degrees, bulk[camera].orientation_offset_degrees);
+            assert_eq!(single.sensor_offset_px, bulk[camera].sensor_offset_px);
+            assert_eq!(single.distortion_delta, bulk[camera].distortion_delta);
+        }
+
+        let overridden =
+            refinement_for_camera_with_override(2, &parameters, &specs, Some((1, 2.5)));
+        let mut changed = parameters;
+        changed[1] = 2.5;
+        let changed_bulk = refinements_from_parameters(3, &changed, &specs);
+        assert_eq!(overridden.sensor_offset_px, changed_bulk[2].sensor_offset_px);
     }
 }

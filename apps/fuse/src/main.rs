@@ -205,9 +205,32 @@ struct Cli {
     resolution_reconstruction: ResolutionReconstruction,
 
     /// Diagnose flat-region Joint-CFA support by running solves whose output
-    /// is guaranteed to retain the baseline.
+    /// is guaranteed to retain the baseline. This also disables fast lattice
+    /// reuse and the constant-XYZ tier for apples-to-apples diagnostics.
     #[arg(long)]
     joint_cfa_solve_flat: bool,
+
+    /// Joint-CFA output-pixel solve lattice. 1 restores per-pixel solves; 2
+    /// shares one local model over 2x2 blocks where its complexity is valid.
+    #[arg(long, default_value_t = 2)]
+    joint_cfa_lattice: usize,
+
+    /// Luminance-structure/application weight at which Joint-CFA upgrades from
+    /// the cheap constant XYZ measurement model to the full affine XYZ+dX+dY
+    /// model. Production application remains luminance-only in both tiers.
+    #[arg(long, default_value_t = 0.40)]
+    joint_cfa_affine_threshold: f32,
+
+    /// Skip production Joint-CFA solves below this eventual blend weight.
+    /// Held-out validation and --joint-cfa-solve-flat always bypass the gate.
+    #[arg(long, default_value_t = 0.02)]
+    joint_cfa_min_application_weight: f32,
+
+    /// Restore the legacy projected-luminance reconstruction for calibrated
+    /// colour modules even in Joint-CFA mode. Normally Joint CFA owns this
+    /// high-frequency luminance path to avoid gathering the same sensors twice.
+    #[arg(long)]
+    joint_cfa_legacy_multicamera_detail: bool,
 
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
@@ -230,7 +253,7 @@ struct Cli {
     /// `anchor-graph` grows constellation-validated tracks before fitting;
     /// `latent-graph` keeps several repeated-structure hypotheses and lets
     /// them switch between bundle passes.
-    #[arg(long, value_enum, default_value = "physical")]
+    #[arg(long, value_enum, default_value = "latent-graph")]
     rig_strategy: RigStrategy,
 
     /// Maximum anchor-graph propagation rounds after bootstrap.
@@ -416,11 +439,6 @@ struct Cli {
     #[arg(long)]
     rig_max_center_offset: Option<f64>,
 
-    /// Maximum shared B/C-group scale of CRA/Hall-implied focus travel along
-    /// each physical camera optical axis. Zero (the default) disables it.
-    #[arg(long)]
-    rig_max_focus_pupil_scale: Option<f64>,
-
     /// Maximum calibration-raster origin correction per sensor axis.
     #[arg(long)]
     rig_max_sensor_offset_px: Option<f64>,
@@ -461,10 +479,6 @@ struct Cli {
     /// One-sigma scale of the factory prior for optical-centre corrections.
     #[arg(long)]
     rig_center_prior_sigma: Option<f64>,
-
-    /// One-sigma prior for the dimensionless shared focus-pupil scale.
-    #[arg(long)]
-    rig_focus_pupil_prior_sigma: Option<f64>,
 
     /// One-sigma scale of the factory prior for sensor-raster offsets.
     #[arg(long)]
@@ -750,9 +764,6 @@ fn main() -> Result<()> {
     if let Some(value) = cli.rig_max_center_offset {
         options.rig_refinement.max_center_offset = value.max(0.0);
     }
-    if let Some(value) = cli.rig_max_focus_pupil_scale {
-        options.rig_refinement.max_focus_pupil_scale = value.clamp(0.0, 4.0);
-    }
     if let Some(value) = cli.rig_max_sensor_offset_px {
         options.rig_refinement.max_sensor_offset_px = value.max(0.0);
     }
@@ -782,9 +793,6 @@ fn main() -> Result<()> {
     }
     if let Some(value) = cli.rig_center_prior_sigma {
         options.rig_refinement.center_prior_sigma = value.max(1.0e-6);
-    }
-    if let Some(value) = cli.rig_focus_pupil_prior_sigma {
-        options.rig_refinement.focus_pupil_prior_sigma = value.max(1.0e-6);
     }
     if let Some(value) = cli.rig_sensor_prior_sigma_px {
         options.rig_refinement.sensor_offset_prior_sigma_px = value.max(1.0e-6);
@@ -849,6 +857,10 @@ fn main() -> Result<()> {
     options.color_profile = cli.factory_profile.into();
     options.synth.resolution_reconstruction = cli.resolution_reconstruction;
     options.synth.joint_cfa_solve_flat = cli.joint_cfa_solve_flat;
+    options.synth.joint_cfa_lattice = cli.joint_cfa_lattice;
+    options.synth.joint_cfa_affine_threshold = cli.joint_cfa_affine_threshold;
+    options.synth.joint_cfa_min_application_weight = cli.joint_cfa_min_application_weight;
+    options.synth.joint_cfa_owns_color_resolution = !cli.joint_cfa_legacy_multicamera_detail;
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;
@@ -1135,7 +1147,6 @@ fn main() -> Result<()> {
         correction.orientation_offset_degrees != [0.0; 3]
             || correction.mirror_angle_offset_degrees != 0.0
             || correction.center_offset_world != [0.0; 3]
-            || correction.focus_pupil_scale != 0.0
             || correction.sensor_offset_px != [0.0; 2]
             || correction.focal_scale_delta != 0.0
             || correction.focal_aspect_delta != 0.0
@@ -1143,7 +1154,7 @@ fn main() -> Result<()> {
             || correction.distortion_delta != [0.0; 4]
     }) {
         println!(
-            "  {} {}{rig_strategy} correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, focus-pupil {:+.4}, sensor {:+.2},{:+.2} px, focal(s,a) {:+.3},{:+.3}%, dist-centre {:+.2},{:+.2} px, d[k1,k2,p1,p2]=[{:+.5},{:+.5},{:+.5},{:+.5}], mirror {:+.4} deg{}",
+            "  {} {}{rig_strategy} correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, sensor {:+.2},{:+.2} px, focal(s,a) {:+.3},{:+.3}%, dist-centre {:+.2},{:+.2} px, d[k1,k2,p1,p2]=[{:+.5},{:+.5},{:+.5},{:+.5}], mirror {:+.4} deg{}",
             correction.camera,
             if rig.accepted { "" } else { "candidate " },
             correction.orientation_offset_degrees[0],
@@ -1152,7 +1163,6 @@ fn main() -> Result<()> {
             correction.center_offset_world[0],
             correction.center_offset_world[1],
             correction.center_offset_world[2],
-            correction.focus_pupil_scale,
             correction.sensor_offset_px[0],
             correction.sensor_offset_px[1],
             correction.focal_scale_delta * 100.0,
@@ -1295,12 +1305,12 @@ fn main() -> Result<()> {
     }
     if let Some(joint) = &report.synthesis.joint_cfa {
         println!(
-            "joint CFA: {:.2}% of {} candidate points reconstructed (stride {}), solver ran at {:.2}% and skipped {:.2}% by structure gate, {:.1} observations from {:.2} cameras/pixel, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample affine fit {:+.2}% (diagnostic only)",
+            "joint CFA: {:.2}% of {} candidate points reconstructed (stride {}), independent solver ran at {:.2}% and {:.2}% avoided gather/solve, {:.1} observations from {:.2} cameras/solve, {:.3} px phase spread, {:.1}% applied, {:.1} iterations, residual {:.6}; in-sample joint fit {:+.2}% (diagnostic only)",
             joint.reconstructed_fraction * 100.0,
             joint.attempted_pixels,
             joint.sampling_stride,
             joint.solver_attempted_fraction * 100.0,
-            joint.structure_skipped_fraction * 100.0,
+            joint.solver_avoided_fraction * 100.0,
             joint.mean_observations_per_pixel,
             joint.mean_cameras_per_pixel,
             joint.mean_phase_spread,
@@ -1310,10 +1320,25 @@ fn main() -> Result<()> {
             joint.in_sample_relative_fit * 100.0,
         );
         println!(
-            "  Joint-CFA rejection funnel (of solver attempts): geometry {:.2}%, footprint samples {:.2}%, conditioning {:.2}%",
+            "  Joint-CFA fast path: lattice {} / affine >= {:.2} / min weight {:.3}, color-owner {}; {} lattice reuses ({:.2}%), {} constant / {} affine solves; physical-site cache {:.2}% hit ({} / {} accesses)",
+            joint.lattice_size,
+            joint.affine_threshold,
+            joint.min_application_weight,
+            joint.owns_color_resolution,
+            joint.lattice_reused_pixels,
+            joint.lattice_reused_fraction * 100.0,
+            joint.constant_solver_pixels,
+            joint.affine_solver_pixels,
+            joint.physical_site_cache_hit_fraction * 100.0,
+            joint.physical_site_cache_hits,
+            joint.physical_site_cache_hits + joint.physical_site_cache_misses,
+        );
+        println!(
+            "  Joint-CFA rejection funnel (of independent solver attempts): geometry {:.2}%, footprint samples {:.2}%, conditioning {:.2}%; low-impact gate {:.2}%",
             joint.insufficient_geometry_fraction * 100.0,
             joint.insufficient_samples_fraction * 100.0,
             joint.solver_rejected_fraction * 100.0,
+            joint.structure_skipped_fraction * 100.0,
         );
     }
     for held_out in &report.synthesis.held_out_cfa {
@@ -1414,6 +1439,10 @@ mod tests {
             ResolutionReconstruction::JointCfa
         );
         assert!(!cli.joint_cfa_solve_flat);
+        assert_eq!(cli.joint_cfa_lattice, 2);
+        assert!((cli.joint_cfa_affine_threshold - 0.40).abs() < f32::EPSILON);
+        assert!((cli.joint_cfa_min_application_weight - 0.02).abs() < f32::EPSILON);
+        assert!(!cli.joint_cfa_legacy_multicamera_detail);
         assert!(!cli.no_rig_refine);
     }
 

@@ -30,11 +30,6 @@ pub struct CameraRefinement {
     /// viewpoint rather than pretending one capture can identify every
     /// physical mirror-system component independently.
     pub center_offset_world: Option<Vec3>,
-    /// Dimensionless scale of the CRA/Hall-implied focus travel along the
-    /// physical camera's optical axis. Zero preserves the existing model.
-    /// This is shared by focal group in the rig optimizer rather than fitted
-    /// independently per camera.
-    pub focus_pupil_scale: Option<f64>,
     /// Translation of the calibration raster relative to the captured sensor
     /// raster, in pixels. Both K's principal point and the distortion centre
     /// move together, which models a crop/active-area origin error without
@@ -81,7 +76,6 @@ enum PoseTemplate {
         rotation_cw: Mat3,
         translation_wc: Vec3,
         center: Vec3,
-        focus_shift_per_unit: Vec3,
     },
     Mirror {
         real_cw: Mat3,
@@ -91,7 +85,6 @@ enum PoseTemplate {
         point_on_rotation_axis: Vec3,
         mirror_plane_distance: f64,
         real_camera_location: Vec3,
-        focus_shift_per_unit: Vec3,
     },
 }
 
@@ -102,13 +95,6 @@ impl ResolvedCameraTemplate {
         mode: IntrinsicsMode,
     ) -> Result<Self> {
         let base_k = calibration.k_for_hall(state.lens_hall, mode)?;
-        let focus_travel = calibration
-            .cra
-            .as_ref()
-            .and_then(|cra| Some((cra.distance_hall_ratio?, cra.sensor_distance?)))
-            .map_or(0.0, |(ratio, calibrated_distance)| {
-                (state.lens_hall + 1.0) * ratio - calibrated_distance
-            });
         let mut factory_mirror_angle = None;
         let pose = if let Some(canonical) = calibration.canonical_pose.as_ref() {
             let rotation_cw = transpose(&canonical.rotation_wc);
@@ -117,10 +103,6 @@ impl ResolvedCameraTemplate {
                 rotation_cw,
                 translation_wc: canonical.translation_wc,
                 center: canonical.center_world(),
-                focus_shift_per_unit: scale(
-                    normalize(mul_vec(&rotation_cw, [0.0, 0.0, 1.0])),
-                    focus_travel,
-                ),
             }
         } else if let Some(mirror) = calibration.mirror.as_ref() {
             let angle = mirror.actuator.angle_for_hall(state.mirror_hall)?;
@@ -133,10 +115,6 @@ impl ResolvedCameraTemplate {
                 point_on_rotation_axis: mirror.point_on_rotation_axis,
                 mirror_plane_distance: mirror.mirror_plane_distance,
                 real_camera_location: mirror.real_camera_location,
-                focus_shift_per_unit: scale(
-                    normalize(mul_vec(&mirror.real_camera_orientation_cw, [0.0, 0.0, 1.0])),
-                    focus_travel,
-                ),
             }
         } else {
             bail!(
@@ -186,26 +164,17 @@ impl ResolvedCameraTemplate {
         k[1][2] += sensor_offset[1];
         let k_inverse = math::inverse(&k).context("singular intrinsic matrix")?;
         let center_offset = refinement.center_offset_world.unwrap_or([0.0; 3]);
-        let focus_scale = refinement.focus_pupil_scale.unwrap_or(0.0);
         let pose = match &self.pose {
             PoseTemplate::Canonical {
                 rotation_wc,
                 rotation_cw,
                 translation_wc,
                 center,
-                focus_shift_per_unit,
             } => Pose::Canonical {
                 rotation_wc: *rotation_wc,
                 rotation_cw: *rotation_cw,
-                translation_wc: {
-                    let total_offset =
-                        add(center_offset, scale(*focus_shift_per_unit, focus_scale));
-                    sub(*translation_wc, mul_vec(rotation_wc, total_offset))
-                },
-                center: add(
-                    add(*center, center_offset),
-                    scale(*focus_shift_per_unit, focus_scale),
-                ),
+                translation_wc: sub(*translation_wc, mul_vec(rotation_wc, center_offset)),
+                center: add(*center, center_offset),
             },
             PoseTemplate::Mirror {
                 real_cw,
@@ -215,7 +184,6 @@ impl ResolvedCameraTemplate {
                 point_on_rotation_axis,
                 mirror_plane_distance,
                 real_camera_location,
-                focus_shift_per_unit,
             } => {
                 let angle = factory_angle_degrees + refinement.mirror_angle_offset_degrees;
                 let rotation = math::rotation_about_axis(*rotation_axis, angle.to_radians());
@@ -225,13 +193,9 @@ impl ResolvedCameraTemplate {
                     scale(normal, *mirror_plane_distance),
                 );
                 let reflect = reflection(normal);
-                let shifted_real_camera = add(
-                    *real_camera_location,
-                    scale(*focus_shift_per_unit, focus_scale),
-                );
-                let distance = math::dot(normal, sub(shifted_real_camera, plane_point));
+                let distance = math::dot(normal, sub(*real_camera_location, plane_point));
                 let virtual_center = add(
-                    sub(shifted_real_camera, scale(normal, 2.0 * distance)),
+                    sub(*real_camera_location, scale(normal, 2.0 * distance)),
                     center_offset,
                 );
                 Pose::Mirror {
@@ -634,10 +598,7 @@ pub(crate) fn undistort(distortion: &PolynomialDistortion, pixel: Vec2) -> Vec2 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::{
-        CanonicalPose, CraCalibration, IntrinsicsBundle, MirrorActuator, MirrorAngleMode,
-        MirrorModel,
-    };
+    use crate::calibration::{CanonicalPose, IntrinsicsBundle};
     use crate::math::norm;
 
     fn refinement_test_camera(distortion: Option<PolynomialDistortion>) -> CameraCalibration {
@@ -844,97 +805,5 @@ mod tests {
         assert!(norm(sub(shifted_ray.direction, factory_ray.direction)) < 1.0e-10);
     }
 
-    #[test]
-    fn focus_pupil_scale_moves_a_canonical_center_along_its_optical_axis() {
-        let mut calibration = refinement_test_camera(None);
-        calibration.cra = Some(CraCalibration {
-            center: None,
-            sensor_distance: Some(10.0),
-            exit_pupil_distance: None,
-            pixel_size: None,
-            lens_hall_code: Some(99.0),
-            distance_hall_ratio: Some(0.1),
-            radial_samples: Vec::new(),
-            fitted_coefficients: Vec::new(),
-            fit_cost: None,
-            valid_roi: None,
-        });
-        let mut state = refinement_test_state();
-        state.lens_hall = 50.0;
-        let camera = ResolvedCamera::new(
-            &calibration,
-            &state,
-            IntrinsicsMode::Clamp,
-            &CameraRefinement {
-                focus_pupil_scale: Some(0.5),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // d(50)-d(99) = 5.1-10.0 = -4.9; alpha=0.5 moves -2.45 on +Z.
-        assert_eq!(camera.center(), [10.0, 20.0, 27.55]);
-    }
 
-    #[test]
-    fn focus_pupil_scale_moves_real_camera_before_mirror_reflection() {
-        let mut calibration = refinement_test_camera(None);
-        calibration.canonical_pose = None;
-        calibration.mirror = Some(MirrorModel {
-            real_camera_location: [0.0, 0.0, 1.0],
-            real_camera_orientation_cw: IDENTITY,
-            rotation_axis: [0.0, 1.0, 0.0],
-            point_on_rotation_axis: [0.0; 3],
-            mirror_plane_distance: 0.0,
-            mirror_normal_zero: [0.0, 0.0, 1.0],
-            flip_img_around_x: false,
-            actuator: MirrorActuator {
-                mean_std_normalize: true,
-                actuator_length_offset: 0.0,
-                actuator_length_scale: 1.0,
-                mirror_angle_offset: 0.0,
-                mirror_angle_scale: 1.0,
-                hall_angle_pairs: vec![(-1.0, 1.0), (1.0, -1.0)],
-                quadratic_coeffs: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                use_rplus_for_left_segment: Some(false),
-                use_rplus_for_right_segment: Some(false),
-                inflection_value: Some(0.0),
-                angle_mode: MirrorAngleMode::CalibrationQuadraticInverse,
-            },
-        });
-        calibration.cra = Some(CraCalibration {
-            center: None,
-            sensor_distance: Some(10.0),
-            exit_pupil_distance: None,
-            pixel_size: None,
-            lens_hall_code: Some(99.0),
-            distance_hall_ratio: Some(0.1),
-            radial_samples: Vec::new(),
-            fitted_coefficients: Vec::new(),
-            fit_cost: None,
-            valid_roi: None,
-        });
-        let mut state = refinement_test_state();
-        state.lens_hall = 119.0;
-        let factory = ResolvedCamera::new(
-            &calibration,
-            &state,
-            IntrinsicsMode::Clamp,
-            &CameraRefinement::default(),
-        )
-        .unwrap();
-        let focused = ResolvedCamera::new(
-            &calibration,
-            &state,
-            IntrinsicsMode::Clamp,
-            &CameraRefinement {
-                focus_pupil_scale: Some(0.5),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // The implied +2 physical-camera Z travel is scaled to +1, then the
-        // z=0 mirror reflects the real center from z=+2 to virtual z=-2.
-        assert_eq!(factory.center(), [0.0, 0.0, -1.0]);
-        assert_eq!(focused.center(), [0.0, 0.0, -2.0]);
-    }
 }

@@ -50,13 +50,28 @@ Common options include:
 - `--resolution-reconstruction resample|multi-camera|joint-cfa` selects ordinary
   pull resampling, locally aligned multiscale reconstruction, or
   the default pre-demosaic Joint-CFA solver. Joint CFA solves calibrated
-  physical samples jointly and falls back to the production MultiCamera result
-  wherever independent local support is insufficient. MultiCamera remains
-  explicitly selectable for comparison;
+  physical samples jointly and falls back to the robust production blend where
+  independent local support is insufficient. Held-out validation renders retain
+  the historical MultiCamera comparison baseline across the frame, and MultiCamera remains
+  explicitly selectable for full-frame comparison;
+- Joint-CFA production rendering uses a performance-oriented, luma-dominant
+  hierarchy by default: `--joint-cfa-lattice 2` shares one solved local field
+  over a 2x2 output block, `--joint-cfa-affine-threshold 0.40` reserves the
+  9-parameter affine measurement model for strongly structured pixels, and
+  `--joint-cfa-min-application-weight 0.02` rejects negligible corrections
+  before physical-sample gathering. The raw solver still estimates calibrated
+  XYZ, but production applies only its high-frequency luminance/detail to the
+  trusted multi-camera baseline chromaticity. This prevents isolated CFA-fit
+  errors from becoming magenta/green output pixels;
 - `--joint-cfa-solve-flat` is a diagnostic-only switch that restores solver
   attempts where the reference structure gate guarantees a zero-weight update;
-  ordinary Joint-CFA rendering skips those attempts and reports the saved
-  fraction;
+  it also forces the full affine per-pixel path so held-out diagnostics remain
+  directly comparable;
+- Joint CFA owns calibrated colour-module high-frequency luminance
+  reconstruction by default, avoiding a second MultiCamera sensor-footprint
+  traversal. The established synthesis path remains the colour authority.
+  `--joint-cfa-legacy-multicamera-detail` restores the legacy projected-detail
+  path for comparison; monochrome detail remains on that path;
 - `--cfa-held-out CAMERA` excludes a physical Bayer module from both baseline
   and joint reconstruction, then reports how well each predicts that camera's
   unseen real CFA measurements. Repeat it for camera-wise cross-validation;
@@ -91,7 +106,7 @@ Common options include:
   candidate is the only active rig: it is not raced against the physical
   strategy and is not replaced by factory geometry when validation warns. If
   latent optimization cannot produce a candidate, fusion fails explicitly.
-  `physical` remains the CLI default. Anchor-graph mode uses the full
+  `latent-graph` is the CLI default; `physical` remains available explicitly. Anchor-graph mode uses the full
   available 2x2-CFA-cell luminance raster (not the older /4 neural raster),
   performs up to four iterative identity-growth rounds, re-triangulates and
   refits orientation between rounds, and keeps factory metric centres/mirror
@@ -125,10 +140,6 @@ Common options include:
   the L16 optical hierarchy (A1 to B, or B4 to C). The aligner measures only
   this mapping-seeded warp; it no longer runs or selects a calibration-only
   hypothesis. `--no-angle-optical-center-prior` explicitly disables it;
-- `--rig-max-focus-pupil-scale` enables an experimental group-shared axial
-  optical-centre shift derived from the CRA Hall-to-distance metadata. It is
-  disabled at its default of zero; `--rig-focus-pupil-prior-sigma` controls its
-  prior when enabled;
 - the `--rig-*-prior-sigma*` options set the physical scale of each factory
   prior, while `--rig-factory-prior-weight` sets its overall strength;
 - `--rig-match-subpixel-step-px`, `--rig-match-patch-radius`,
@@ -160,9 +171,22 @@ Run `chiaro-fuse --help` for all options.
 Joint CFA reconstruction operates on corrected physical R/Gr/Gb/B sites before
 demosaicing. It robustly fits a compact local XYZ field from calibrated camera
 response rows, sensor-noise variance, highlight provenance, alignment
-confidence, and an edge-aligned Hann window. A local affine field is used so
-the test does not obtain lower error merely by averaging away edges. The
-implementation is deterministic, CPU-only, and independently tileable.
+confidence, and an edge-aligned Hann window. Production rendering now uses a
+tiered model: low-structure locations use a 3-parameter constant XYZ solve,
+while edge/texture locations retain the full 9-parameter affine XYZ+dX+dY
+field. Held-out validation always uses the full affine model.
+
+The hot path is explicitly designed around spatial reuse. A per-worker,
+per-camera physical-site cache keeps corrected CFA values, calibrated response
+rows, propagated sensor-noise dependencies, and sensor-space photometry so
+neighbouring output pixels do not reconstruct the same Bayer sites repeatedly.
+A configurable output lattice re-evaluates one solved local field over nearby
+pixels with each pixel's own baseline and structure blend. Solver design rows,
+base weights, and inverse noise sigmas are prepared once; normal equations only
+accumulate the symmetric triangle and are solved with a small Cholesky factor.
+The raster renderer also uses a cell-cached incremental warp scanline sampler.
+The implementation remains deterministic, CPU-only, and independently
+tileable.
 
 The real-capture validation keeps a MultiCamera render as the comparison
 baseline and withholds one non-reference module:
@@ -183,7 +207,9 @@ inverse-projection-residual populations. Empty populations carry
 or fallback value predicted a camera it never observed more accurately.
 Contributor losses are explicitly in-sample diagnostics, not evidence of added
 resolution. Joint diagnostics also record attempted/support counts, response
-and spatial conditioning, application confidence, peak resident memory, and
+and spatial conditioning, application confidence, lattice-reused pixels,
+constant-vs-affine solve counts, physical-site cache hit rate, the fraction of
+candidates that avoided an independent gather/solve, peak resident memory, and
 total/synthesis time per megapixel. Held-out reports estimate uncertainty over
 64x64 sensor blocks instead of treating neighboring CFA sites as independent.
 They also retain deterministic per-site phase, reference-only structure,

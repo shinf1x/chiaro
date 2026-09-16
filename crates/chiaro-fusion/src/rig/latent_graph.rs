@@ -23,17 +23,21 @@
 //! correspondence membership is therefore frozen exactly like the other rig
 //! strategies' validation population.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use serde::Serialize;
 
 use super::{
     FALLBACK_ROTATION_MIN_INLIERS, RigCameraInput, RigRefinementOptions, RigRefinementStrategy,
-    Track, TrackObservation, anchor_graph::build_anchor_tracks, fallback_epipolar_inliers,
-    fallback_rotation_inliers, pair_signed_depths, triangulate,
+    Track, TrackObservation,
+    anchor_graph::{AnchorGraphTimingReport, build_anchor_tracks},
+    fallback_epipolar_inliers, fallback_rotation_inliers, pair_signed_depths, triangulate,
 };
 use crate::{
-    align::{AlignmentCorrespondence, ModuleAlignment, detect_rig_corners},
+    align::{AlignmentCorrespondence, ModuleAlignment, RigCorner, detect_rig_corners},
     calibration::IntrinsicsMode,
     geometry::ResolvedCamera,
     image::Plane,
@@ -102,6 +106,25 @@ pub struct LatentCameraSupportReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct LatentMatchTimingReport {
+    pub total_seconds: f64,
+    pub seed_filter_seconds: f64,
+    pub seed_grouping_seconds: f64,
+    pub corner_detection_seconds: f64,
+    pub candidate_pool_seconds: f64,
+    pub cycle_graph_seconds: f64,
+    pub cycle_factory_edges_seconds: f64,
+    pub cycle_corner_uniqueness_seconds: f64,
+    pub cycle_bootstrap_graph_seconds: f64,
+    pub cycle_direct_seed_seconds: f64,
+    pub cycle_pair_models_seconds: f64,
+    pub cycle_reporting_seconds: f64,
+    pub candidate_enumeration_seconds: f64,
+    pub validation_constellation_seconds: f64,
+    pub unaccounted_seconds: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct LatentMatchReport {
     /// Pairwise image observations surviving the same independent epipolar
     /// filter used by the ordinary physical strategy.
@@ -109,6 +132,7 @@ pub struct LatentMatchReport {
     /// Multi-view tracks after reference-landmark merging.
     pub initial_tracks: usize,
     pub initial_three_plus_tracks: usize,
+    pub timings: LatentMatchTimingReport,
     /// Independently localized target-side landmarks searched for alternatives.
     pub candidate_pool_landmarks: usize,
     /// Target-camera observations for which more than one self-similar
@@ -1085,65 +1109,112 @@ fn correspondence_quality(correspondence: &AlignmentCorrespondence) -> f64 {
         - 0.1 * f64::from(correspondence.forward_backward_error_px)
 }
 
-fn filtered_seed_observations(
+fn filtered_seed_observations_for_camera(
+    camera: usize,
     cameras: &[RigCameraInput<'_>],
     reference_index: usize,
     alignments: &[ModuleAlignment],
     resolved: &[ResolvedCamera],
 ) -> Vec<SeedObservation> {
-    let mut observations = Vec::new();
-    for (camera, alignment) in alignments.iter().enumerate() {
-        if camera == reference_index
-            || !cameras[camera].match_evidence_enabled
-            || cameras[camera].calibration.is_none()
-        {
-            continue;
-        }
-        if !alignment.report.accepted && alignment.correspondences.len() < 8 {
-            continue;
-        }
-        let mut epipolar_inliers = fallback_epipolar_inliers(
+    if camera == reference_index
+        || camera >= alignments.len()
+        || camera >= resolved.len()
+        || !cameras[camera].match_evidence_enabled
+        || cameras[camera].calibration.is_none()
+    {
+        return Vec::new();
+    }
+    let alignment = &alignments[camera];
+    if !alignment.report.accepted && alignment.correspondences.len() < 8 {
+        return Vec::new();
+    }
+    let mut epipolar_inliers = fallback_epipolar_inliers(
+        &alignment.correspondences,
+        &resolved[reference_index],
+        &resolved[camera],
+    );
+    if !alignment.report.accepted
+        && alignment.correspondences.len() >= FALLBACK_ROTATION_MIN_INLIERS
+        && resolved[camera].focal_px >= resolved[reference_index].focal_px * 1.35
+    {
+        let rotation_inliers = fallback_rotation_inliers(
             &alignment.correspondences,
             &resolved[reference_index],
             &resolved[camera],
         );
-        if !alignment.report.accepted
-            && alignment.correspondences.len() >= FALLBACK_ROTATION_MIN_INLIERS
-            && resolved[camera].focal_px >= resolved[reference_index].focal_px * 1.35
-        {
-            let rotation_inliers = fallback_rotation_inliers(
-                &alignment.correspondences,
-                &resolved[reference_index],
-                &resolved[camera],
-            );
-            if !rotation_inliers.is_empty() {
-                let mut keep = vec![false; alignment.correspondences.len()];
-                for index in rotation_inliers {
-                    keep[index] = true;
-                }
-                let intersection = epipolar_inliers
-                    .iter()
-                    .copied()
-                    .filter(|&index| keep[index])
-                    .collect::<Vec<_>>();
-                if intersection.len() >= FALLBACK_ROTATION_MIN_INLIERS {
-                    epipolar_inliers = intersection;
-                }
+        if !rotation_inliers.is_empty() {
+            let mut keep = vec![false; alignment.correspondences.len()];
+            for index in rotation_inliers {
+                keep[index] = true;
             }
-        }
-        for index in epipolar_inliers {
-            let correspondence = alignment.correspondences[index];
-            if resolved[reference_index].contains(correspondence.reference_pixel)
-                && resolved[camera].contains(correspondence.target_pixel)
-            {
-                observations.push(SeedObservation {
-                    camera,
-                    correspondence,
-                });
+            let intersection = epipolar_inliers
+                .iter()
+                .copied()
+                .filter(|&index| keep[index])
+                .collect::<Vec<_>>();
+            if intersection.len() >= FALLBACK_ROTATION_MIN_INLIERS {
+                epipolar_inliers = intersection;
             }
         }
     }
-    observations
+    epipolar_inliers
+        .into_iter()
+        .filter_map(|index| {
+            let correspondence = alignment.correspondences[index];
+            (resolved[reference_index].contains(correspondence.reference_pixel)
+                && resolved[camera].contains(correspondence.target_pixel))
+            .then_some(SeedObservation {
+                camera,
+                correspondence,
+            })
+        })
+        .collect()
+}
+
+fn filtered_seed_observations(
+    cameras: &[RigCameraInput<'_>],
+    reference_index: usize,
+    alignments: &[ModuleAlignment],
+    resolved: &[ResolvedCamera],
+    requested_threads: usize,
+) -> Vec<SeedObservation> {
+    if cameras.is_empty() {
+        return Vec::new();
+    }
+    let automatic = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = if requested_threads == 0 {
+        automatic
+    } else {
+        requested_threads.min(automatic)
+    }
+    .clamp(1, cameras.len());
+    let cameras_per_worker = cameras.len().div_ceil(workers).max(1);
+    let chunks = std::thread::scope(|scope| {
+        cameras
+            .chunks(cameras_per_worker)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let first_camera = chunk_index * cameras_per_worker;
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    for local_camera in 0..chunk.len() {
+                        local.extend(filtered_seed_observations_for_camera(
+                            first_camera + local_camera,
+                            cameras,
+                            reference_index,
+                            alignments,
+                            resolved,
+                        ));
+                    }
+                    local
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("latent seed-filter worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    chunks.into_iter().flatten().collect()
 }
 
 fn group_seed_observations(
@@ -1196,10 +1267,92 @@ fn group_seed_observations(
     groups
 }
 
+#[derive(Debug)]
+struct PoolDedupIndex {
+    cell_size: f64,
+    radius_cells: i32,
+    cells: HashMap<(i32, i32), Vec<usize>>,
+    keys: Vec<(i32, i32)>,
+}
+
+impl PoolDedupIndex {
+    fn new(radius: f64) -> Self {
+        let cell_size = radius.max(1.0);
+        Self {
+            cell_size,
+            radius_cells: (radius.max(0.0) / cell_size).ceil() as i32,
+            cells: HashMap::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    fn key(&self, pixel: Vec2) -> (i32, i32) {
+        (
+            (pixel[0] / self.cell_size).floor() as i32,
+            (pixel[1] / self.cell_size).floor() as i32,
+        )
+    }
+
+    fn find_first(&self, pool: &[PoolFeature], pixel: Vec2, radius_sq: f64) -> Option<usize> {
+        let key = self.key(pixel);
+        let mut first = None::<usize>;
+        for gy in key.1 - self.radius_cells..=key.1 + self.radius_cells {
+            for gx in key.0 - self.radius_cells..=key.0 + self.radius_cells {
+                let Some(indices) = self.cells.get(&(gx, gy)) else {
+                    continue;
+                };
+                for &index in indices {
+                    if first.is_some_and(|current| index >= current) {
+                        continue;
+                    }
+                    if pool
+                        .get(index)
+                        .is_some_and(|feature| distance_squared(feature.pixel, pixel) <= radius_sq)
+                    {
+                        first = Some(index);
+                    }
+                }
+            }
+        }
+        first
+    }
+
+    fn insert(&mut self, index: usize, pixel: Vec2) {
+        let key = self.key(pixel);
+        if self.keys.len() == index {
+            self.keys.push(key);
+        } else if index < self.keys.len() {
+            self.keys[index] = key;
+        } else {
+            self.keys.resize(index + 1, key);
+        }
+        self.cells.entry(key).or_default().push(index);
+    }
+
+    fn move_index(&mut self, index: usize, new_pixel: Vec2) {
+        let new_key = self.key(new_pixel);
+        let Some(old_key) = self.keys.get(index).copied() else {
+            self.insert(index, new_pixel);
+            return;
+        };
+        if old_key == new_key {
+            return;
+        }
+        if let Some(indices) = self.cells.get_mut(&old_key) {
+            if let Some(position) = indices.iter().position(|&candidate| candidate == index) {
+                indices.swap_remove(position);
+            }
+        }
+        self.keys[index] = new_key;
+        self.cells.entry(new_key).or_default().push(index);
+    }
+}
+
 fn build_pool(
     camera: usize,
     observations: &[SeedObservation],
     luminance: Option<&Plane>,
+    detected_corners: &[RigCorner],
     resolved: &ResolvedCamera,
     dedup_radius_px: f64,
     maximum_detected_corners: usize,
@@ -1209,12 +1362,17 @@ fn build_pool(
     };
     let dedup_sq = dedup_radius_px * dedup_radius_px;
     let mut pool = Vec::<PoolFeature>::new();
+    let mut dedup = PoolDedupIndex::new(dedup_radius_px);
     for seed in observations.iter().filter(|seed| seed.camera == camera) {
         let correspondence = seed.correspondence;
-        if let Some(existing) = pool.iter_mut().find(|feature| {
-            distance_squared(feature.pixel, correspondence.target_pixel) <= dedup_sq
-        }) {
-            if correspondence_quality(&correspondence) > existing.seed_quality {
+        if let Some(existing_index) = dedup.find_first(
+            &pool,
+            correspondence.target_pixel,
+            dedup_sq,
+        ) {
+            if correspondence_quality(&correspondence) > pool[existing_index].seed_quality {
+                dedup.move_index(existing_index, correspondence.target_pixel);
+                let existing = &mut pool[existing_index];
                 existing.pixel = correspondence.target_pixel;
                 existing.localization_covariance = correspondence
                     .target_localization_covariance
@@ -1227,6 +1385,7 @@ fn build_pool(
             }
             continue;
         }
+        let index = pool.len();
         pool.push(PoolFeature {
             pixel: correspondence.target_pixel,
             localization_covariance: correspondence
@@ -1238,6 +1397,7 @@ fn build_pool(
             descriptor: descriptor_for_sensor_pixel(plane, correspondence.target_pixel),
             ray_direction: resolved.pixel_to_ray(correspondence.target_pixel).direction,
         });
+        dedup.insert(index, correspondence.target_pixel);
     }
 
     // The aligner exposes only its accepted correspondences, but latent
@@ -1246,20 +1406,15 @@ fn build_pool(
     // on the target luminance plane and add those independently localized
     // landmarks to the candidate pool. Matched landmarks above stay preferred
     // by the de-duplication pass because they were inserted first.
-    for corner in detect_rig_corners(plane)
-        .into_iter()
-        .take(maximum_detected_corners)
-    {
+    for corner in detected_corners.iter().take(maximum_detected_corners) {
         let pixel = [
             2.0 * f64::from(corner.subpixel[0]) + 0.5,
             2.0 * f64::from(corner.subpixel[1]) + 0.5,
         ];
-        if pool
-            .iter()
-            .any(|feature| distance_squared(feature.pixel, pixel) <= dedup_sq)
-        {
+        if dedup.find_first(&pool, pixel, dedup_sq).is_some() {
             continue;
         }
+        let index = pool.len();
         pool.push(PoolFeature {
             pixel,
             localization_covariance: corner.covariance.map(|row| row.map(f64::from)),
@@ -1269,6 +1424,7 @@ fn build_pool(
             descriptor: descriptor_for_sensor_pixel(plane, pixel),
             ray_direction: resolved.pixel_to_ray(pixel).direction,
         });
+        dedup.insert(index, pixel);
     }
     pool
 }
@@ -1292,38 +1448,104 @@ pub(super) fn build_latent_tracks(
     intrinsics_mode: IntrinsicsMode,
     options: &RigRefinementOptions,
 ) -> LatentBuildOutcome {
-    let seed_observations =
-        filtered_seed_observations(cameras, reference_index, alignments, resolved);
+    let total_started = Instant::now();
+    let seed_filter_started = Instant::now();
+    let seed_observations = filtered_seed_observations(
+        cameras,
+        reference_index,
+        alignments,
+        resolved,
+        options.threads,
+    );
+    let seed_filter_seconds = seed_filter_started.elapsed().as_secs_f64();
+
+    let seed_grouping_started = Instant::now();
     let groups = group_seed_observations(
         &seed_observations,
         cameras.len(),
         options.latent_reference_merge_radius_px,
     );
-    let pools = (0..cameras.len())
-        .map(|camera| {
-            if camera == reference_index
-                || !cameras[camera].match_evidence_enabled
-                || !seed_observations.iter().any(|seed| seed.camera == camera)
-            {
-                Vec::new()
-            } else {
-                build_pool(
-                    camera,
-                    &seed_observations,
-                    cameras[camera].luminance,
-                    &resolved[camera],
-                    options.latent_candidate_dedup_radius_px,
-                    options.latent_candidate_pool_max_corners,
-                )
-            }
-        })
-        .collect::<Vec<_>>();
+    let seed_grouping_seconds = seed_grouping_started.elapsed().as_secs_f64();
+
+    // Corner detection feeds both the latent alternative pool and the bootstrap
+    // cycle graph. Detect once per camera and share the immutable result.
+    let corner_detection_started = Instant::now();
+    let automatic = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = if options.threads == 0 {
+        automatic
+    } else {
+        options.threads.min(automatic)
+    }
+    .clamp(1, cameras.len().max(1));
+    let cameras_per_worker = cameras.len().div_ceil(workers).max(1);
+    let corner_chunks = std::thread::scope(|scope| {
+        cameras
+            .chunks(cameras_per_worker)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|camera| camera.luminance.map(detect_rig_corners).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("latent corner-detector worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let detected_corners = corner_chunks.into_iter().flatten().collect::<Vec<_>>();
+    let corner_detection_seconds = corner_detection_started.elapsed().as_secs_f64();
+
+    let candidate_pool_started = Instant::now();
+    let pool_chunks = std::thread::scope(|scope| {
+        cameras
+            .chunks(cameras_per_worker)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let first_camera = chunk_index * cameras_per_worker;
+                let detected_corners = &detected_corners;
+                let seed_observations = &seed_observations;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(local_camera, input)| {
+                            let camera = first_camera + local_camera;
+                            if camera == reference_index
+                                || !input.match_evidence_enabled
+                                || !seed_observations.iter().any(|seed| seed.camera == camera)
+                            {
+                                Vec::new()
+                            } else {
+                                build_pool(
+                                    camera,
+                                    seed_observations,
+                                    input.luminance,
+                                    &detected_corners[camera],
+                                    &resolved[camera],
+                                    options.latent_candidate_dedup_radius_px,
+                                    options.latent_candidate_pool_max_corners,
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("latent candidate-pool worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let pools = pool_chunks.into_iter().flatten().collect::<Vec<_>>();
+    let candidate_pool_seconds = candidate_pool_started.elapsed().as_secs_f64();
 
     // Reuse the mature anchor-graph matcher only as an image-derived
     // correspondence constraint. Running zero propagation rounds performs
     // overlap edge selection, direct mutual image matching, and initial cycle
     // promotion, but never invokes AnchorGraph's intermediate physical rig.
-    let (cycle_graph, cycle_candidate_edges, cycle_active_edges) =
+    let cycle_graph_started = Instant::now();
+    let (cycle_graph, cycle_candidate_edges, cycle_active_edges, cycle_anchor_timings) =
         if options.latent_cycle_graph_enabled && options.latent_cycle_graph_max_edges > 0 {
             let mut cycle_options = options.clone();
             cycle_options.strategy = RigRefinementStrategy::AnchorGraph;
@@ -1341,6 +1563,7 @@ pub(super) fn build_latent_tracks(
                 intrinsics_mode,
                 5,
                 &cycle_options,
+                Some(&detected_corners),
             );
             let candidate_edges = anchor.report.candidate_edges;
             let active_edges = anchor.report.final_active_edges;
@@ -1352,10 +1575,17 @@ pub(super) fn build_latent_tracks(
                 ),
                 candidate_edges,
                 active_edges,
+                anchor.report.timings.clone(),
             )
         } else {
-            (LatentCycleGraph::default(), 0, 0)
+            (
+                LatentCycleGraph::default(),
+                0,
+                0,
+                AnchorGraphTimingReport::default(),
+            )
         };
+    let cycle_graph_seconds = cycle_graph_started.elapsed().as_secs_f64();
 
     let mut tracks = Vec::new();
     let mut candidate_state = LatentCandidateState {
@@ -1384,6 +1614,20 @@ pub(super) fn build_latent_tracks(
         .collect();
     let mut report = LatentMatchReport {
         seed_pairwise_matches: seed_observations.len(),
+        timings: LatentMatchTimingReport {
+            seed_filter_seconds,
+            seed_grouping_seconds,
+            corner_detection_seconds,
+            candidate_pool_seconds,
+            cycle_graph_seconds,
+            cycle_factory_edges_seconds: cycle_anchor_timings.factory_edges_seconds,
+            cycle_corner_uniqueness_seconds: cycle_anchor_timings.corner_uniqueness_seconds,
+            cycle_bootstrap_graph_seconds: cycle_anchor_timings.bootstrap_graph_seconds,
+            cycle_direct_seed_seconds: cycle_anchor_timings.bootstrap_direct_seed_seconds,
+            cycle_pair_models_seconds: cycle_anchor_timings.final_pair_models_seconds,
+            cycle_reporting_seconds: cycle_anchor_timings.final_reporting_seconds,
+            ..Default::default()
+        },
         candidate_pool_landmarks: pools.iter().map(Vec::len).sum(),
         cycle_graph_candidate_edges: cycle_candidate_edges,
         cycle_graph_active_edges: cycle_active_edges,
@@ -1394,6 +1638,7 @@ pub(super) fn build_latent_tracks(
         ..Default::default()
     };
 
+    let candidate_enumeration_started = Instant::now();
     for group in groups {
         let target_count = group.targets.iter().flatten().count();
         if target_count == 0 {
@@ -1537,6 +1782,8 @@ pub(super) fn build_latent_tracks(
             max_ray_angle_degrees: f64::NAN,
         });
     }
+    report.timings.candidate_enumeration_seconds =
+        candidate_enumeration_started.elapsed().as_secs_f64();
 
     // Validation labels must be trustworthy independently of the physical rig.
     // Pairwise confidence/FB checks above catch ordinary local failures, but a
@@ -1546,12 +1793,14 @@ pub(super) fn build_latent_tracks(
     // mark only grossly inconsistent labels as unsuitable for held-out ground
     // truth. No candidate camera, triangulation, or fitted geometry participates
     // in this pass, so it cannot leak the rig solution into validation.
+    let validation_constellation_started = Instant::now();
     if options
         .latent_validation_max_constellation_error_px
         .is_finite()
         && options.latent_validation_max_constellation_error_px > 0.0
     {
         let mut constellation_rejected = 0usize;
+        let constellation_indices = build_constellation_indices(&tracks, cameras.len());
         for track_index in 0..tracks.len() {
             let key = tracks[track_index].key;
             let cameras_to_check = candidate_state
@@ -1568,6 +1817,7 @@ pub(super) fn build_latent_tracks(
             for camera in cameras_to_check {
                 let Some(predicted) = local_affine_prediction(
                     &tracks,
+                    &constellation_indices,
                     track_index,
                     camera,
                     options.latent_neighbour_count,
@@ -1604,12 +1854,23 @@ pub(super) fn build_latent_tracks(
         report.validation_constellation_rejected_observations = constellation_rejected;
     }
 
+    report.timings.validation_constellation_seconds =
+        validation_constellation_started.elapsed().as_secs_f64();
     report.initial_tracks = tracks.len();
     report.initial_three_plus_tracks = tracks
         .iter()
         .filter(|track| track.observations.len() >= 3)
         .count();
 
+    report.timings.total_seconds = total_started.elapsed().as_secs_f64();
+    let accounted = report.timings.seed_filter_seconds
+        + report.timings.seed_grouping_seconds
+        + report.timings.corner_detection_seconds
+        + report.timings.candidate_pool_seconds
+        + report.timings.cycle_graph_seconds
+        + report.timings.candidate_enumeration_seconds
+        + report.timings.validation_constellation_seconds;
+    report.timings.unaccounted_seconds = (report.timings.total_seconds - accounted).max(0.0);
     LatentBuildOutcome {
         pairwise_matches: seed_observations.len(),
         tracks,
@@ -1624,6 +1885,183 @@ fn reference_pixel(track: &Track) -> Option<Vec2> {
         .iter()
         .find(|observation| observation.fixed_gauge)
         .map(|observation| observation.pixel)
+}
+
+const CONSTELLATION_INDEX_CELL_PX: f64 = 96.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ConstellationPoint {
+    track_index: usize,
+    reference: Vec2,
+    target: Vec2,
+    confidence: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ConstellationSpatialIndex {
+    cell_size: f64,
+    cells: HashMap<(i32, i32), Vec<ConstellationPoint>>,
+    min_cell: [i32; 2],
+    max_cell: [i32; 2],
+    empty: bool,
+}
+
+impl Default for ConstellationSpatialIndex {
+    fn default() -> Self {
+        Self {
+            cell_size: CONSTELLATION_INDEX_CELL_PX,
+            cells: HashMap::new(),
+            min_cell: [0, 0],
+            max_cell: [0, 0],
+            empty: true,
+        }
+    }
+}
+
+impl ConstellationSpatialIndex {
+    fn insert(&mut self, point: ConstellationPoint) {
+        let key = (
+            (point.reference[0] / self.cell_size).floor() as i32,
+            (point.reference[1] / self.cell_size).floor() as i32,
+        );
+        if self.empty {
+            self.min_cell = [key.0, key.1];
+            self.max_cell = [key.0, key.1];
+            self.empty = false;
+        } else {
+            self.min_cell[0] = self.min_cell[0].min(key.0);
+            self.min_cell[1] = self.min_cell[1].min(key.1);
+            self.max_cell[0] = self.max_cell[0].max(key.0);
+            self.max_cell[1] = self.max_cell[1].max(key.1);
+        }
+        self.cells.entry(key).or_default().push(point);
+    }
+
+    /// Exact k-nearest lookup in reference-image space. Cells are expanded in
+    /// rings until the current kth neighbour is closer than the nearest point
+    /// any unvisited cell could contain. Ties are resolved by track index,
+    /// matching the original full-track scan order.
+    fn nearest(
+        &self,
+        reference: Vec2,
+        exclude_track: usize,
+        neighbour_count: usize,
+    ) -> Vec<(f64, Vec2, Vec2, f64)> {
+        if self.empty {
+            return Vec::new();
+        }
+        let wanted = neighbour_count.max(3);
+        let qx = (reference[0] / self.cell_size).floor() as i32;
+        let qy = (reference[1] / self.cell_size).floor() as i32;
+        let max_ring = (qx - self.min_cell[0])
+            .abs()
+            .max((qx - self.max_cell[0]).abs())
+            .max((qy - self.min_cell[1]).abs())
+            .max((qy - self.max_cell[1]).abs());
+        let mut best = Vec::<(f64, usize, Vec2, Vec2, f64)>::with_capacity(wanted + 1);
+
+        for ring in 0..=max_ring {
+            for gy in (qy - ring)..=(qy + ring) {
+                for gx in (qx - ring)..=(qx + ring) {
+                    if ring > 0
+                        && gx != qx - ring
+                        && gx != qx + ring
+                        && gy != qy - ring
+                        && gy != qy + ring
+                    {
+                        continue;
+                    }
+                    let Some(points) = self.cells.get(&(gx, gy)) else {
+                        continue;
+                    };
+                    for point in points {
+                        if point.track_index == exclude_track {
+                            continue;
+                        }
+                        let d2 = distance_squared(reference, point.reference);
+                        if !d2.is_finite() || d2 <= 1.0e-9 {
+                            continue;
+                        }
+                        let insertion = best
+                            .binary_search_by(|entry| {
+                                entry
+                                    .0
+                                    .total_cmp(&d2)
+                                    .then_with(|| entry.1.cmp(&point.track_index))
+                            })
+                            .unwrap_or_else(|index| index);
+                        if insertion < wanted {
+                            best.insert(
+                                insertion,
+                                (
+                                    d2,
+                                    point.track_index,
+                                    point.reference,
+                                    point.target,
+                                    point.confidence,
+                                ),
+                            );
+                            if best.len() > wanted {
+                                best.pop();
+                            }
+                        }
+                    }
+                }
+            }
+
+            if best.len() >= wanted {
+                let left = (qx - ring) as f64 * self.cell_size;
+                let right = (qx + ring + 1) as f64 * self.cell_size;
+                let top = (qy - ring) as f64 * self.cell_size;
+                let bottom = (qy + ring + 1) as f64 * self.cell_size;
+                let outside_distance = (reference[0] - left)
+                    .min(right - reference[0])
+                    .min(reference[1] - top)
+                    .min(bottom - reference[1])
+                    .max(0.0);
+                if best.last().is_some_and(|entry| entry.0 < outside_distance * outside_distance) {
+                    break;
+                }
+            }
+        }
+
+        best.into_iter()
+            .map(|(d2, _, source, target, confidence)| (d2, source, target, confidence))
+            .collect()
+    }
+}
+
+fn build_constellation_indices(
+    tracks: &[Track],
+    camera_count: usize,
+) -> Vec<ConstellationSpatialIndex> {
+    let mut indices = vec![ConstellationSpatialIndex::default(); camera_count];
+    // The legacy lookup used `.find()` and therefore only the first
+    // observation for a camera in a track. Track construction normally
+    // guarantees uniqueness, but preserve that exact behaviour here rather
+    // than relying on the invariant.
+    let mut last_seen_track = vec![usize::MAX; camera_count];
+    for (track_index, track) in tracks.iter().enumerate() {
+        let Some(reference) = reference_pixel(track) else {
+            continue;
+        };
+        for observation in &track.observations {
+            if observation.fixed_gauge || observation.camera >= camera_count {
+                continue;
+            }
+            if last_seen_track[observation.camera] == track_index {
+                continue;
+            }
+            last_seen_track[observation.camera] = track_index;
+            indices[observation.camera].insert(ConstellationPoint {
+                track_index,
+                reference,
+                target: observation.pixel,
+                confidence: observation.confidence,
+            });
+        }
+    }
+    indices
 }
 
 fn weighted_local_affine_fit(
@@ -1663,42 +2101,20 @@ fn weighted_local_affine_fit(
 
 fn local_affine_prediction(
     tracks: &[Track],
+    indices: &[ConstellationSpatialIndex],
     current_track_index: usize,
     camera: usize,
     neighbour_count: usize,
 ) -> Option<Vec2> {
     let reference = reference_pixel(&tracks[current_track_index])?;
-    let mut nearest = Vec::<(f64, Vec2, Vec2, f64)>::with_capacity(neighbour_count + 1);
-    for (index, track) in tracks.iter().enumerate() {
-        if index == current_track_index {
-            continue;
-        }
-        let Some(neighbour_reference) = reference_pixel(track) else {
-            continue;
-        };
-        let Some(observation) = track
-            .observations
-            .iter()
-            .find(|observation| observation.camera == camera)
-        else {
-            continue;
-        };
-        let d2 = distance_squared(reference, neighbour_reference);
-        if !d2.is_finite() || d2 <= 1.0e-9 {
-            continue;
-        }
-        nearest.push((
-            d2,
-            neighbour_reference,
-            observation.pixel,
-            observation.confidence,
-        ));
-    }
+    let nearest = indices.get(camera)?.nearest(
+        reference,
+        current_track_index,
+        neighbour_count,
+    );
     if nearest.len() < 3 {
         return None;
     }
-    nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
-    nearest.truncate(neighbour_count.max(3));
 
     // Local affine target = intercept + J * (reference - current_reference).
     // Repeated structure can leave a wrong latent identity among otherwise
@@ -1895,6 +2311,7 @@ pub(super) fn update_assignments(
     let mut score_after_sum = 0.0f64;
     let mut cycle_rejected_switches = 0usize;
     let mut cycle_predictions_evaluated = 0usize;
+    let constellation_indices = build_constellation_indices(tracks, cameras.len());
 
     // Build every proposal against one immutable assignment snapshot, then
     // apply them together.  Sequentially mutating a repeated lattice lets the
@@ -1920,6 +2337,7 @@ pub(super) fn update_assignments(
                 leave_one_camera_prediction(track, observation.camera, cameras, options);
             let constellation_prediction = local_affine_prediction(
                 tracks,
+                &constellation_indices,
                 track_index,
                 observation.camera,
                 options.latent_neighbour_count,
@@ -2290,6 +2708,57 @@ mod tests {
         assert_eq!(second.pairwise_reactivated, 1);
         assert_eq!(tracks.len(), 1);
         assert_eq!(report.pairwise_track_reactivations, 1);
+    }
+
+    #[test]
+    fn constellation_spatial_index_matches_bruteforce_neighbours() {
+        let mut index = ConstellationSpatialIndex::default();
+        let points = [
+            (0usize, [10.0, 10.0], [20.0, 20.0], 0.9),
+            (1usize, [12.0, 10.0], [22.0, 20.0], 0.8),
+            (2usize, [8.0, 10.0], [18.0, 20.0], 0.7),
+            (3usize, [10.0, 13.0], [20.0, 23.0], 0.6),
+            (4usize, [200.0, 200.0], [210.0, 210.0], 0.5),
+            (5usize, [-95.0, 10.0], [-85.0, 20.0], 0.4),
+        ];
+        for &(track_index, reference, target, confidence) in &points {
+            index.insert(ConstellationPoint {
+                track_index,
+                reference,
+                target,
+                confidence,
+            });
+        }
+
+        let query = [10.0, 10.0];
+        let exclude = 0usize;
+        let wanted = 4usize;
+        let indexed = index.nearest(query, exclude, wanted);
+        let mut brute = points
+            .iter()
+            .filter(|(track_index, _, _, _)| *track_index != exclude)
+            .map(|(track_index, reference, target, confidence)| {
+                (
+                    distance_squared(query, *reference),
+                    *track_index,
+                    *reference,
+                    *target,
+                    *confidence,
+                )
+            })
+            .filter(|entry| entry.0.is_finite() && entry.0 > 1.0e-9)
+            .collect::<Vec<_>>();
+        brute.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        brute.truncate(wanted.max(3));
+        let brute = brute
+            .into_iter()
+            .map(|(d2, _, source, target, confidence)| (d2, source, target, confidence))
+            .collect::<Vec<_>>();
+        assert_eq!(indexed, brute);
     }
 
     #[test]

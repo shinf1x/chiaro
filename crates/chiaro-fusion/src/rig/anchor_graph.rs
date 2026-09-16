@@ -19,7 +19,10 @@
 //! accepted only when local appearance and the independent 2-D constellation
 //! agree.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use serde::Serialize;
 
@@ -32,7 +35,8 @@ use crate::{
 };
 
 use super::{
-    ParameterKind, RigCameraInput, RigRefinementOptions, Track, TrackObservation,
+    ParameterKind, RigBundleTimingReport, RigCameraInput, RigRefinementOptions, Track,
+    TrackObservation,
     bearing_bootstrap, fallback_epipolar_inliers, filter_observable_parameter_specs,
     is_validation_track, parameter_specs, refinements_from_parameters, remap_parameters,
     resolve_cameras, staged_bundle_optimize_rig, triangulate,
@@ -144,6 +148,19 @@ pub struct AnchorGraphCameraReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct AnchorGraphTimingReport {
+    pub total_seconds: f64,
+    pub factory_edges_seconds: f64,
+    pub corner_uniqueness_seconds: f64,
+    pub bootstrap_graph_seconds: f64,
+    pub bootstrap_direct_seed_seconds: f64,
+    pub rounds_seconds: f64,
+    pub final_pair_models_seconds: f64,
+    pub final_reporting_seconds: f64,
+    pub unaccounted_seconds: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct AnchorGraphReport {
     pub factory_overlap_threshold: f64,
     pub candidate_edges: usize,
@@ -178,6 +195,7 @@ pub struct AnchorGraphReport {
     pub pairs: Vec<AnchorGraphPairReport>,
     pub graph_edges: Vec<AnchorGraphEdgeReport>,
     pub graph_cameras: Vec<AnchorGraphCameraReport>,
+    pub timings: AnchorGraphTimingReport,
 }
 
 pub(crate) struct AnchorGraphBuild {
@@ -864,18 +882,19 @@ fn corner_grid(corners: &[RigCorner], cell_size: f64) -> CornerGrid {
     grid
 }
 
-fn nearby_corner_indices(
+fn append_nearby_corner_indices(
     grid: &CornerGrid,
     centre: Vec2,
     radius: f64,
     cell_size: f64,
-) -> Vec<usize> {
+    indices: &mut Vec<usize>,
+) {
+    indices.clear();
     let cell_size = cell_size.max(8.0);
     let min_x = ((centre[0] - radius) / cell_size).floor() as i32;
     let max_x = ((centre[0] + radius) / cell_size).floor() as i32;
     let min_y = ((centre[1] - radius) / cell_size).floor() as i32;
     let max_y = ((centre[1] + radius) / cell_size).floor() as i32;
-    let mut indices = Vec::new();
     for gy in min_y..=max_y {
         for gx in min_x..=max_x {
             if let Some(cell) = grid.get(&(gx, gy)) {
@@ -883,7 +902,6 @@ fn nearby_corner_indices(
             }
         }
     }
-    indices
 }
 
 /// Local differential of the exact factory projection at one depth.  Using
@@ -893,18 +911,18 @@ fn factory_local_affine(
     source: &ResolvedCamera,
     target: &ResolvedCamera,
     source_pixel: Vec2,
+    target_pixel: Vec2,
     depth: f64,
 ) -> Option<Affine2> {
     const STEP: f64 = 12.0;
-    let offsets = [
-        [0.0, 0.0],
-        [STEP, 0.0],
-        [-STEP, 0.0],
-        [0.0, STEP],
-        [0.0, -STEP],
-    ];
-    let mut samples = Vec::with_capacity(offsets.len());
-    for offset in offsets {
+    // The centre projection was already evaluated by the caller to locate the
+    // target search window. Reuse it instead of running the full physical
+    // camera projection a second time for the affine fit.
+    let mut samples = Vec::with_capacity(5);
+    if source.contains(source_pixel) {
+        samples.push((source_pixel, target_pixel, 1.0));
+    }
+    for offset in [[STEP, 0.0], [-STEP, 0.0], [0.0, STEP], [0.0, -STEP]] {
         let source_sample = [source_pixel[0] + offset[0], source_pixel[1] + offset[1]];
         if !source.contains(source_sample) {
             continue;
@@ -917,11 +935,202 @@ fn factory_local_affine(
     fit_weighted_affine(&samples)
 }
 
+#[derive(Clone, Debug)]
+struct PreparedZnccSourcePatch {
+    values: Vec<f64>,
+    mean: f64,
+    energy: f64,
+    radius: usize,
+}
+
+fn prepare_zncc_source_patch(
+    source: &Plane,
+    source_sensor: Vec2,
+    radius: usize,
+) -> Option<PreparedZnccSourcePatch> {
+    let source_centre = sensor_to_luma(source_sensor);
+    let side = 2 * radius + 1;
+    let mut values = Vec::with_capacity(side * side);
+    for dy in -(radius as isize)..=(radius as isize) {
+        for dx in -(radius as isize)..=(radius as isize) {
+            let source_luma = [source_centre[0] + dx as f64, source_centre[1] + dy as f64];
+            values.push(sample_plane(source, source_luma)?);
+        }
+    }
+    if values.len() < 9 {
+        return None;
+    }
+    let count = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / count;
+    let mut energy = 0.0;
+    for &value in &values {
+        let centred = value - mean;
+        energy += centred * centred;
+    }
+    if energy <= 1.0e-12 {
+        return None;
+    }
+    Some(PreparedZnccSourcePatch {
+        values,
+        mean,
+        energy,
+        radius,
+    })
+}
+
+fn warped_zncc_prepared_source(
+    prepared: &PreparedZnccSourcePatch,
+    target: &Plane,
+    target_sensor: Vec2,
+    affine: Affine2,
+    target_values: &mut Vec<f64>,
+) -> Option<f64> {
+    let jacobian = affine.jacobian();
+    target_values.clear();
+    let expected = prepared.values.len();
+    if target_values.capacity() < expected {
+        target_values.reserve(expected - target_values.capacity());
+    }
+    for dy in -(prepared.radius as isize)..=(prepared.radius as isize) {
+        for dx in -(prepared.radius as isize)..=(prepared.radius as isize) {
+            let sensor_offset = [SENSOR_PER_LUMA * dx as f64, SENSOR_PER_LUMA * dy as f64];
+            let target_offset = [
+                jacobian[0][0] * sensor_offset[0] + jacobian[0][1] * sensor_offset[1],
+                jacobian[1][0] * sensor_offset[0] + jacobian[1][1] * sensor_offset[1],
+            ];
+            let target_luma = sensor_to_luma([
+                target_sensor[0] + target_offset[0],
+                target_sensor[1] + target_offset[1],
+            ]);
+            target_values.push(sample_plane(target, target_luma)?);
+        }
+    }
+    let count = target_values.len() as f64;
+    let target_mean = target_values.iter().sum::<f64>() / count;
+    let mut target_energy = 0.0;
+    let mut cross = 0.0;
+    for (&source_value, &target_value) in prepared.values.iter().zip(target_values.iter()) {
+        let source_value = source_value - prepared.mean;
+        let target_value = target_value - target_mean;
+        target_energy += target_value * target_value;
+        cross += source_value * target_value;
+    }
+    if target_energy <= 1.0e-12 {
+        return None;
+    }
+    Some(cross / (prepared.energy * target_energy).sqrt())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn factory_seed_choice_for_source(
+    source_index: usize,
+    source_corners: &[RigCorner],
+    target_corners: &[RigCorner],
+    target_grid: &CornerGrid,
+    source_plane: &Plane,
+    target_plane: &Plane,
+    source_camera: &ResolvedCamera,
+    target_camera: &ResolvedCamera,
+    depths: &[f64],
+    radius: f64,
+    cell_size: f64,
+    options: &RigRefinementOptions,
+) -> Option<DirectSeedChoice> {
+    let source_corner = &source_corners[source_index];
+    let source_pixel = corner_sensor(source_corner);
+    let prepared_source =
+        prepare_zncc_source_patch(source_plane, source_pixel, options.anchor_patch_radius_luma)?;
+    let mut target_values = Vec::with_capacity(prepared_source.values.len());
+    let mut nearby = Vec::<usize>::new();
+    // A candidate corner can be reached by more than one depth sample. Keep
+    // only the strongest depth-specific patch warp for that identity.
+    let mut candidates = HashMap::<usize, (f64, f64, f64, f64)>::with_capacity(32);
+    for &depth in depths {
+        let Some(predicted) = target_camera.map_from(source_camera, source_pixel, depth) else {
+            continue;
+        };
+        if predicted[0] < -radius
+            || predicted[1] < -radius
+            || predicted[0] > target_camera.width as f64 - 1.0 + radius
+            || predicted[1] > target_camera.height as f64 - 1.0 + radius
+        {
+            continue;
+        }
+        let Some(affine) = factory_local_affine(
+            source_camera,
+            target_camera,
+            source_pixel,
+            predicted,
+            depth,
+        ) else {
+            continue;
+        };
+        append_nearby_corner_indices(target_grid, predicted, radius, cell_size, &mut nearby);
+        for target_index in nearby.iter().copied() {
+            let target_pixel = corner_sensor(&target_corners[target_index]);
+            let prediction_error = distance(target_pixel, predicted);
+            if prediction_error > radius {
+                continue;
+            }
+            let Some(score) = warped_zncc_prepared_source(
+                &prepared_source,
+                target_plane,
+                target_pixel,
+                affine,
+                &mut target_values,
+            ) else {
+                continue;
+            };
+            if !score.is_finite() || score < options.anchor_direct_seed_min_zncc - 0.08 {
+                continue;
+            }
+            let ranked = score - 0.03 * prediction_error / radius;
+            let entry = candidates.entry(target_index).or_insert((
+                ranked,
+                score,
+                prediction_error,
+                affine.local_scale(),
+            ));
+            if ranked > entry.0 {
+                *entry = (ranked, score, prediction_error, affine.local_scale());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut ranked = candidates
+        .into_iter()
+        .map(
+            |(target_index, (ranked, score, prediction_error, local_scale))| {
+                (ranked, score, prediction_error, local_scale, target_index)
+            },
+        )
+        .collect::<Vec<_>>();
+    ranked.sort_by(|first, second| second.0.total_cmp(&first.0));
+    let best = ranked[0];
+    let second_score = ranked.get(1).map_or(-1.0, |candidate| candidate.1);
+    let margin = best.1 - second_score;
+    if best.1 < options.anchor_direct_seed_min_zncc
+        || margin < options.anchor_direct_seed_min_margin
+    {
+        return None;
+    }
+    Some(DirectSeedChoice {
+        other: best.4,
+        score: best.1,
+        margin,
+        prediction_error: best.2,
+        local_scale: best.3,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn factory_seed_choices(
     source_camera: usize,
     target_camera: usize,
     corners: &[Vec<RigCorner>],
+    corner_uniqueness: &[Vec<f64>],
     cameras: &[RigCameraInput<'_>],
     resolved: &[ResolvedCamera],
     options: &RigRefinementOptions,
@@ -946,7 +1155,16 @@ fn factory_seed_choices(
     let maximum_sources = options
         .anchor_direct_seed_max_corners
         .min(source_corners.len());
-    let source_uniqueness = corner_global_uniqueness(source_corners, source_plane);
+    let fallback_uniqueness;
+    let source_uniqueness = if let Some(values) = corner_uniqueness
+        .get(source_camera)
+        .filter(|values| values.len() == source_corners.len())
+    {
+        values.as_slice()
+    } else {
+        fallback_uniqueness = corner_global_uniqueness(source_corners, source_plane);
+        fallback_uniqueness.as_slice()
+    };
     let mut source_order = (0..source_corners.len()).collect::<Vec<_>>();
     source_order.sort_by(|&first, &second| {
         source_uniqueness[second]
@@ -958,91 +1176,52 @@ fn factory_seed_choices(
     });
     source_order.truncate(maximum_sources);
 
-    for source_index in source_order {
-        let source_corner = &source_corners[source_index];
-        let source_pixel = corner_sensor(source_corner);
-        // A candidate corner can be reached by more than one depth sample.
-        // Keep only the strongest depth-specific patch warp for that identity.
-        let mut candidates = HashMap::<usize, (f64, f64, f64, f64)>::new();
-        for &depth in &depths {
-            let Some(predicted) =
-                resolved[target_camera].map_from(&resolved[source_camera], source_pixel, depth)
-            else {
-                continue;
-            };
-            if predicted[0] < -radius
-                || predicted[1] < -radius
-                || predicted[0] > resolved[target_camera].width as f64 - 1.0 + radius
-                || predicted[1] > resolved[target_camera].height as f64 - 1.0 + radius
-            {
-                continue;
-            }
-            let Some(affine) = factory_local_affine(
-                &resolved[source_camera],
-                &resolved[target_camera],
-                source_pixel,
-                depth,
-            ) else {
-                continue;
-            };
-            for target_index in nearby_corner_indices(&target_grid, predicted, radius, cell_size) {
-                let target_pixel = corner_sensor(&target_corners[target_index]);
-                let prediction_error = distance(target_pixel, predicted);
-                if prediction_error > radius {
-                    continue;
-                }
-                let Some(score) = warped_zncc(
-                    source_plane,
-                    target_plane,
-                    source_pixel,
-                    target_pixel,
-                    affine,
-                    options.anchor_patch_radius_luma,
-                ) else {
-                    continue;
-                };
-                if !score.is_finite() || score < options.anchor_direct_seed_min_zncc - 0.08 {
-                    continue;
-                }
-                let ranked = score - 0.03 * prediction_error / radius;
-                let entry = candidates.entry(target_index).or_insert((
-                    ranked,
-                    score,
-                    prediction_error,
-                    affine.local_scale(),
-                ));
-                if ranked > entry.0 {
-                    *entry = (ranked, score, prediction_error, affine.local_scale());
-                }
-            }
-        }
-        if candidates.is_empty() {
-            continue;
-        }
-        let mut ranked = candidates
+    let automatic = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = if options.threads == 0 {
+        automatic
+    } else {
+        options.threads.min(automatic)
+    }
+    .clamp(1, source_order.len().max(1));
+    let sources_per_worker = source_order.len().div_ceil(workers).max(1);
+    let evaluated = std::thread::scope(|scope| {
+        source_order
+            .chunks(sources_per_worker)
+            .map(|chunk| {
+                let target_grid = &target_grid;
+                let depths = &depths;
+                let source_resolved = &resolved[source_camera];
+                let target_resolved = &resolved[target_camera];
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|&source_index| {
+                            factory_seed_choice_for_source(
+                                source_index,
+                                source_corners,
+                                target_corners,
+                                target_grid,
+                                source_plane,
+                                target_plane,
+                                source_resolved,
+                                target_resolved,
+                                depths,
+                                radius,
+                                cell_size,
+                                options,
+                            )
+                            .map(|choice| (source_index, choice))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
             .into_iter()
-            .map(
-                |(target_index, (ranked, score, prediction_error, local_scale))| {
-                    (ranked, score, prediction_error, local_scale, target_index)
-                },
-            )
-            .collect::<Vec<_>>();
-        ranked.sort_by(|first, second| second.0.total_cmp(&first.0));
-        let best = ranked[0];
-        let second_score = ranked.get(1).map_or(-1.0, |candidate| candidate.1);
-        let margin = best.1 - second_score;
-        if best.1 < options.anchor_direct_seed_min_zncc
-            || margin < options.anchor_direct_seed_min_margin
-        {
-            continue;
-        }
-        result[source_index] = Some(DirectSeedChoice {
-            other: best.4,
-            score: best.1,
-            margin,
-            prediction_error: best.2,
-            local_scale: best.3,
-        });
+            .map(|handle| handle.join().expect("anchor direct-seed worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    for (source_index, choice) in evaluated.into_iter().flatten() {
+        result[source_index] = Some(choice);
     }
     result
 }
@@ -1051,12 +1230,29 @@ fn direct_pair_seed_matches(
     first: usize,
     second: usize,
     corners: &[Vec<RigCorner>],
+    corner_uniqueness: &[Vec<f64>],
     cameras: &[RigCameraInput<'_>],
     resolved: &[ResolvedCamera],
     options: &RigRefinementOptions,
 ) -> Vec<DirectSeedMatch> {
-    let forward = factory_seed_choices(first, second, corners, cameras, resolved, options);
-    let reverse = factory_seed_choices(second, first, corners, cameras, resolved, options);
+    let forward = factory_seed_choices(
+        first,
+        second,
+        corners,
+        corner_uniqueness,
+        cameras,
+        resolved,
+        options,
+    );
+    let reverse = factory_seed_choices(
+        second,
+        first,
+        corners,
+        corner_uniqueness,
+        cameras,
+        resolved,
+        options,
+    );
     let mut matches = Vec::<DirectSeedMatch>::new();
     for (first_corner, choice) in forward.iter().enumerate() {
         let Some(choice) = choice else {
@@ -1486,6 +1682,7 @@ fn seed_active_edges_directly(
     attempt_counts: &mut HashMap<(usize, usize), usize>,
     seeded_matches: &mut HashMap<(usize, usize), usize>,
     corners: &[Vec<RigCorner>],
+    corner_uniqueness: &[Vec<f64>],
     cameras: &[RigCameraInput<'_>],
     resolved: &[ResolvedCamera],
     reference_index: usize,
@@ -1535,7 +1732,15 @@ fn seed_active_edges_directly(
         }
 
         let mut matched =
-            direct_pair_seed_matches(first, second, corners, cameras, resolved, options);
+            direct_pair_seed_matches(
+                first,
+                second,
+                corners,
+                corner_uniqueness,
+                cameras,
+                resolved,
+                options,
+            );
         if matched.len() < options.anchor_min_pair_anchors {
             // Rescue a structurally sparse/poorly factory-aligned camera
             // without paying the wider search cost on every edge.  C modules
@@ -1550,6 +1755,7 @@ fn seed_active_edges_directly(
                 first,
                 second,
                 corners,
+                corner_uniqueness,
                 cameras,
                 resolved,
                 &rescue_options,
@@ -1579,6 +1785,7 @@ fn reseed_under_supported_active_edges(
     attempt_counts: &mut HashMap<(usize, usize), usize>,
     seeded_matches: &mut HashMap<(usize, usize), usize>,
     corners: &[Vec<RigCorner>],
+    corner_uniqueness: &[Vec<f64>],
     cameras: &[RigCameraInput<'_>],
     resolved: &[ResolvedCamera],
     reference_index: usize,
@@ -1627,7 +1834,15 @@ fn reseed_under_supported_active_edges(
         }
 
         let mut matched =
-            direct_pair_seed_matches(first, second, corners, cameras, resolved, options);
+            direct_pair_seed_matches(
+                first,
+                second,
+                corners,
+                corner_uniqueness,
+                cameras,
+                resolved,
+                options,
+            );
         if matched.len() < options.anchor_min_pair_anchors {
             let mut rescue_options = options.clone();
             // Geometry is already capture-refined here, so this wider pass is
@@ -1639,6 +1854,7 @@ fn reseed_under_supported_active_edges(
                 first,
                 second,
                 corners,
+                corner_uniqueness,
                 cameras,
                 resolved,
                 &rescue_options,
@@ -2621,6 +2837,11 @@ fn intermediate_geometry(
         vec![0.0; orientation_specs.len()]
     };
     let orientation_sweeps = options.max_iterations.clamp(1, 2);
+    // AnchorGraph does not currently expose per-round bundle timing in its
+    // public report, but the shared staged optimizer requires an accumulator.
+    // Keep one local accumulator for all bundle sweeps in this round so the
+    // instrumentation remains correct without changing AnchorGraph output.
+    let mut bundle_timings = RigBundleTimingReport::default();
     let (orientation_parameters, _, orientation_iterations) = staged_bundle_optimize_rig(
         bearing_parameters,
         &orientation_specs,
@@ -2629,6 +2850,7 @@ fn intermediate_geometry(
         &refs,
         intrinsics_mode,
         options,
+        &mut bundle_timings,
     );
 
     if round <= 1 {
@@ -2685,6 +2907,7 @@ fn intermediate_geometry(
         &refs,
         intrinsics_mode,
         options,
+        &mut bundle_timings,
     );
     let refinements = refinements_from_parameters(cameras.len(), &global_parameters, &global_specs);
     let resolved =
@@ -3425,9 +3648,13 @@ pub(crate) fn build_anchor_tracks(
     intrinsics_mode: IntrinsicsMode,
     validation_modulus: u64,
     options: &RigRefinementOptions,
+    precomputed_corners: Option<&[Vec<RigCorner>]>,
 ) -> AnchorGraphBuild {
+    let total_started = Instant::now();
     let mut report = AnchorGraphReport::default();
+    let factory_edges_started = Instant::now();
     let all_factory_edges = factory_edges(cameras, factory_cameras, options);
+    report.timings.factory_edges_seconds = factory_edges_started.elapsed().as_secs_f64();
     let candidate_edges = all_factory_edges
         .iter()
         .copied()
@@ -3483,10 +3710,55 @@ pub(crate) fn build_anchor_tracks(
     report.maximum_active_edges = maximum_active_edges;
     report.target_min_camera_degree = options.anchor_min_camera_degree;
 
-    let corners = cameras
-        .iter()
-        .map(|camera| camera.luminance.map(detect_rig_corners).unwrap_or_default())
-        .collect::<Vec<_>>();
+    let corner_uniqueness_started = Instant::now();
+    let owned_corners = precomputed_corners.is_none().then(|| {
+        cameras
+            .iter()
+            .map(|camera| camera.luminance.map(detect_rig_corners).unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    let corners = precomputed_corners
+        .or_else(|| owned_corners.as_deref())
+        .unwrap_or(&[]);
+    // Global corner uniqueness depends only on one image, but direct edge
+    // matching used to recompute it for every incident graph edge.
+    let automatic = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = if options.threads == 0 {
+        automatic
+    } else {
+        options.threads.min(automatic)
+    }
+    .clamp(1, corners.len().max(1));
+    let cameras_per_worker = corners.len().div_ceil(workers).max(1);
+    let uniqueness_chunks = std::thread::scope(|scope| {
+        corners
+            .chunks(cameras_per_worker)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let first_camera = chunk_index * cameras_per_worker;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(local_camera, camera_corners)| {
+                            let camera = first_camera + local_camera;
+                            cameras
+                                .get(camera)
+                                .and_then(|input| input.luminance)
+                                .map(|plane| corner_global_uniqueness(camera_corners, plane))
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("anchor uniqueness worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let corner_uniqueness = uniqueness_chunks.into_iter().flatten().collect::<Vec<_>>();
+    report.timings.corner_uniqueness_seconds = corner_uniqueness_started.elapsed().as_secs_f64();
+    let bootstrap_graph_started = Instant::now();
     let (mut tracks, bootstrap_matches) = bootstrap_graph(
         cameras,
         reference_index,
@@ -3496,6 +3768,8 @@ pub(crate) fn build_anchor_tracks(
         options,
         &mut report,
     );
+    report.timings.bootstrap_graph_seconds = bootstrap_graph_started.elapsed().as_secs_f64();
+    let bootstrap_direct_seed_started = Instant::now();
     // The old implementation only *labelled* non-reference edges active; it
     // never matched those image pairs.  Seed every unsupported active edge now
     // using factory geometry only as a wide proposal and mutual image evidence
@@ -3512,7 +3786,8 @@ pub(crate) fn build_anchor_tracks(
             &mut direct_seed_attempted,
             &mut direct_seed_attempt_counts,
             &mut direct_seed_matches,
-            &corners,
+            corners,
+            &corner_uniqueness,
             cameras,
             factory_cameras,
             reference_index,
@@ -3568,7 +3843,8 @@ pub(crate) fn build_anchor_tracks(
             &mut direct_seed_attempted,
             &mut direct_seed_attempt_counts,
             &mut direct_seed_matches,
-            &corners,
+            corners,
+            &corner_uniqueness,
             cameras,
             factory_cameras,
             reference_index,
@@ -3589,6 +3865,8 @@ pub(crate) fn build_anchor_tracks(
             break;
         }
     }
+    report.timings.bootstrap_direct_seed_seconds =
+        bootstrap_direct_seed_started.elapsed().as_secs_f64();
     report.initial_active_edges = active_edges.len();
     report.bootstrap_direct_seed_edges = bootstrap_direct_seed_edges;
     report.bootstrap_direct_seed_matches = bootstrap_direct_seed_matches;
@@ -3602,6 +3880,7 @@ pub(crate) fn build_anchor_tracks(
     let mut promoted_observations = 0usize;
     let mut spawned_tracks = 0usize;
     let mut stopped_early = false;
+    let rounds_started = Instant::now();
 
     for round in 1..=options.anchor_max_rounds {
         // A failed edge is not permanently impossible. As other camera pairs
@@ -3677,7 +3956,8 @@ pub(crate) fn build_anchor_tracks(
             &mut direct_seed_attempted,
             &mut direct_seed_attempt_counts,
             &mut direct_seed_matches,
-            &corners,
+            corners,
+            &corner_uniqueness,
             cameras,
             &geometry,
             reference_index,
@@ -4083,7 +4363,8 @@ pub(crate) fn build_anchor_tracks(
                     &mut direct_seed_attempted,
                     &mut direct_seed_attempt_counts,
                     &mut direct_seed_matches,
-                    &corners,
+                    corners,
+                    &corner_uniqueness,
                     cameras,
                     &geometry,
                     reference_index,
@@ -4158,7 +4439,11 @@ pub(crate) fn build_anchor_tracks(
         }
     }
 
+    report.timings.rounds_seconds = rounds_started.elapsed().as_secs_f64();
+    let final_pair_models_started = Instant::now();
     let final_models = pair_models(&tracks, cameras.len(), options);
+    report.timings.final_pair_models_seconds = final_pair_models_started.elapsed().as_secs_f64();
+    let final_reporting_started = Instant::now();
     report.pairs = final_models
         .iter()
         .map(|model| AnchorGraphPairReport {
@@ -4276,6 +4561,16 @@ pub(crate) fn build_anchor_tracks(
         .iter()
         .map(|track| track.observations.len().saturating_sub(1))
         .sum::<usize>();
+    report.timings.final_reporting_seconds = final_reporting_started.elapsed().as_secs_f64();
+    report.timings.total_seconds = total_started.elapsed().as_secs_f64();
+    let accounted = report.timings.factory_edges_seconds
+        + report.timings.corner_uniqueness_seconds
+        + report.timings.bootstrap_graph_seconds
+        + report.timings.bootstrap_direct_seed_seconds
+        + report.timings.rounds_seconds
+        + report.timings.final_pair_models_seconds
+        + report.timings.final_reporting_seconds;
+    report.timings.unaccounted_seconds = (report.timings.total_seconds - accounted).max(0.0);
     AnchorGraphBuild {
         tracks: ordinary,
         pairwise_matches: final_matches.max(bootstrap_matches),
@@ -4329,6 +4624,46 @@ mod tests {
         let model = validate_pair_anchors(anchors, 8, 3.0, 6).unwrap();
         assert!(model.anchors.iter().all(|anchor| anchor.track != 5));
         assert!(model.loo_rms < 1.0e-5, "{}", model.loo_rms);
+    }
+
+    #[test]
+    fn prepared_source_zncc_matches_original_score() {
+        let mut source = Plane::new(64, 64);
+        let mut target = Plane::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let value = ((x * 17 + y * 31 + x * y) % 251) as f32 / 251.0;
+                source.data[y * 64 + x] = value;
+                target.data[y * 64 + x] = value * 0.91 + 0.037;
+            }
+        }
+        let source_sensor = [60.5, 58.5];
+        let target_sensor = source_sensor;
+        let affine = Affine2 {
+            x: [1.0, 0.0, 0.0],
+            y: [0.0, 1.0, 0.0],
+        };
+        let original = warped_zncc(
+            &source,
+            &target,
+            source_sensor,
+            target_sensor,
+            affine,
+            5,
+        )
+        .expect("original score");
+        let prepared =
+            prepare_zncc_source_patch(&source, source_sensor, 5).expect("source patch");
+        let mut scratch = Vec::new();
+        let cached = warped_zncc_prepared_source(
+            &prepared,
+            &target,
+            target_sensor,
+            affine,
+            &mut scratch,
+        )
+        .expect("cached score");
+        assert_eq!(original.to_bits(), cached.to_bits());
     }
 
     #[test]

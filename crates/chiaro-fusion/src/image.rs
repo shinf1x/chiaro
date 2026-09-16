@@ -783,6 +783,7 @@ impl Plane {
     }
 
     /// Bilinear sample; `None` outside the image.
+    #[inline]
     pub fn sample(&self, x: f32, y: f32) -> Option<f32> {
         if !(x >= 0.0 && y >= 0.0 && x <= (self.width - 1) as f32 && y <= (self.height - 1) as f32)
         {

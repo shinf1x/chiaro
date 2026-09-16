@@ -1,8 +1,8 @@
 //! Experimental cross-camera reconstruction from physical CFA observations.
 //!
 //! This module is deliberately independent of the production selector. It
-//! provides a compact observation record and a tileable three-variable robust
-//! solve in the common D50 XYZ space. Real-capture held-out validation decides
+//! provides a compact observation record and tileable robust solves in the
+//! common D50 XYZ space: a cheap constant-XYZ tier and a full local-affine tier. Real-capture held-out validation decides
 //! whether the path is worth further production work.
 
 use chiaro::lri::{NoiseChannelModel, NoiseModel};
@@ -50,6 +50,22 @@ pub enum Visibility {
     Visible,
     Occluded,
     Unknown,
+}
+
+/// Complexity of the local Joint-CFA model.  Flat/weakly structured regions
+/// can use the three-parameter constant-XYZ model; edge/texture regions retain
+/// the full nine-parameter affine field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JointCfaSolveMode {
+    Constant,
+    Affine,
+}
+
+impl Default for JointCfaSolveMode {
+    fn default() -> Self {
+        Self::Affine
+    }
 }
 
 /// One real sensor measurement projected near an output reconstruction point.
@@ -106,6 +122,13 @@ struct DependencyUse {
 #[derive(Debug, Default)]
 pub struct CfaSolverScratch {
     robust_weights: Vec<f32>,
+    /// Precomputed design rows and immutable base weights for the current pixel.
+    /// The solver used to rebuild both for every IRLS pass and for several
+    /// diagnostics; keeping them here removes a large amount of repeated scalar
+    /// work in the hottest loop.
+    design_rows: Vec<[f32; MODEL_SIZE]>,
+    base_weights: Vec<f32>,
+    inverse_sigmas: Vec<f32>,
     original_variance: Vec<f32>,
     correlation_mass: Vec<f32>,
     dependency_uses: Vec<DependencyUse>,
@@ -115,6 +138,7 @@ pub struct CfaSolverScratch {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct JointCfaSolveReport {
     pub observations: usize,
+    pub mode: JointCfaSolveMode,
     pub cameras: usize,
     pub phase_mask: u8,
     /// RMS distance of the closest physical sampling position from its
@@ -131,6 +155,10 @@ pub struct JointCfaSolveReport {
     /// Smallest-to-largest elimination pivot ratio of that information. This
     /// is a conservative conditioning score in `[0, 1]`.
     pub information_confidence: f32,
+    /// Fraction of baseline robust loss removed by the solved model, further
+    /// tempered by its absolute residual. Unlike matrix conditioning this
+    /// measures whether the local model actually explains the sensor data.
+    pub fit_confidence: f32,
     /// Rank of the complete unregularized affine design (XYZ plus both
     /// spatial derivatives). A value below nine means the centre estimate can
     /// still depend on ridge priors through an unsupported slope direction.
@@ -141,11 +169,19 @@ pub struct JointCfaSolveReport {
 #[derive(Clone, Copy, Debug)]
 pub struct JointCfaEstimate {
     pub xyz: [f32; 3],
-    /// Confidence used by synthesis when blending this estimate with its
-    /// production baseline. The algebraic solver itself returns one.
+    /// Luminance/detail confidence used by synthesis when blending this
+    /// estimate with its trusted production colour baseline.
     pub application_weight: f32,
+    /// Chroma correction weight. Production Joint-CFA intentionally keeps this
+    /// at zero: the raw multi-camera solve supplies high-frequency luminance
+    /// while the established synthesis path owns chromaticity. Held-out
+    /// diagnostics may opt into a non-zero value without affecting rendering.
+    pub chroma_application_weight: f32,
     pub report: JointCfaSolveReport,
     model: [f32; MODEL_SIZE],
+    /// Solver-only confidence before the output structure gate is applied.
+    /// It combines matrix conditioning with actual robust fit improvement.
+    base_application_weight: f32,
     preserve_baseline_luminance: bool,
 }
 
@@ -166,23 +202,72 @@ impl JointCfaEstimate {
         baseline_xyz: [f32; 3],
         structure_weight: f32,
         preserve_baseline_luminance: bool,
+        chroma_weight: f32,
     ) {
-        self.application_weight *= structure_weight.clamp(0.0, 1.0);
+        self.application_weight =
+            self.base_application_weight * structure_weight.clamp(0.0, 1.0);
+        self.chroma_application_weight =
+            self.application_weight * chroma_weight.clamp(0.0, 1.0);
         self.preserve_baseline_luminance = preserve_baseline_luminance;
         self.xyz = self.applied_xyz_at([0.0, 0.0], baseline_xyz);
     }
 
+    /// Re-evaluate this solved local model at a nearby output-pixel offset.
+    /// The spatial lattice is deliberately luminance-only. Affine chroma
+    /// slopes are not propagated into neighbouring output pixels because a
+    /// tiny colour-model error becomes a conspicuous magenta/green impulse.
+    pub fn reapplied_luminance_at(
+        &self,
+        model_offset: [f32; 2],
+        baseline_xyz: [f32; 3],
+        structure_weight: f32,
+        preserve_baseline_luminance: bool,
+    ) -> Self {
+        let mut estimate = *self;
+        estimate.application_weight =
+            estimate.base_application_weight * structure_weight.clamp(0.0, 1.0);
+        estimate.chroma_application_weight = 0.0;
+        estimate.preserve_baseline_luminance = preserve_baseline_luminance;
+        estimate.xyz = estimate.applied_xyz_at(model_offset, baseline_xyz);
+        estimate
+    }
+
+    pub fn base_application_weight(&self) -> f32 {
+        self.base_application_weight
+    }
+
+    /// Apply the raw-CFA model as a detail reconstruction over a trusted colour
+    /// baseline. Luminance is taken from the fitted model, but chromaticity is
+    /// retained from the baseline unless an explicit diagnostic chroma weight
+    /// is supplied. This mirrors the useful part of Lumen's ResAmp philosophy:
+    /// aggressive high-frequency evidence is allowed to sharpen intensity
+    /// without inventing high-frequency colour.
     pub fn applied_xyz_at(&self, offset: [f32; 2], baseline_xyz: [f32; 3]) -> [f32; 3] {
-        let mut fitted = self.fitted_xyz_at(offset).map(|value| value.max(0.0));
-        if self.preserve_baseline_luminance && fitted[1] > 1.0e-8 {
-            let scale = baseline_xyz[1].max(0.0) / fitted[1];
-            for value in &mut fitted {
-                *value *= scale;
-            }
-        }
+        let fitted = self.fitted_xyz_at(offset).map(|value| value.max(0.0));
+        let baseline_y = baseline_xyz[1].max(0.0);
+        let fitted_y = fitted[1].max(0.0);
+
+        // Scale the trusted baseline colour to the fitted luminance. This is
+        // the Joint-CFA high-frequency detail candidate. In near-black regions
+        // do not manufacture a colour direction from an ill-conditioned ratio.
+        let luminance_candidate = if baseline_y > 1.0e-6 && fitted_y.is_finite() {
+            let scale = (fitted_y / baseline_y).clamp(0.0, 8.0);
+            baseline_xyz.map(|value| (value * scale).max(0.0))
+        } else {
+            baseline_xyz
+        };
+
+        let luma_weight = if self.preserve_baseline_luminance {
+            0.0
+        } else {
+            self.application_weight.clamp(0.0, 1.0)
+        };
+        let chroma_weight = self.chroma_application_weight.clamp(0.0, 1.0);
         std::array::from_fn(|channel| {
-            baseline_xyz[channel]
-                + self.application_weight * (fitted[channel] - baseline_xyz[channel])
+            let luma_delta = luminance_candidate[channel] - baseline_xyz[channel];
+            let chroma_delta = fitted[channel] - luminance_candidate[channel];
+            (baseline_xyz[channel] + luma_weight * luma_delta + chroma_weight * chroma_delta)
+                .max(0.0)
         })
     }
 }
@@ -207,20 +292,70 @@ pub fn solve_joint_xyz_with_scratch(
     prior_weight: f32,
     scratch: &mut CfaSolverScratch,
 ) -> Option<JointCfaEstimate> {
-    let valid_count = observations
-        .iter()
-        .filter(|observation| observation_weight(observation) > 0.0)
-        .count();
+    solve_joint_xyz_mode_with_scratch(
+        observations,
+        prior_xyz,
+        prior_weight,
+        JointCfaSolveMode::Affine,
+        scratch,
+    )
+}
+
+/// Tiered Joint-CFA solve.  `Constant` keeps only centre XYZ (3 variables),
+/// while `Affine` retains the historical XYZ + dXYZ/dx + dXYZ/dy model
+/// (9 variables).  Both paths share the same robust weighting, covariance
+/// accounting, camera-rank checks and report semantics.
+pub fn solve_joint_xyz_mode_with_scratch(
+    observations: &[CfaObservation],
+    prior_xyz: [f32; 3],
+    prior_weight: f32,
+    mode: JointCfaSolveMode,
+    scratch: &mut CfaSolverScratch,
+) -> Option<JointCfaEstimate> {
+    scratch.design_rows.clear();
+    scratch.base_weights.clear();
+    scratch.inverse_sigmas.clear();
+    scratch.design_rows.reserve(observations.len());
+    scratch.base_weights.reserve(observations.len());
+    scratch.inverse_sigmas.reserve(observations.len());
+
+    let mut valid_count = 0usize;
+    let mut observation_weight_sum = 0.0f32;
+    for observation in observations {
+        let weight = observation_weight(observation);
+        scratch.design_rows.push(design_row(observation));
+        scratch.base_weights.push(weight);
+        scratch
+            .inverse_sigmas
+            .push(observation.noise_variance.max(1.0e-10).sqrt().recip());
+        if weight > 0.0 {
+            valid_count += 1;
+            observation_weight_sum += weight;
+        }
+    }
     if valid_count < 3 {
         return None;
     }
-    let observation_scale =
-        observations.iter().map(observation_weight).sum::<f32>() / valid_count as f32;
-    let (data_rank, initial_information_confidence) = response_information(observations, None);
-    let (spatial_rank, initial_spatial_confidence) = spatial_information(observations, None);
-    if data_rank < 3 || spatial_rank < 2 {
+    let observation_scale = observation_weight_sum / valid_count as f32;
+    let (data_rank, initial_information_confidence) =
+        response_information_prepared(observations, &scratch.base_weights, None);
+    if data_rank < 3 {
         return None;
     }
+    let (_spatial_rank, initial_spatial_confidence) = if mode == JointCfaSolveMode::Affine {
+        let result = spatial_information_prepared(observations, &scratch.base_weights, None);
+        if result.0 < 2 {
+            return None;
+        }
+        result
+    } else {
+        (0, 1.0)
+    };
+
+    let parameter_count = match mode {
+        JointCfaSolveMode::Constant => 3,
+        JointCfaSolveMode::Affine => MODEL_SIZE,
+    };
     let regularization = prior_weight.max(1.0e-8) * observation_scale.max(1.0e-8);
     let mut estimate = [0.0_f32; MODEL_SIZE];
     estimate[..3].copy_from_slice(&prior_xyz);
@@ -228,7 +363,7 @@ pub fn solve_joint_xyz_with_scratch(
     for _ in 0..SOLVER_ITERATIONS {
         let mut normal = [[0.0_f64; MODEL_SIZE]; MODEL_SIZE];
         let mut rhs = [0.0_f64; MODEL_SIZE];
-        for parameter in 0..MODEL_SIZE {
+        for parameter in 0..parameter_count {
             let ridge = if parameter < 3 {
                 regularization
             } else {
@@ -239,26 +374,38 @@ pub fn solve_joint_xyz_with_scratch(
                 rhs[parameter] += f64::from(ridge * prior_xyz[parameter]);
             }
         }
-        for observation in observations {
-            let base_weight = observation_weight(observation);
+        for (index, observation) in observations.iter().enumerate() {
+            let base_weight = scratch.base_weights[index];
             if base_weight <= 0.0 {
                 continue;
             }
-            let design = design_row(observation);
-            let predicted = dot_model(design, estimate);
-            let normalized_residual = (observation.value - predicted).abs()
-                / observation.noise_variance.max(1.0e-10).sqrt();
+            let design = scratch.design_rows[index];
+            let predicted = dot_model_prefix(design, estimate, parameter_count);
+            let normalized_residual =
+                (observation.value - predicted).abs() * scratch.inverse_sigmas[index];
             let robust = (HUBER_SIGMA / normalized_residual.max(HUBER_SIGMA)).min(1.0);
             let weight = base_weight * robust;
-            for row in 0..MODEL_SIZE {
-                rhs[row] += f64::from(weight * design[row] * observation.value);
-                for column in 0..MODEL_SIZE {
-                    normal[row][column] += f64::from(weight * design[row] * design[column]);
-                }
-            }
+            accumulate_normal_upper(
+                &mut normal,
+                &mut rhs,
+                design,
+                observation.value,
+                weight,
+                parameter_count,
+            );
         }
-        estimate = solve_linear(normal, rhs)?.map(|value| value as f32);
-        if estimate.iter().any(|value| !value.is_finite()) {
+        mirror_upper_triangle(&mut normal, parameter_count);
+        let solved = solve_spd_prefix(normal, rhs, parameter_count)?;
+        for parameter in 0..parameter_count {
+            estimate[parameter] = solved[parameter] as f32;
+        }
+        for parameter in parameter_count..MODEL_SIZE {
+            estimate[parameter] = 0.0;
+        }
+        if estimate[..parameter_count]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
             return None;
         }
         iterations += 1;
@@ -273,7 +420,7 @@ pub fn solve_joint_xyz_with_scratch(
     let mut joint_loss = 0.0;
     let mut closest = [None::<(f32, [f32; 2])>; u32::BITS as usize];
     for (index, observation) in observations.iter().enumerate() {
-        let weight = observation_weight(observation);
+        let weight = scratch.base_weights[index];
         if weight <= 0.0 {
             continue;
         }
@@ -283,14 +430,16 @@ pub fn solve_joint_xyz_with_scratch(
                     + observation.response[1] * prior_xyz[1]
                     + observation.response[2] * prior_xyz[2]
             });
-        let joint_residual = observation.value - dot_model(design_row(observation), estimate);
-        let sigma = observation.noise_variance.max(1.0e-10).sqrt();
-        let normalized_residual = joint_residual.abs() / sigma;
+        let joint_residual = observation.value
+            - dot_model_prefix(scratch.design_rows[index], estimate, parameter_count);
+        let normalized_residual = joint_residual.abs() * scratch.inverse_sigmas[index];
         let robust = (HUBER_SIGMA / normalized_residual.max(HUBER_SIGMA)).min(1.0);
         scratch.robust_weights[index] = robust;
         residual_sum += weight * joint_residual.abs();
-        baseline_loss += weight * robust_noise_loss(baseline_residual / sigma);
-        joint_loss += weight * robust_noise_loss(joint_residual / sigma);
+        baseline_loss += weight
+            * robust_noise_loss(baseline_residual * scratch.inverse_sigmas[index]);
+        joint_loss +=
+            weight * robust_noise_loss(joint_residual * scratch.inverse_sigmas[index]);
         weight_sum += weight;
         if observation.camera_index < u32::BITS as usize {
             let distance = observation.output_offset[0].hypot(observation.output_offset[1]);
@@ -302,19 +451,37 @@ pub fn solve_joint_xyz_with_scratch(
         phase_mask |= 1 << observation.phase.index();
     }
     let robust_weights = Some(scratch.robust_weights.as_slice());
-    let (robust_rank, robust_information_confidence) =
-        response_information(observations, robust_weights);
-    let (robust_model_rank, _) = model_information(observations, robust_weights);
+    let (robust_rank, robust_information_confidence) = response_information_prepared(
+        observations,
+        &scratch.base_weights,
+        robust_weights,
+    );
+    let (robust_model_rank, _) = if mode == JointCfaSolveMode::Affine {
+        model_information_prepared(
+            observations,
+            &scratch.design_rows,
+            &scratch.base_weights,
+            robust_weights,
+        )
+    } else {
+        (robust_rank, robust_information_confidence)
+    };
     let (robust_spatial_rank, robust_spatial_confidence) =
-        spatial_information(observations, robust_weights);
-    if robust_rank < 3 || robust_spatial_rank < 2 {
+        if mode == JointCfaSolveMode::Affine {
+            spatial_information_prepared(observations, &scratch.base_weights, robust_weights)
+        } else {
+            (0, 1.0)
+        };
+    if robust_rank < 3
+        || (mode == JointCfaSolveMode::Affine && robust_spatial_rank < 2)
+    {
         return None;
     }
     let mut camera_weights = [0.0_f32; u32::BITS as usize];
     for (index, observation) in observations.iter().enumerate() {
         if observation.camera_index < camera_weights.len() {
             camera_weights[observation.camera_index] +=
-                observation_weight(observation) * scratch.robust_weights[index];
+                scratch.base_weights[index] * scratch.robust_weights[index];
         }
     }
     let strongest_camera = camera_weights.into_iter().fold(0.0_f32, f32::max);
@@ -341,35 +508,56 @@ pub fn solve_joint_xyz_with_scratch(
     }
     let phase_spread = (phase_spread_sum / closest_count.max(1) as f32).sqrt();
 
+    let information_confidence = initial_information_confidence
+        .min(robust_information_confidence)
+        .min(initial_spatial_confidence)
+        .min(robust_spatial_confidence);
+    let mean_baseline_loss = baseline_loss / weight_sum.max(1.0e-8);
+    let mean_joint_loss = joint_loss / weight_sum.max(1.0e-8);
+    let relative_fit = if mean_baseline_loss <= 1.0e-8 && mean_joint_loss <= 1.0e-8 {
+        // The spatially matched baseline can already be exact in diagnostic
+        // tests. That is a good fit, not a zero-confidence divide-by-zero case.
+        1.0
+    } else {
+        ((mean_baseline_loss - mean_joint_loss) / mean_baseline_loss.max(1.0e-8))
+            .clamp(0.0, 1.0)
+    };
+    // Conditioning says whether the equations constrain XYZ; fit confidence
+    // says whether the constrained model actually explains these measurements.
+    // The absolute-loss term is intentionally gentle for good fits but pushes
+    // noisy/contradictory solves down before they can become visible detail.
+    let absolute_fit = 1.0 / (1.0 + 0.25 * mean_joint_loss.max(0.0));
+    let fit_confidence = (relative_fit * absolute_fit).clamp(0.0, 1.0);
+    if fit_confidence < 0.05 {
+        return None;
+    }
+    let base_application_weight = information_confidence.sqrt() * fit_confidence;
     Some(JointCfaEstimate {
         xyz: [
             estimate[0].max(0.0),
             estimate[1].max(0.0),
             estimate[2].max(0.0),
         ],
-        application_weight: initial_information_confidence
-            .min(robust_information_confidence)
-            .min(initial_spatial_confidence)
-            .min(robust_spatial_confidence)
-            .sqrt(),
+        application_weight: base_application_weight,
+        chroma_application_weight: 0.0,
         report: JointCfaSolveReport {
             observations: valid_count,
+            mode,
             cameras: retained_camera_mask.count_ones() as usize,
             phase_mask,
             phase_spread,
             iterations,
             weighted_residual: residual_sum / weight_sum.max(1.0e-8),
-            in_sample_baseline_loss: baseline_loss / weight_sum.max(1.0e-8),
-            in_sample_affine_loss: joint_loss / weight_sum.max(1.0e-8),
+            in_sample_baseline_loss: mean_baseline_loss,
+            in_sample_affine_loss: mean_joint_loss,
             data_rank: robust_rank,
-            information_confidence: initial_information_confidence
-                .min(robust_information_confidence)
-                .min(initial_spatial_confidence)
-                .min(robust_spatial_confidence),
+            information_confidence,
+            fit_confidence,
             model_rank: robust_model_rank,
             spatial_rank: robust_spatial_rank,
         },
         model: estimate,
+        base_application_weight,
         preserve_baseline_luminance: false,
     })
 }
@@ -378,65 +566,71 @@ pub fn solve_joint_xyz_with_scratch(
 /// response information. Ridge priors deliberately do not participate: they
 /// may stabilize unsupported directions, but must not be reported as sensor
 /// evidence.
-fn response_information(
+fn response_information_prepared(
     observations: &[CfaObservation],
+    base_weights: &[f32],
     robust_weights: Option<&[f32]>,
 ) -> (usize, f32) {
     let mut information = [[0.0_f64; 3]; 3];
     for (index, observation) in observations.iter().enumerate() {
         let robust = robust_weights.map_or(1.0, |weights| weights[index]);
-        let weight = observation_weight(observation) * robust;
+        let weight = base_weights[index] * robust;
         if weight <= 0.0 {
             continue;
         }
-        accumulate_information(&mut information, observation.response, weight);
+        accumulate_information_upper(&mut information, observation.response, weight);
     }
+    mirror_upper_triangle(&mut information, 3);
     information_rank_matrix(information)
 }
 
-fn model_information(
+fn model_information_prepared(
     observations: &[CfaObservation],
+    designs: &[[f32; MODEL_SIZE]],
+    base_weights: &[f32],
     robust_weights: Option<&[f32]>,
 ) -> (usize, f32) {
     let mut information = [[0.0_f64; MODEL_SIZE]; MODEL_SIZE];
-    for (index, observation) in observations.iter().enumerate() {
+    for index in 0..observations.len() {
         let robust = robust_weights.map_or(1.0, |weights| weights[index]);
-        let weight = observation_weight(observation) * robust;
+        let weight = base_weights[index] * robust;
         if weight <= 0.0 {
             continue;
         }
-        accumulate_information(&mut information, design_row(observation), weight);
+        accumulate_information_upper(&mut information, designs[index], weight);
     }
+    mirror_upper_triangle(&mut information, MODEL_SIZE);
     information_rank_matrix(information)
 }
 
-fn spatial_information(
+fn spatial_information_prepared(
     observations: &[CfaObservation],
+    base_weights: &[f32],
     robust_weights: Option<&[f32]>,
 ) -> (usize, f32) {
     let total_weight = observations
         .iter()
         .enumerate()
-        .map(|(index, observation)| {
-            observation_weight(observation) * robust_weights.map_or(1.0, |weights| weights[index])
+        .map(|(index, _)| {
+            base_weights[index] * robust_weights.map_or(1.0, |weights| weights[index])
         })
         .sum::<f32>()
         .max(1.0e-10);
     let mut mean = [0.0_f32; 2];
     for (index, observation) in observations.iter().enumerate() {
         let weight =
-            observation_weight(observation) * robust_weights.map_or(1.0, |weights| weights[index]);
+            base_weights[index] * robust_weights.map_or(1.0, |weights| weights[index]);
         mean[0] += weight * observation.output_offset[0] / total_weight;
         mean[1] += weight * observation.output_offset[1] / total_weight;
     }
     let mut information = [[0.0_f64; 2]; 2];
     for (index, observation) in observations.iter().enumerate() {
         let robust = robust_weights.map_or(1.0, |weights| weights[index]);
-        let weight = observation_weight(observation) * robust;
+        let weight = base_weights[index] * robust;
         if weight <= 0.0 {
             continue;
         }
-        accumulate_information(
+        accumulate_information_upper(
             &mut information,
             [
                 observation.output_offset[0] - mean[0],
@@ -445,18 +639,48 @@ fn spatial_information(
             weight,
         );
     }
+    mirror_upper_triangle(&mut information, 2);
     information_rank_matrix(information)
 }
 
 #[inline]
-fn accumulate_information<const N: usize>(
+fn accumulate_information_upper<const N: usize>(
     information: &mut [[f64; N]; N],
     design: [f32; N],
     weight: f32,
 ) {
     for row in 0..N {
-        for column in 0..N {
-            information[row][column] += f64::from(weight * design[row] * design[column]);
+        let weighted = f64::from(weight * design[row]);
+        for column in row..N {
+            information[row][column] += weighted * f64::from(design[column]);
+        }
+    }
+}
+
+#[inline]
+fn accumulate_normal_upper(
+    normal: &mut [[f64; MODEL_SIZE]; MODEL_SIZE],
+    rhs: &mut [f64; MODEL_SIZE],
+    design: [f32; MODEL_SIZE],
+    value: f32,
+    weight: f32,
+    parameter_count: usize,
+) {
+    let value = f64::from(value);
+    for row in 0..parameter_count {
+        let weighted = f64::from(weight * design[row]);
+        rhs[row] += weighted * value;
+        for column in row..parameter_count {
+            normal[row][column] += weighted * f64::from(design[column]);
+        }
+    }
+}
+
+#[inline]
+fn mirror_upper_triangle<const N: usize>(matrix: &mut [[f64; N]; N], parameter_count: usize) {
+    for row in 0..parameter_count {
+        for column in row + 1..parameter_count {
+            matrix[column][row] = matrix[row][column];
         }
     }
 }
@@ -519,47 +743,67 @@ fn design_row(observation: &CfaObservation) -> [f32; MODEL_SIZE] {
     [x, y, z, dx * x, dx * y, dx * z, dy * x, dy * y, dy * z]
 }
 
-fn dot_model(first: [f32; MODEL_SIZE], second: [f32; MODEL_SIZE]) -> f32 {
-    first
-        .into_iter()
-        .zip(second)
-        .map(|(left, right)| left * right)
-        .sum()
+#[inline]
+fn dot_model_prefix(
+    first: [f32; MODEL_SIZE],
+    second: [f32; MODEL_SIZE],
+    parameter_count: usize,
+) -> f32 {
+    let mut sum = 0.0f32;
+    for index in 0..parameter_count {
+        sum += first[index] * second[index];
+    }
+    sum
 }
 
-fn solve_linear<const N: usize>(mut matrix: [[f64; N]; N], mut rhs: [f64; N]) -> Option<[f64; N]> {
-    for column in 0..N {
-        let pivot = (column..N).max_by(|left, right| {
-            matrix[*left][column]
-                .abs()
-                .total_cmp(&matrix[*right][column].abs())
-        })?;
-        if !matrix[pivot][column].is_finite() || matrix[pivot][column].abs() < 1.0e-14 {
-            return None;
-        }
-        matrix.swap(column, pivot);
-        rhs.swap(column, pivot);
-        let divisor = matrix[column][column];
-        for entry in &mut matrix[column][column..] {
-            *entry /= divisor;
-        }
-        rhs[column] /= divisor;
-        let pivot_row = matrix[column];
-        for row in 0..N {
+/// Solve the positive-definite normal equations with a Cholesky factorisation.
+/// Ridge regularisation guarantees a strictly positive diagonal for supported
+/// systems, so this is both cheaper and more cache-friendly than the previous
+/// full Gauss-Jordan elimination.
+fn solve_spd_prefix(
+    matrix: [[f64; MODEL_SIZE]; MODEL_SIZE],
+    rhs: [f64; MODEL_SIZE],
+    parameter_count: usize,
+) -> Option<[f64; MODEL_SIZE]> {
+    let mut lower = [[0.0_f64; MODEL_SIZE]; MODEL_SIZE];
+    for row in 0..parameter_count {
+        for column in 0..=row {
+            let mut sum = matrix[row][column];
+            for k in 0..column {
+                sum -= lower[row][k] * lower[column][k];
+            }
             if row == column {
-                continue;
+                if !sum.is_finite() || sum <= 1.0e-18 {
+                    return None;
+                }
+                lower[row][column] = sum.sqrt();
+            } else {
+                let diagonal = lower[column][column];
+                if !diagonal.is_finite() || diagonal.abs() <= 1.0e-18 {
+                    return None;
+                }
+                lower[row][column] = sum / diagonal;
             }
-            let factor = matrix[row][column];
-            if factor == 0.0 {
-                continue;
-            }
-            for (target, pivot) in matrix[row][column..].iter_mut().zip(&pivot_row[column..]) {
-                *target -= factor * pivot;
-            }
-            rhs[row] -= factor * rhs[column];
         }
     }
-    Some(rhs)
+
+    let mut y = [0.0_f64; MODEL_SIZE];
+    for row in 0..parameter_count {
+        let mut sum = rhs[row];
+        for column in 0..row {
+            sum -= lower[row][column] * y[column];
+        }
+        y[row] = sum / lower[row][row];
+    }
+    let mut solution = [0.0_f64; MODEL_SIZE];
+    for row in (0..parameter_count).rev() {
+        let mut sum = y[row];
+        for column in row + 1..parameter_count {
+            sum -= lower[column][row] * solution[column];
+        }
+        solution[row] = sum / lower[row][row];
+    }
+    Some(solution)
 }
 
 fn observation_weight(observation: &CfaObservation) -> f32 {
@@ -879,6 +1123,35 @@ mod tests {
     }
 
     #[test]
+    fn constant_tier_requires_colour_rank_but_not_spatial_rank() {
+        let observations = [
+            observation([1.0, 0.0, 0.0], 0.2, CfaPhase::R),
+            observation([0.0, 1.0, 0.0], 0.4, CfaPhase::Gr),
+            observation([0.0, 0.0, 1.0], 0.6, CfaPhase::B),
+            observation([1.0, 0.0, 0.0], 0.2, CfaPhase::R),
+            observation([0.0, 1.0, 0.0], 0.4, CfaPhase::Gr),
+            observation([0.0, 0.0, 1.0], 0.6, CfaPhase::B),
+        ];
+        let mut scratch = CfaSolverScratch::default();
+        let estimate = solve_joint_xyz_mode_with_scratch(
+            &observations,
+            [0.0; 3],
+            1.0e-6,
+            JointCfaSolveMode::Constant,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(estimate.report.mode, JointCfaSolveMode::Constant);
+        assert_eq!(estimate.report.model_rank, 3);
+        assert_eq!(estimate.report.spatial_rank, 0);
+        for (actual, expected) in estimate.xyz.into_iter().zip([0.2, 0.4, 0.6]) {
+            assert!((actual - expected).abs() < 1.0e-4);
+        }
+        // The full affine model correctly rejects the same coincident sites.
+        assert!(solve_joint_xyz(&observations, [0.0; 3], 1.0e-6).is_none());
+    }
+
+    #[test]
     fn unresolved_highlight_is_not_an_observation() {
         let mut observations = Vec::new();
         for (channel, phase) in [CfaPhase::R, CfaPhase::Gr, CfaPhase::B]
@@ -970,9 +1243,34 @@ mod tests {
         }
         let baseline = [0.1, 0.3, 0.5];
         let mut estimate = solve_joint_xyz(&observations, baseline, 1.0e-6).unwrap();
-        estimate.apply_over_baseline(baseline, 1.0, true);
+        estimate.apply_over_baseline(baseline, 1.0, true, 1.0);
         assert!((estimate.xyz[1] - baseline[1]).abs() < 1.0e-6);
         assert!((estimate.xyz[0] - baseline[0]).abs() > 1.0e-3);
+    }
+
+    #[test]
+    fn production_application_changes_luminance_without_chromaticity() {
+        let centres = [0.2, 0.4, 0.6];
+        let mut observations = Vec::new();
+        for (channel, phase) in [CfaPhase::R, CfaPhase::Gr, CfaPhase::B]
+            .into_iter()
+            .enumerate()
+        {
+            let mut response = [0.0; 3];
+            response[channel] = 1.0;
+            for offset in [[-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]] {
+                let mut sample = observation(response, centres[channel], phase);
+                sample.output_offset = offset;
+                observations.push(sample);
+            }
+        }
+        let baseline = [0.12, 0.30, 0.48];
+        let mut estimate = solve_joint_xyz(&observations, baseline, 1.0e-6).unwrap();
+        estimate.apply_over_baseline(baseline, 1.0, false, 0.0);
+        assert!((estimate.xyz[1] - baseline[1]).abs() > 1.0e-3);
+        assert!((estimate.xyz[0] / estimate.xyz[1] - baseline[0] / baseline[1]).abs() < 1.0e-6);
+        assert!((estimate.xyz[2] / estimate.xyz[1] - baseline[2] / baseline[1]).abs() < 1.0e-6);
+        assert_eq!(estimate.chroma_application_weight, 0.0);
     }
 
     #[test]

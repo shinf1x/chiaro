@@ -101,6 +101,155 @@ struct WarpCell {
     ty: f32,
 }
 
+/// Cell-cached horizontal raster sampler for a fixed warp-grid row.  Ordinary
+/// `Warp::sample` recomputes the Y cell, four grid indices and four node loads
+/// for every adjacent destination pixel.  Synthesis walks rows monotonically,
+/// so cache those values until the X cell changes and advance the reference X
+/// coordinate incrementally.  Interpolation keeps the same operation order as
+/// `Warp::sample` to minimise numerical drift.
+pub struct WarpScanlineSampler<'a> {
+    warp: &'a Warp,
+    fx: f32,
+    dfx: f32,
+    r0: usize,
+    r1: usize,
+    ty: f32,
+    valid_y: bool,
+    cached_c0: usize,
+    cached_points: [[f32; 2]; 4],
+    cached_confidence: [f32; 4],
+    cached_visibility: WarpVisibility,
+}
+
+impl Warp {
+    /// Prepare a scanline sampler beginning at reference X `x` and
+    /// advancing by `dx` for each call to [`WarpScanlineSampler::next`].
+    pub fn scanline(&self, x: f32, y: f32, dx: f32) -> WarpScanlineSampler<'_> {
+        let valid_grid = self.step > 0 && self.columns > 0 && self.rows > 0;
+        let inv_step = if valid_grid {
+            (self.step as f32).recip()
+        } else {
+            0.0
+        };
+        let fy = y * inv_step;
+        let valid_y = valid_grid && fy >= 0.0;
+        let r0 = if valid_y {
+            (fy.floor() as usize).min(self.rows - 1)
+        } else {
+            0
+        };
+        let r1 = if valid_y {
+            (r0 + 1).min(self.rows - 1)
+        } else {
+            0
+        };
+        WarpScanlineSampler {
+            warp: self,
+            fx: x * inv_step,
+            dfx: dx * inv_step,
+            r0,
+            r1,
+            ty: if valid_y { fy - r0 as f32 } else { 0.0 },
+            valid_y,
+            cached_c0: usize::MAX,
+            cached_points: [[f32::NAN; 2]; 4],
+            cached_confidence: [0.0; 4],
+            cached_visibility: WarpVisibility::Unknown,
+        }
+    }
+}
+
+impl WarpScanlineSampler<'_> {
+    #[inline]
+    fn load_cell(&mut self, c0: usize) {
+        let c1 = (c0 + 1).min(self.warp.columns - 1);
+        let index = |column: usize, row: usize| row * self.warp.columns + column;
+        self.cached_points = [
+            self.warp.points[index(c0, self.r0)],
+            self.warp.points[index(c1, self.r0)],
+            self.warp.points[index(c0, self.r1)],
+            self.warp.points[index(c1, self.r1)],
+        ];
+        if self.warp.confidence.len() == self.warp.points.len() {
+            self.cached_confidence = [
+                self.warp.confidence[index(c0, self.r0)],
+                self.warp.confidence[index(c1, self.r0)],
+                self.warp.confidence[index(c0, self.r1)],
+                self.warp.confidence[index(c1, self.r1)],
+            ];
+        } else {
+            self.cached_confidence = [0.0; 4];
+        }
+        self.cached_visibility = if self.warp.visibility.len() == self.warp.points.len() {
+            let values = [
+                self.warp.visibility[index(c0, self.r0)],
+                self.warp.visibility[index(c1, self.r0)],
+                self.warp.visibility[index(c0, self.r1)],
+                self.warp.visibility[index(c1, self.r1)],
+            ];
+            if values.contains(&WarpVisibility::Boundary) {
+                WarpVisibility::Boundary
+            } else {
+                let occluded = values.contains(&WarpVisibility::Occluded);
+                let visible = values.contains(&WarpVisibility::Visible);
+                let unknown = values.contains(&WarpVisibility::Unknown);
+                if occluded {
+                    if visible || unknown {
+                        WarpVisibility::Boundary
+                    } else {
+                        WarpVisibility::Occluded
+                    }
+                } else if unknown {
+                    WarpVisibility::Unknown
+                } else {
+                    WarpVisibility::Visible
+                }
+            }
+        } else {
+            WarpVisibility::Unknown
+        };
+        self.cached_c0 = c0;
+    }
+
+    /// Return the current sample and advance to the next output pixel.
+    #[inline]
+    pub fn next(&mut self) -> WarpSample {
+        let fx = self.fx;
+        self.fx += self.dfx;
+        if !self.valid_y || fx < 0.0 {
+            return WarpSample {
+                mapped: None,
+                confidence: 0.0,
+                visibility: WarpVisibility::Unknown,
+            };
+        }
+        let c0 = (fx.floor() as usize).min(self.warp.columns - 1);
+        if c0 != self.cached_c0 {
+            self.load_cell(c0);
+        }
+        let tx = fx - c0 as f32;
+        let [a, b, c, d] = self.cached_points;
+        let mut mapped = [0.0f32; 2];
+        for k in 0..2 {
+            let top = a[k] * (1.0 - tx) + b[k] * tx;
+            let bottom = c[k] * (1.0 - tx) + d[k] * tx;
+            mapped[k] = top * (1.0 - self.ty) + bottom * self.ty;
+        }
+        let mapped = (!mapped[0].is_nan() && !mapped[1].is_nan()).then_some(mapped);
+        let [ca, cb, cc, cd] = self.cached_confidence;
+        let confidence = {
+            let top = ca * (1.0 - tx) + cb * tx;
+            let bottom = cc * (1.0 - tx) + cd * tx;
+            (top * (1.0 - self.ty) + bottom * self.ty).clamp(0.0, 1.0)
+        };
+        WarpSample {
+            mapped,
+            confidence,
+            visibility: self.cached_visibility,
+        }
+    }
+}
+
 impl Warp {
     #[inline]
     fn cell(&self, x: f32, y: f32) -> Option<WarpCell> {
@@ -583,6 +732,63 @@ pub struct AlignmentSeed<'a> {
     pub name: &'static str,
 }
 
+/// Work profile for one image-space alignment pass.
+///
+/// The original aligner used the same complete coarse-to-fine + sparse-feature
+/// pipeline both before and after physical rig refinement.  LatentGraph only
+/// needs a robust bootstrap population from the factory pass, while the
+/// post-rig pass only needs the final residual warp.  Keeping those roles
+/// explicit avoids rendering/matching work whose output is never consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlignmentPass {
+    /// Historical complete alignment; retained for public callers/tests and
+    /// as a conservative fallback when a specialised pass has weak support.
+    #[default]
+    Full,
+    /// Factory-geometry bootstrap for sparse LatentGraph seeds.  Skip the
+    /// finest pyramid refinement because the subsequent native sparse matcher
+    /// already performs fine localisation in exactly that frame.
+    FactoryBootstrap,
+    /// Residual registration after a capture-specific physical rig is known.
+    /// Use a cheap scale-4 bootstrap followed by scale-2 refinement so the
+    /// expensive finest pass inherits the narrow residual search radius. Do
+    /// not regenerate sparse rig correspondences: the rig has already consumed
+    /// them.
+    PostRigResidual,
+    /// Conservative post-rig retry: full pyramid refinement, but still avoid
+    /// generating sparse correspondences that no downstream stage consumes.
+    PostRigResidualFallback,
+}
+
+impl AlignmentPass {
+    #[inline]
+    fn emit_rig_correspondences(self) -> bool {
+        matches!(self, Self::Full | Self::FactoryBootstrap)
+    }
+
+    #[inline]
+    fn finest_pyramid_level(self, level_count: usize) -> usize {
+        if matches!(self, Self::FactoryBootstrap) && level_count > 1 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn coarsest_pyramid_level(self, level_count: usize) -> usize {
+        match self {
+            // level=1 is reported as scale=4 because luminance itself is
+            // already half sensor resolution. Starting here is cheap enough
+            // to establish the residual homography, after which the existing
+            // `acquired_correction` path narrows the scale-2 search radius
+            // from `coarse_radius` to 3 pixels.
+            Self::PostRigResidual => level_count.saturating_sub(1).min(1),
+            _ => level_count.saturating_sub(1),
+        }
+    }
+}
+
 /// Reusable luminance pyramid for repeated alignment passes. Building down to
 /// the smallest alignment scale once lets each call borrow the prefix it
 /// needs instead of repeatedly cloning/downsampling the same module.
@@ -661,6 +867,26 @@ pub fn align_module_seeded_cached(
     seed: Option<AlignmentSeed<'_>>,
     reference_pyramid: &AlignPyramidCache,
     target_pyramid: &AlignPyramidCache,
+) -> Result<ModuleAlignment> {
+    align_module_seeded_cached_for_pass(
+        reference,
+        target,
+        options,
+        seed,
+        reference_pyramid,
+        target_pyramid,
+        AlignmentPass::Full,
+    )
+}
+
+pub fn align_module_seeded_cached_for_pass(
+    reference: &AlignInput<'_>,
+    target: &AlignInput<'_>,
+    options: &AlignOptions,
+    seed: Option<AlignmentSeed<'_>>,
+    reference_pyramid: &AlignPyramidCache,
+    target_pyramid: &AlignPyramidCache,
+    pass: AlignmentPass,
 ) -> Result<ModuleAlignment> {
     let (width, height) = (reference.width, reference.height);
     let mut report = AlignmentReport {
@@ -793,7 +1019,10 @@ pub fn align_module_seeded_cached(
         };
         alignment_magnification = magnification;
         let mut acquired_correction = false;
-        for level in (0..reference_pyramid.len()).rev() {
+        let finest_level = pass.finest_pyramid_level(reference_pyramid.len());
+        let coarsest_level = pass.coarsest_pyramid_level(reference_pyramid.len());
+        let mut finest_fitted_level = None::<usize>;
+        for level in (finest_level..=coarsest_level).rev() {
             let scale = 1usize << level; // reference luminance pixels per level pixel
             let reference_plane = &reference_pyramid[level];
             // Render the target through the current mapping at this level's
@@ -872,7 +1101,8 @@ pub fn align_module_seeded_cached(
                     inliers: inliers.len(),
                     median_residual_px: residuals[residuals.len() / 2],
                 });
-                if level == 0 {
+                if finest_fitted_level.map_or(true, |current| level < current) {
+                    finest_fitted_level = Some(level);
                     finest_residuals = residuals;
                     report.patches = pairs.len();
                     report.inliers = inliers.len();
@@ -888,7 +1118,7 @@ pub fn align_module_seeded_cached(
         }
     }
 
-    if options.refine {
+    if options.refine && pass.emit_rig_correspondences() {
         // Re-render at the native half-resolution luminance density through the
         // *final* 2-D alignment proposal. This image is only a search frame:
         // sparse correspondences remain explicit reference/target sensor
@@ -1820,6 +2050,56 @@ fn photometric_gain(reference: &Plane, target: &Plane, warp: &Warp) -> Option<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specialised_alignment_passes_select_expected_pyramid_ranges() {
+        assert_eq!(AlignmentPass::FactoryBootstrap.finest_pyramid_level(5), 1);
+        assert_eq!(AlignmentPass::FactoryBootstrap.coarsest_pyramid_level(5), 4);
+        assert_eq!(AlignmentPass::PostRigResidual.finest_pyramid_level(5), 0);
+        assert_eq!(AlignmentPass::PostRigResidual.coarsest_pyramid_level(5), 1);
+        assert_eq!(
+            AlignmentPass::PostRigResidualFallback.coarsest_pyramid_level(5),
+            4
+        );
+        assert!(!AlignmentPass::PostRigResidual.emit_rig_correspondences());
+        assert!(AlignmentPass::FactoryBootstrap.emit_rig_correspondences());
+        // Tiny images with a one-level pyramid must not create an invalid
+        // factory or post-rig range.
+        assert_eq!(AlignmentPass::FactoryBootstrap.finest_pyramid_level(1), 0);
+        assert_eq!(AlignmentPass::PostRigResidual.coarsest_pyramid_level(1), 0);
+    }
+
+    #[test]
+    fn scanline_sampler_matches_independent_warp_samples() {
+        let mut warp = Warp::from_fn(192, 128, 16, |point| {
+            Some([
+                point[0] * 1.013 + 0.0007 * point[1] + 3.0,
+                point[1] * 0.997 - 0.0004 * point[0] - 2.0,
+            ])
+        });
+        for (index, confidence) in warp.confidence.iter_mut().enumerate() {
+            *confidence = 0.35 + 0.6 * ((index % 11) as f32 / 10.0);
+        }
+        let x0 = 3.25;
+        let y = 47.75;
+        let dx = 0.43;
+        let mut scanline = warp.scanline(x0, y, dx);
+        for index in 0..300 {
+            let x = x0 + index as f32 * dx;
+            let expected = warp.sample(x, y);
+            let actual = scanline.next();
+            match (actual.mapped, expected.mapped) {
+                (Some(actual), Some(expected)) => {
+                    assert!((actual[0] - expected[0]).abs() < 2.0e-4);
+                    assert!((actual[1] - expected[1]).abs() < 2.0e-4);
+                }
+                (None, None) => {}
+                other => panic!("mapping mismatch at {index}: {other:?}"),
+            }
+            assert!((actual.confidence - expected.confidence).abs() < 2.0e-5);
+            assert_eq!(actual.visibility, expected.visibility);
+        }
+    }
 
     #[test]
     fn rig_corner_metric_rejects_one_dimensional_edges_but_accepts_corners() {

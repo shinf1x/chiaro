@@ -134,6 +134,24 @@ impl InverseWarpJacobian {
         [self.xx * dx + self.xy * dy, self.yx * dx + self.yy * dy]
     }
 
+    /// Map a small reference-raster displacement into source-sensor pixels.
+    /// `InverseWarpJacobian` stores source -> reference; Joint-CFA already has
+    /// this local inverse at its selected physical/residual geometry, so
+    /// invert it once algebraically instead of performing four independent
+    /// warp-grid lookups for structure admission.
+    #[inline]
+    pub fn source_offset(self, dx: f32, dy: f32) -> Option<[f32; 2]> {
+        let determinant = self.xx * self.yy - self.xy * self.yx;
+        if !determinant.is_finite() || determinant.abs() < 1.0e-8 {
+            return None;
+        }
+        let jxx = self.yy / determinant;
+        let jxy = -self.xy / determinant;
+        let jyx = -self.yx / determinant;
+        let jyy = self.xx / determinant;
+        Some([jxx * dx + jxy * dy, jyx * dx + jyy * dy])
+    }
+
     /// Conservative source-coordinate radius containing an output-space disc.
     pub fn source_radius(self, output_radius: f32, scale: f32) -> usize {
         let inverse_scale = scale.max(1.0e-4).recip();
@@ -610,6 +628,21 @@ mod tests {
         let reference_delta = inverse.map(source_delta[0], source_delta[1]);
         assert!((reference_delta[0] - 1.0).abs() < 1.0e-4);
         assert!((reference_delta[1] - 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn inverse_jacobian_round_trips_reference_offsets() {
+        let warp = Warp::from_fn(100, 100, 4, |p| {
+            Some([2.0 * p[0] + 0.25 * p[1], -0.5 * p[0] + 1.5 * p[1]])
+        });
+        let inverse = inverse_warp_jacobian(&warp, 50.0, 50.0).unwrap();
+        let reference_delta = [1.25, -0.75];
+        let source_delta = inverse
+            .source_offset(reference_delta[0], reference_delta[1])
+            .unwrap();
+        let recovered = inverse.map(source_delta[0], source_delta[1]);
+        assert!((recovered[0] - reference_delta[0]).abs() < 1.0e-4);
+        assert!((recovered[1] - reference_delta[1]).abs() < 1.0e-4);
     }
 
     #[test]

@@ -27,8 +27,8 @@ use chiaro_hotpixel_core::{
 use serde::Serialize;
 
 use crate::align::{
-    AlignInput, AlignOptions, AlignPyramidCache, AlignmentReport, ModuleAlignment,
-    align_module_seeded_cached,
+    AlignInput, AlignOptions, AlignPyramidCache, AlignmentPass, AlignmentReport, ModuleAlignment,
+    align_module_seeded_cached_for_pass,
 };
 use crate::array_color::{
     ArrayColorSelectionReport, ArrayColorSource, ColorProfileMode, ProfileBlend,
@@ -186,8 +186,16 @@ pub struct ColorSelectionReport {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AlignmentTimings {
+    /// Luminance conversion plus reusable alignment-pyramid construction.
+    pub alignment_preparation: f32,
+    /// Factory-geometry bootstrap used to seed capture-specific rig fitting.
+    pub factory_bootstrap: f32,
+    /// Backward-compatible alias for `factory_bootstrap`.
     pub factory_alignment: f32,
     pub rig_refinement: f32,
+    /// Fine image-space residual fit after the selected physical rig.
+    pub post_rig_residual: f32,
+    /// Backward-compatible alias for `post_rig_residual`.
     pub post_rig_alignment: f32,
     pub dense_depth: f32,
     pub resolution_refinement: f32,
@@ -629,6 +637,48 @@ fn alignment_inputs<'a>(
         .collect()
 }
 
+fn prepare_alignment_images(
+    modules: &[LoadedModule],
+    threads: usize,
+) -> (Vec<Plane>, Vec<AlignPyramidCache>) {
+    if modules.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let automatic_workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let requested_workers = if threads == 0 { automatic_workers } else { threads };
+    let worker_count = requested_workers.clamp(1, modules.len());
+    let modules_per_worker = modules.len().div_ceil(worker_count).max(1);
+    let chunks = std::thread::scope(|scope| {
+        modules
+            .chunks(modules_per_worker)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|module| {
+                            let luminance = module.mosaic.luminance_half();
+                            let pyramid = AlignPyramidCache::new(&luminance);
+                            (luminance, pyramid)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("alignment-preparation worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut luminance = Vec::with_capacity(modules.len());
+    let mut pyramids = Vec::with_capacity(modules.len());
+    for chunk in chunks {
+        for (plane, pyramid) in chunk {
+            luminance.push(plane);
+            pyramids.push(pyramid);
+        }
+    }
+    (luminance, pyramids)
+}
+
 fn disable_held_out_depth_evidence(inputs: &mut [AlignInput<'_>], held_out: &[String]) {
     for input in inputs {
         if held_out
@@ -676,6 +726,7 @@ fn align_all_modules(
     reference_index: usize,
     options: &AlignOptions,
     threads: usize,
+    pass: AlignmentPass,
 ) -> Result<Vec<ModuleAlignment>> {
     let reference = &inputs[reference_index];
     debug_assert_eq!(inputs.len(), pyramids.len());
@@ -696,14 +747,53 @@ fn align_all_modules(
                     (first_index..last_index)
                         .map(|index| {
                             let target = &inputs[index];
-                            let mut aligned = align_module_seeded_cached(
+                            let mut aligned = align_module_seeded_cached_for_pass(
                                 reference,
                                 target,
                                 options,
                                 None,
                                 &pyramids[reference_index],
                                 &pyramids[index],
+                                pass,
                             );
+                            // Specialised passes are intentionally cheaper, but
+                            // never strand a camera. If the reduced factory
+                            // bootstrap cannot provide a useful sparse seed
+                            // population, or the two-level post-rig residual
+                            // fit is not measurable, retry only that camera
+                            // with the conservative work profile.
+                            let retry_pass = aligned.as_ref().ok().and_then(|alignment| {
+                                if target.name == reference.name {
+                                    None
+                                } else {
+                                    match pass {
+                                        AlignmentPass::FactoryBootstrap
+                                            if alignment.correspondences.len() < 256 =>
+                                        {
+                                            Some(AlignmentPass::Full)
+                                        }
+                                        AlignmentPass::PostRigResidual
+                                            if !alignment.report.accepted
+                                                || alignment.report.inliers < 4
+                                                || !alignment.report.residual_median_px.is_finite() =>
+                                        {
+                                            Some(AlignmentPass::PostRigResidualFallback)
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            });
+                            if let Some(retry_pass) = retry_pass {
+                                aligned = align_module_seeded_cached_for_pass(
+                                    reference,
+                                    target,
+                                    options,
+                                    None,
+                                    &pyramids[reference_index],
+                                    &pyramids[index],
+                                    retry_pass,
+                                );
+                            }
                             if target.angle_optical_center_prior_reference_px.is_some()
                                 && let Ok(alignment) = &mut aligned
                             {
@@ -1394,14 +1484,9 @@ pub fn fuse(
         detail: "building luminance pyramids".to_owned(),
         fraction: 0.3,
     });
-    let luminance = modules
-        .iter()
-        .map(|module| module.mosaic.luminance_half())
-        .collect::<Vec<Plane>>();
-    let alignment_pyramids = luminance
-        .iter()
-        .map(AlignPyramidCache::new)
-        .collect::<Vec<_>>();
+    let (luminance, alignment_pyramids) = prepare_alignment_images(&modules, options.threads);
+    align_detail.alignment_preparation = substage_started.elapsed().as_secs_f32();
+    substage_started = Instant::now();
     let reference_index = modules
         .iter()
         .position(|module| module.raw.name == reference_name)
@@ -1429,9 +1514,11 @@ pub fn fuse(
         reference_index,
         &options.align,
         options.threads,
+        AlignmentPass::FactoryBootstrap,
     )?;
     drop(inputs);
-    align_detail.factory_alignment = substage_started.elapsed().as_secs_f32();
+    align_detail.factory_bootstrap = substage_started.elapsed().as_secs_f32();
+    align_detail.factory_alignment = align_detail.factory_bootstrap;
     substage_started = Instant::now();
     progress(Progress {
         stage: "align",
@@ -1518,6 +1605,7 @@ pub fn fuse(
             reference_index,
             &options.align,
             options.threads,
+            AlignmentPass::PostRigResidual,
         )?;
         evaluate_image_space_alignment(
             &mut rig_outcome.report,
@@ -1543,12 +1631,22 @@ pub fn fuse(
                 factory.report.angle_optical_center_prior_selected;
             refined.report.angle_optical_center_prior_quality =
                 factory.report.angle_optical_center_prior_quality;
+            // Sparse rig features belong to the pre-rig bootstrap. The fast
+            // post-rig pass intentionally does not regenerate them, so retain
+            // the diagnostics from the population that actually seeded the rig.
+            refined.report.rig_feature_candidates = factory.report.rig_feature_candidates;
+            refined.report.rig_feature_matches = factory.report.rig_feature_matches;
+            refined.report.rig_feature_rejected_ambiguous =
+                factory.report.rig_feature_rejected_ambiguous;
+            refined.report.rig_feature_rejected_forward_backward =
+                factory.report.rig_feature_rejected_forward_backward;
         }
         refined_alignments
     } else {
         factory_alignments
     };
-    align_detail.post_rig_alignment = substage_started.elapsed().as_secs_f32();
+    align_detail.post_rig_residual = substage_started.elapsed().as_secs_f32();
+    align_detail.post_rig_alignment = align_detail.post_rig_residual;
     substage_started = Instant::now();
     let mut inputs = alignment_inputs(&modules, &luminance, None);
     let mut depth_options = options.align.depth.clone();
