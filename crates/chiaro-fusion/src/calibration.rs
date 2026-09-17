@@ -380,6 +380,10 @@ pub struct MirrorModel {
     pub mirror_plane_distance: f64,
     pub mirror_normal_zero: Vec3,
     pub flip_img_around_x: bool,
+    /// Diagnostic compatibility with Lumen's movable-mirror world-to-camera
+    /// translation bug (`t_y` uses R(0,1) where R(1,0) is expected).
+    /// Disabled by default; this must never silently become factory geometry.
+    pub lumen_translation_compat: bool,
     pub actuator: MirrorActuator,
 }
 
@@ -392,8 +396,9 @@ pub struct PolynomialDistortion {
     pub coeffs: Vec<f64>,
 }
 
-/// Chief-ray-angle calibration retained as optical metadata. It is not
-/// treated as a replacement for the Brown object-space distortion model.
+/// Chief-ray-angle calibration retained as optical metadata. The default
+/// camera model continues to use Brown distortion; an explicit diagnostic
+/// mode can instead use Lumen's CRA-centred registration convention.
 #[derive(Clone, Debug)]
 pub struct CraCalibration {
     pub center: Option<Vec2>,
@@ -609,6 +614,11 @@ pub struct CameraCalibration {
     pub angle_optical_center_mapping: Option<AngleOpticalCenterMapping>,
     pub distortion: Option<PolynomialDistortion>,
     pub cra: Option<CraCalibration>,
+    /// Diagnostic runtime switch: reproduce Lumen's registration-image
+    /// distortion convention by applying the polynomial radial curve around
+    /// the CRA centre. Factory parsing leaves this disabled; the fusion
+    /// pipeline enables it explicitly for controlled A/B runs.
+    pub lumen_cra_registration_compat: bool,
     pub color: Vec<ColorProfile>,
     pub vignetting: Option<Vignetting>,
 }
@@ -1027,6 +1037,7 @@ fn mirror_model(system: &MirrorSystem, mapping: &MirrorActuatorMapping) -> Mirro
             .map(point3)
             .unwrap_or([0.0, 0.0, 1.0]),
         flip_img_around_x: system.flip_img_around_x.unwrap_or(false),
+        lumen_translation_compat: false,
         actuator: MirrorActuator {
             mean_std_normalize: mapping
                 .transformation_type

@@ -76,6 +76,12 @@ pub struct FusionOptions {
     /// branch exists as an explicit A/B experiment because the semantics of
     /// the protobuf quadratic branch metadata are not yet established.
     pub mirror_angle_mode: MirrorAngleMode,
+    /// Reproduce Lumen's apparent movable-mirror `t_y` matrix-index bug for a
+    /// controlled factory-geometry compatibility experiment.
+    pub lumen_mirror_translation_compat: bool,
+    /// Diagnostic only: use Lumen's CRA-centred radial registration warp as
+    /// the raw-raster distortion convention throughout latent-graph geometry.
+    pub lumen_cra_registration_compat: bool,
     /// Bootstrap factory image alignment with the movable camera's calibrated
     /// optical-axis point in its adjacent wider reference camera.
     pub angle_optical_center_prior: bool,
@@ -118,6 +124,8 @@ impl Default for FusionOptions {
             overlays: Vec::new(),
             intrinsics_mode: IntrinsicsMode::LinearHall,
             mirror_angle_mode: MirrorAngleMode::default(),
+            lumen_mirror_translation_compat: false,
+            lumen_cra_registration_compat: false,
             angle_optical_center_prior: true,
             hotpixel: None,
             cameras: Vec::new(),
@@ -150,6 +158,8 @@ pub struct Progress {
 pub struct FusionReport {
     pub reference: String,
     pub calibration_modules: usize,
+    pub lumen_mirror_translation_compat: bool,
+    pub lumen_cra_registration_compat: bool,
     /// 35 mm-equivalent focal length recorded for the framing, if any.
     pub framed_focal_length_mm: Option<i32>,
     pub modules: Vec<AlignmentReport>,
@@ -1263,8 +1273,10 @@ pub fn fuse(
         .collect::<Result<Vec<_>>>()?;
     let mut calibration = CalibrationDatabase::from_capture_and_overlays(&messages, &overlays);
     for camera in calibration.cameras.values_mut() {
+        camera.lumen_cra_registration_compat = options.lumen_cra_registration_compat;
         if let Some(mirror) = camera.mirror.as_mut() {
             mirror.actuator.angle_mode = options.mirror_angle_mode;
+            mirror.lumen_translation_compat = options.lumen_mirror_translation_compat;
         }
     }
     let states = module_states(&messages)
@@ -2213,6 +2225,8 @@ pub fn fuse(
     let report = FusionReport {
         reference: reference_name,
         calibration_modules: calibration.cameras.len(),
+        lumen_mirror_translation_compat: options.lumen_mirror_translation_compat,
+        lumen_cra_registration_compat: options.lumen_cra_registration_compat,
         framed_focal_length_mm,
         modules: alignments.iter().map(|a| a.report.clone()).collect(),
         rig_refinement: rig_outcome.report,

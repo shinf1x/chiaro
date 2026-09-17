@@ -12,7 +12,9 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::calibration::{CameraCalibration, IntrinsicsMode, ModuleState, PolynomialDistortion};
+use crate::calibration::{
+    CameraCalibration, CraCalibration, IntrinsicsMode, ModuleState, PolynomialDistortion,
+};
 use crate::math::{
     self, IDENTITY, Mat3, Vec2, Vec3, add, mul, mul_vec, normalize, reflection, scale, sub,
     transpose,
@@ -35,6 +37,11 @@ pub struct CameraRefinement {
     /// move together, which models a crop/active-area origin error without
     /// changing the calibrated distortion coefficients.
     pub sensor_offset_px: Option<Vec2>,
+    /// Additive correction to K's principal point, in calibration-raster
+    /// pixels. Unlike `sensor_offset_px`, this does not move the distortion
+    /// centre: it models an intrinsic optical-axis error rather than a raster
+    /// origin/crop error.
+    pub principal_point_offset_px: Option<Vec2>,
     /// Small capture-specific common multiplicative correction to focal
     /// length, expressed as a fractional delta from factory (0.001 = +0.1%).
     pub focal_scale_delta: Option<f64>,
@@ -62,6 +69,8 @@ pub struct ResolvedCameraTemplate {
     height: usize,
     base_k: Mat3,
     distortion: Option<PolynomialDistortion>,
+    cra: Option<CraCalibration>,
+    lumen_cra_registration_compat: bool,
     flip_around_x: Option<bool>,
     pose: PoseTemplate,
     focus_distance: Option<f64>,
@@ -85,6 +94,7 @@ enum PoseTemplate {
         point_on_rotation_axis: Vec3,
         mirror_plane_distance: f64,
         real_camera_location: Vec3,
+        lumen_translation_compat: bool,
     },
 }
 
@@ -115,6 +125,7 @@ impl ResolvedCameraTemplate {
                 point_on_rotation_axis: mirror.point_on_rotation_axis,
                 mirror_plane_distance: mirror.mirror_plane_distance,
                 real_camera_location: mirror.real_camera_location,
+                lumen_translation_compat: mirror.lumen_translation_compat,
             }
         } else {
             bail!(
@@ -128,6 +139,8 @@ impl ResolvedCameraTemplate {
             height: state.height,
             base_k,
             distortion: calibration.distortion.clone(),
+            cra: calibration.cra.clone(),
+            lumen_cra_registration_compat: calibration.lumen_cra_registration_compat,
             flip_around_x: calibration.mirror.as_ref().map(|m| m.flip_img_around_x),
             pose,
             focus_distance: calibration.focus_distance_for_hall(state.lens_hall, mode),
@@ -143,6 +156,7 @@ impl ResolvedCameraTemplate {
 
     pub fn resolve(&self, refinement: &CameraRefinement) -> Result<ResolvedCamera> {
         let sensor_offset = refinement.sensor_offset_px.unwrap_or([0.0; 2]);
+        let principal_point_offset = refinement.principal_point_offset_px.unwrap_or([0.0; 2]);
         let focal_scale = 1.0 + refinement.focal_scale_delta.unwrap_or(0.0);
         let focal_aspect = refinement.focal_aspect_delta.unwrap_or(0.0);
         let focal_x_scale = focal_scale * (1.0 + focal_aspect);
@@ -160,8 +174,8 @@ impl ResolvedCameraTemplate {
         let mut k = self.base_k;
         k[0][0] *= focal_x_scale;
         k[1][1] *= focal_y_scale;
-        k[0][2] += sensor_offset[0];
-        k[1][2] += sensor_offset[1];
+        k[0][2] += sensor_offset[0] + principal_point_offset[0];
+        k[1][2] += sensor_offset[1] + principal_point_offset[1];
         let k_inverse = math::inverse(&k).context("singular intrinsic matrix")?;
         let center_offset = refinement.center_offset_world.unwrap_or([0.0; 3]);
         let pose = match &self.pose {
@@ -184,6 +198,7 @@ impl ResolvedCameraTemplate {
                 point_on_rotation_axis,
                 mirror_plane_distance,
                 real_camera_location,
+                lumen_translation_compat,
             } => {
                 let angle = factory_angle_degrees + refinement.mirror_angle_offset_degrees;
                 let rotation = math::rotation_about_axis(*rotation_axis, angle.to_radians());
@@ -194,10 +209,19 @@ impl ResolvedCameraTemplate {
                 );
                 let reflect = reflection(normal);
                 let distance = math::dot(normal, sub(*real_camera_location, plane_point));
-                let virtual_center = add(
-                    sub(*real_camera_location, scale(normal, 2.0 * distance)),
-                    center_offset,
-                );
+                let factory_virtual_center =
+                    sub(*real_camera_location, scale(normal, 2.0 * distance));
+                let factory_virtual_center = if *lumen_translation_compat {
+                    lumen_compatible_mirror_center(
+                        *real_cw,
+                        reflect,
+                        factory_virtual_center,
+                        self.flip_around_x.unwrap_or(false),
+                    )
+                } else {
+                    factory_virtual_center
+                };
+                let virtual_center = add(factory_virtual_center, center_offset);
                 Pose::Mirror {
                     real_cw: *real_cw,
                     reflect,
@@ -209,24 +233,54 @@ impl ResolvedCameraTemplate {
             .orientation_offset_degrees
             .map(|v| math::rotation_from_axis_angle(scale(v, std::f64::consts::PI / 180.0)))
             .unwrap_or(IDENTITY);
-        let mut distortion = self.distortion.clone();
-        if let Some(distortion) = distortion.as_mut() {
-            distortion.center[0] += sensor_offset[0];
-            distortion.center[1] += sensor_offset[1];
+        let mut polynomial = self.distortion.clone();
+        if let Some(polynomial) = polynomial.as_mut() {
+            polynomial.center[0] += sensor_offset[0];
+            polynomial.center[1] += sensor_offset[1];
             if let Some(offset) = refinement.distortion_center_offset_px {
-                distortion.center[0] += offset[0];
-                distortion.center[1] += offset[1];
+                polynomial.center[0] += offset[0];
+                polynomial.center[1] += offset[1];
             }
             if let Some(delta) = refinement.distortion_delta {
-                if distortion.coeffs.len() < 4 {
-                    distortion.coeffs.resize(4, 0.0);
+                if polynomial.coeffs.len() < 4 {
+                    polynomial.coeffs.resize(4, 0.0);
                 }
-                distortion.coeffs[0] += delta[0];
-                distortion.coeffs[1] += delta[1];
-                distortion.coeffs[2] += delta[2];
-                distortion.coeffs[3] += delta[3];
+                polynomial.coeffs[0] += delta[0];
+                polynomial.coeffs[1] += delta[1];
+                polynomial.coeffs[2] += delta[2];
+                polynomial.coeffs[3] += delta[3];
             }
         }
+        let distortion = polynomial.map(|polynomial| {
+            let cra = self.cra.as_ref().and_then(|cra| {
+                let mut center = cra.center?;
+                let pixel_size = cra.pixel_size?;
+                if !center.iter().all(|value| value.is_finite())
+                    || !pixel_size.is_finite()
+                    || pixel_size <= 0.0
+                {
+                    return None;
+                }
+                center[0] += sensor_offset[0];
+                center[1] += sensor_offset[1];
+                if let Some(offset) = refinement.distortion_center_offset_px {
+                    center[0] += offset[0];
+                    center[1] += offset[1];
+                }
+                Some((center, pixel_size))
+            });
+            if self.lumen_cra_registration_compat
+                && let Some((center, pixel_size)) = cra
+            {
+                ResolvedDistortion::LumenCra {
+                    polynomial,
+                    center,
+                    pixel_size,
+                }
+            } else {
+                ResolvedDistortion::Brown(polynomial)
+            }
+        });
         Ok(ResolvedCamera {
             name: self.name.clone(),
             width: self.width,
@@ -245,6 +299,30 @@ impl ResolvedCameraTemplate {
     }
 }
 
+/// Convert the physical reflected centre into the effective centre implied by
+/// Lumen's `FUN_180226d90` translation. Its `t_y` expression uses the x
+/// coefficient from row 0 (`R[1]` in flat row-major storage) instead of row 1
+/// (`R[3]`). Lux intentionally reproduces that behavior for bit parity.
+fn lumen_compatible_mirror_center(
+    real_cw: Mat3,
+    reflect: Mat3,
+    physical_center: Vec3,
+    flip_around_x: bool,
+) -> Vec3 {
+    let mut rotation_wc = mul(&transpose(&real_cw), &reflect);
+    // Lumen restores handedness by flipping a column of camera-to-world P;
+    // after transposition this is a row of world-to-camera R.
+    let flipped_row = usize::from(flip_around_x);
+    for value in &mut rotation_wc[flipped_row] {
+        *value = -*value;
+    }
+    let mut translation = scale(mul_vec(&rotation_wc, physical_center), -1.0);
+    translation[1] = -(rotation_wc[0][1] * physical_center[0]
+        + rotation_wc[1][1] * physical_center[1]
+        + rotation_wc[1][2] * physical_center[2]);
+    scale(mul_vec(&transpose(&rotation_wc), translation), -1.0)
+}
+
 /// A module with its calibration resolved for one capture.
 #[derive(Clone, Debug)]
 pub struct ResolvedCamera {
@@ -253,7 +331,7 @@ pub struct ResolvedCamera {
     pub height: usize,
     pub k: Mat3,
     k_inverse: Mat3,
-    distortion: Option<PolynomialDistortion>,
+    distortion: Option<ResolvedDistortion>,
     flip_around_x: Option<bool>,
     pose: Pose,
     orientation_correction: Mat3,
@@ -264,6 +342,19 @@ pub struct ResolvedCamera {
     pub focus_distance: Option<f64>,
     angle_optical_center_reference: Option<&'static str>,
     angle_optical_center_reference_pixel: Option<Vec2>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedDistortion {
+    Brown(PolynomialDistortion),
+    /// Lumen's registration-image convention: use the factory polynomial to
+    /// derive a one-dimensional radial curve, then apply that curve around the
+    /// separate CRA centre. `pixel_size` determines the 2.9 mm curve limit.
+    LumenCra {
+        polynomial: PolynomialDistortion,
+        center: Vec2,
+        pixel_size: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -322,7 +413,7 @@ impl ResolvedCamera {
         let ideal = [self.k[0][2], self.k[1][2]];
         self.distortion
             .as_ref()
-            .map_or(ideal, |distortion| distort(distortion, ideal))
+            .map_or(ideal, |distortion| distort_resolved(distortion, ideal))
     }
 
     /// Restore right-handedness of a mirrored image by reflecting one axis.
@@ -341,7 +432,7 @@ impl ResolvedCamera {
     /// baking the pose we are trying to refine into the measurements.
     pub fn pixel_to_camera_direction(&self, pixel: Vec2) -> Vec3 {
         let ideal = match &self.distortion {
-            Some(distortion) => undistort(distortion, pixel),
+            Some(distortion) => undistort_resolved(distortion, pixel),
             None => pixel,
         };
         let mut direction = normalize(mul_vec(&self.k_inverse, [ideal[0], ideal[1], 1.0]));
@@ -455,7 +546,7 @@ impl ResolvedCamera {
             return None;
         }
         Some(match &self.distortion {
-            Some(distortion) => distort(distortion, ideal),
+            Some(distortion) => distort_resolved(distortion, ideal),
             None => ideal,
         })
     }
@@ -553,6 +644,66 @@ fn from_normalized(distortion: &PolynomialDistortion, normalized: Vec2) -> Vec2 
     ]
 }
 
+fn distort_resolved(distortion: &ResolvedDistortion, ideal: Vec2) -> Vec2 {
+    match distortion {
+        ResolvedDistortion::Brown(polynomial) => distort(polynomial, ideal),
+        ResolvedDistortion::LumenCra {
+            polynomial,
+            center,
+            pixel_size,
+        } => {
+            let delta = [ideal[0] - center[0], ideal[1] - center[1]];
+            let radius = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            if !radius.is_finite() || radius <= 1.0e-12 {
+                return ideal;
+            }
+
+            // Lumen samples this curve every 0.1 mm through 2.9 mm and stores
+            // it in a 4096-entry LUT. Evaluating the same curve continuously
+            // avoids rebuilding that LUT for every finite-difference camera
+            // trial while preserving the CRA-centre convention being tested.
+            let curve_radius = radius.min(2.9 / pixel_size);
+            if !curve_radius.is_finite() || curve_radius <= 1.0e-12 {
+                return ideal;
+            }
+            let curve_ideal = [polynomial.center[0] + curve_radius, polynomial.center[1]];
+            let curve_distorted = distort(polynomial, curve_ideal);
+            let radial_scale = (curve_distorted[0] - polynomial.center[0]) / curve_radius;
+            if !radial_scale.is_finite() {
+                return ideal;
+            }
+            [
+                center[0] + radial_scale * delta[0],
+                center[1] + radial_scale * delta[1],
+            ]
+        }
+    }
+}
+
+fn undistort_resolved(distortion: &ResolvedDistortion, pixel: Vec2) -> Vec2 {
+    if let ResolvedDistortion::Brown(polynomial) = distortion {
+        return undistort(polynomial, pixel);
+    }
+    // Lumen materialises the forward aligned-image warp. Chiaro keeps raw
+    // raster observations, so invert that warp to recover the ideal bearing.
+    let mut estimate = pixel;
+    for _ in 0..24 {
+        let mapped = distort_resolved(distortion, estimate);
+        let next = [
+            estimate[0] + pixel[0] - mapped[0],
+            estimate[1] + pixel[1] - mapped[1],
+        ];
+        let delta = (next[0] - estimate[0])
+            .abs()
+            .max((next[1] - estimate[1]).abs());
+        estimate = next;
+        if delta < 1.0e-10 {
+            break;
+        }
+    }
+    estimate
+}
+
 /// Brown model `k1, k2, p1, p2, k3` applied to normalised coordinates.
 fn distort_normalized(coeffs: &[f64], xy: Vec2) -> Vec2 {
     let c = |i: usize| coeffs.get(i).copied().unwrap_or(0.0);
@@ -648,6 +799,109 @@ mod tests {
             let back = distort(&distortion, ideal);
             assert!((back[0] - pixel[0]).abs() < 1e-6 && (back[1] - pixel[1]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn lumen_cra_distortion_uses_cra_center_and_round_trips() {
+        let polynomial = PolynomialDistortion {
+            center: [2111.0, 1579.0],
+            normalization: [4160.0, 4160.0],
+            coeffs: vec![0.01790894, -0.06085644, 0.0, 0.0, 0.01761046],
+        };
+        let brown = ResolvedDistortion::Brown(polynomial.clone());
+        let cra = ResolvedDistortion::LumenCra {
+            polynomial,
+            center: [2200.0, 1485.0],
+            pixel_size: 0.0011,
+        };
+        assert_eq!(distort_resolved(&cra, [2200.0, 1485.0]), [2200.0, 1485.0]);
+        let corner = [0.0, 0.0];
+        let maximum_corner_difference = [corner, [4159.0, 0.0], [0.0, 3119.0], [4159.0, 3119.0]]
+            .into_iter()
+            .map(|ideal| {
+                let brown = distort_resolved(&brown, ideal);
+                let cra = distort_resolved(&cra, ideal);
+                (brown[0] - cra[0]).hypot(brown[1] - cra[1])
+            })
+            .fold(0.0_f64, f64::max);
+        // The 2.9 mm Lumen curve-radius cap limits the largest difference for
+        // this representative calibration, but moving the radial origin still
+        // changes a corner by substantially more than sub-pixel roundoff.
+        assert!(maximum_corner_difference > 1.5);
+        for ideal in [corner, [2080.0, 1560.0], [4159.0, 3119.0]] {
+            let pixel = distort_resolved(&cra, ideal);
+            let recovered = undistort_resolved(&cra, pixel);
+            assert!((recovered[0] - ideal[0]).hypot(recovered[1] - ideal[1]) < 1.0e-7);
+        }
+    }
+
+    #[test]
+    fn camera_selects_lumen_cra_distortion_only_when_enabled() {
+        let distortion = PolynomialDistortion {
+            center: [500.0, 400.0],
+            normalization: [800.0, 800.0],
+            coeffs: vec![0.08, -0.02, 0.0, 0.0, 0.0],
+        };
+        let mut calibration = refinement_test_camera(Some(distortion));
+        calibration.cra = Some(CraCalibration {
+            center: Some([520.0, 380.0]),
+            sensor_distance: None,
+            exit_pupil_distance: None,
+            pixel_size: Some(0.0011),
+            lens_hall_code: None,
+            distance_hall_ratio: None,
+            radial_samples: Vec::new(),
+            fitted_coefficients: Vec::new(),
+            fit_cost: None,
+            valid_roi: None,
+        });
+        let state = refinement_test_state();
+        let brown = ResolvedCamera::new(
+            &calibration,
+            &state,
+            IntrinsicsMode::Clamp,
+            &CameraRefinement::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            brown.distortion,
+            Some(ResolvedDistortion::Brown(_))
+        ));
+        calibration.lumen_cra_registration_compat = true;
+        let cra = ResolvedCamera::new(
+            &calibration,
+            &state,
+            IntrinsicsMode::Clamp,
+            &CameraRefinement::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cra.distortion,
+            Some(ResolvedDistortion::LumenCra { .. })
+        ));
+    }
+
+    #[test]
+    fn lumen_mirror_translation_compat_reproduces_wrong_ty_index() {
+        let real_cw = math::rotation_about_axis(normalize([0.2, 0.9, -0.3]), 0.37);
+        let reflect = reflection(normalize([0.45, -0.25, 0.86]));
+        let physical_center = [18.0, -7.0, 31.0];
+        let flip_around_x = true;
+        let compatible =
+            lumen_compatible_mirror_center(real_cw, reflect, physical_center, flip_around_x);
+
+        let mut rotation_wc = mul(&transpose(&real_cw), &reflect);
+        for value in &mut rotation_wc[usize::from(flip_around_x)] {
+            *value = -*value;
+        }
+        let translated = scale(mul_vec(&rotation_wc, compatible), -1.0);
+        let lumen_ty = -(rotation_wc[0][1] * physical_center[0]
+            + rotation_wc[1][1] * physical_center[1]
+            + rotation_wc[1][2] * physical_center[2]);
+        let correct_ty = -math::dot(rotation_wc[1], physical_center);
+        assert!((translated[1] - lumen_ty).abs() < 1.0e-12);
+        assert!((lumen_ty - correct_ty).abs() > 1.0e-3);
+        assert!(norm(sub(compatible, physical_center)) > 1.0e-3);
     }
 
     #[test]
@@ -761,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn center_and_sensor_offsets_modify_the_resolved_camera_in_their_own_frames() {
+    fn center_and_intrinsic_offsets_modify_the_resolved_camera_in_their_own_frames() {
         let distortion = PolynomialDistortion {
             center: [500.0, 400.0],
             normalization: [800.0, 800.0],
@@ -803,7 +1057,26 @@ mod tests {
         let shifted_ray = sensor_only.pixel_to_ray(shifted_pixel);
         let factory_ray = factory.pixel_to_ray(factory_pixel);
         assert!(norm(sub(shifted_ray.direction, factory_ray.direction)) < 1.0e-10);
+
+        // A true principal-point correction moves K without translating the
+        // Brown distortion frame. With non-zero distortion this is therefore
+        // observably different from a calibration-raster origin shift.
+        let principal_only = ResolvedCamera::new(
+            &calibration,
+            &state,
+            IntrinsicsMode::Clamp,
+            &CameraRefinement {
+                principal_point_offset_px: Some([13.0, -7.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(principal_only.k[0][2], factory.k[0][2] + 13.0);
+        assert_eq!(principal_only.k[1][2], factory.k[1][2] - 7.0);
+        let principal_pixel = principal_only.project(point).unwrap();
+        assert!(
+            (principal_pixel[0] - shifted_pixel[0]).abs() > 1.0e-4
+                || (principal_pixel[1] - shifted_pixel[1]).abs() > 1.0e-4
+        );
     }
-
-
 }

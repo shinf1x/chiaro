@@ -22,10 +22,13 @@ mod latent_graph;
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
     thread,
     time::Instant,
 };
 
+use image::{Rgb, RgbImage};
 use serde::Serialize;
 
 use anchor_graph::build_anchor_tracks;
@@ -80,6 +83,9 @@ pub struct RigRefinementOptions {
     /// carries several repeated-structure hypotheses into alternating bundle
     /// and discrete correspondence-assignment passes.
     pub strategy: RigRefinementStrategy,
+    /// Optional focused visual audit of the final LatentGraph assignments.
+    /// Writes per-camera contact sheets plus a machine-readable manifest.
+    pub match_diagnostics_dir: Option<PathBuf>,
     /// Maximum anchor/constellation propagation rounds after the bootstrap.
     pub anchor_max_rounds: usize,
     /// Candidate camera pairs whose factory-calibrated overlap covers at least
@@ -248,7 +254,8 @@ pub struct RigRefinementOptions {
     /// this native-sensor error unless ordinary leave-one-camera-out geometry
     /// independently supports them.
     pub latent_cycle_max_error_px: f64,
-    /// Convert (1-self-similarity) into a small pixel-equivalent prior cost.
+    /// Convert each independent appearance deficit (target self-similarity and
+    /// scale-corrected reference similarity) into a pixel-equivalent cost.
     pub latent_appearance_penalty_px: f64,
     /// Clip individual geometric/constellation score terms so one bad current
     /// iterate cannot dominate all appearance evidence.
@@ -295,6 +302,10 @@ pub struct RigRefinementOptions {
     pub max_center_offset: f64,
     /// Strict calibration-raster origin correction bound per sensor axis.
     pub max_sensor_offset_px: f64,
+    /// Strict true principal-point correction bound per image axis. This is
+    /// the image-centre DOF used by LatentGraph; it does not translate the
+    /// calibrated Brown distortion centre.
+    pub max_principal_point_offset_px: f64,
     /// LatentGraph common focal correction bound as a fractional change from
     /// factory (0.02 = +/-2%).
     pub max_focal_scale_delta: f64,
@@ -320,6 +331,8 @@ pub struct RigRefinementOptions {
     pub center_prior_sigma: f64,
     /// Gaussian factory prior scale for each sensor-raster axis.
     pub sensor_offset_prior_sigma_px: f64,
+    /// Gaussian factory prior scale for each true principal-point axis.
+    pub principal_point_prior_sigma_px: f64,
     /// Gaussian prior sigma for the fractional common focal-scale correction.
     pub focal_scale_prior_sigma: f64,
     /// Gaussian priors for C-camera focal anisotropy and capture-local Brown
@@ -432,6 +445,7 @@ impl Default for RigRefinementOptions {
         Self {
             enabled: true,
             strategy: RigRefinementStrategy::LatentGraph,
+            match_diagnostics_dir: None,
             anchor_max_rounds: 4,
             anchor_min_factory_overlap: 0.20,
             anchor_initial_active_edges: 18,
@@ -527,6 +541,7 @@ impl Default for RigRefinementOptions {
             max_mirror_degrees: 2.0,
             max_center_offset: 5.0,
             max_sensor_offset_px: 64.0,
+            max_principal_point_offset_px: 64.0,
             max_focal_scale_delta: 0.02,
             max_focal_aspect_delta: 0.01,
             max_distortion_k1_delta: 0.03,
@@ -537,6 +552,7 @@ impl Default for RigRefinementOptions {
             mirror_prior_sigma_degrees: 0.35,
             center_prior_sigma: 1.0,
             sensor_offset_prior_sigma_px: 12.0,
+            principal_point_prior_sigma_px: 12.0,
             focal_scale_prior_sigma: 0.004,
             focal_aspect_prior_sigma: 0.002,
             distortion_k1_prior_sigma: 0.006,
@@ -690,6 +706,15 @@ pub struct RigRefinementTimingReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct RigMatchDiagnosticsReport {
+    pub directory: String,
+    pub samples: usize,
+    pub cameras: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct RigRefinementReport {
     pub enabled: bool,
     pub strategy: RigRefinementStrategy,
@@ -710,6 +735,9 @@ pub struct RigRefinementReport {
     /// multi-hypothesis strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latent_match: Option<LatentMatchReport>,
+    /// Focused visual audit written when `match_diagnostics_dir` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_diagnostics: Option<RigMatchDiagnosticsReport>,
     /// True only when the candidate reached fit and held-out geometric
     /// evaluation. Numeric validation fields are otherwise default storage,
     /// not measured zero error.
@@ -968,6 +996,9 @@ pub struct RigCameraCorrectionReport {
     pub mirror_angle_offset_degrees: f64,
     pub center_offset_world: [f64; 3],
     pub sensor_offset_px: [f64; 2],
+    /// True K principal-point correction; unlike `sensor_offset_px`, this does
+    /// not move the distortion centre.
+    pub principal_point_offset_px: [f64; 2],
     /// Fractional common focal change from factory (0.001 = +0.1%).
     pub focal_scale_delta: f64,
     /// Additional focal anisotropy; approximately fx += aspect, fy -= aspect.
@@ -1114,6 +1145,7 @@ enum ParameterKind {
     Mirror,
     Center(usize),
     Sensor(usize),
+    PrincipalPoint(usize),
     FocalScale,
     FocalAspect,
     DistortionCenter(usize),
@@ -1196,8 +1228,7 @@ fn finalize_rig_timings(report: &mut RigRefinementReport, total_started: &Instan
         + report.timings.outer_bundle_seconds
         + report.timings.evaluation_seconds
         + report.timings.diagnostics_seconds;
-    report.timings.unaccounted_seconds =
-        (report.timings.total_seconds - accounted).max(0.0);
+    report.timings.unaccounted_seconds = (report.timings.total_seconds - accounted).max(0.0);
 }
 
 /// Fit a bounded capture-specific physical model. The pipeline reserves an
@@ -1652,8 +1683,7 @@ pub fn refine_capture_rig(
                 latent_assignment_round,
                 latent_report,
             );
-            report.timings.latent_assignment_seconds +=
-                assignment_started.elapsed().as_secs_f64();
+            report.timings.latent_assignment_seconds += assignment_started.elapsed().as_secs_f64();
         }
     }
     let fit_assignment_refs = fit_assignment_tracks.iter().collect::<Vec<_>>();
@@ -1769,8 +1799,7 @@ pub fn refine_capture_rig(
                 latent_assignment_round,
                 latent_report,
             );
-            report.timings.latent_assignment_seconds +=
-                assignment_started.elapsed().as_secs_f64();
+            report.timings.latent_assignment_seconds += assignment_started.elapsed().as_secs_f64();
         }
     }
     let epipolar_seed_track_refs = epipolar_seed_tracks.iter().collect::<Vec<_>>();
@@ -1873,8 +1902,7 @@ pub fn refine_capture_rig(
                 ),
                 _ => 0,
             };
-            report.timings.latent_assignment_seconds +=
-                assignment_started.elapsed().as_secs_f64();
+            report.timings.latent_assignment_seconds += assignment_started.elapsed().as_secs_f64();
             switches
         } else {
             0
@@ -2314,6 +2342,28 @@ pub fn refine_capture_rig(
         report.fallback_reason = validation_failure_reason;
     }
 
+    if let (Some(directory), Some(candidates)) = (
+        options.match_diagnostics_dir.as_deref(),
+        latent_candidates.as_ref(),
+    ) {
+        report.match_diagnostics = Some(
+            write_latent_match_diagnostics(
+                directory,
+                cameras,
+                reference_index,
+                &fit_tracks,
+                &validation_tracks,
+                candidates,
+                &candidate_cameras,
+                options,
+            )
+            .unwrap_or_else(|error| RigMatchDiagnosticsReport {
+                directory: directory.display().to_string(),
+                error: Some(format!("{error:#}")),
+                ..Default::default()
+            }),
+        );
+    }
     report.timings.diagnostics_seconds = diagnostics_started.elapsed().as_secs_f64();
     finalize_rig_timings(&mut report, &total_started);
 
@@ -2325,6 +2375,637 @@ pub fn refine_capture_rig(
         },
         report,
     }
+}
+
+const MATCH_DIAGNOSTIC_MAX_ROWS: usize = 64;
+const MATCH_DIAGNOSTIC_PATCH_SIDE: usize = 25;
+const MATCH_DIAGNOSTIC_SCALE: usize = 4;
+const MATCH_DIAGNOSTIC_GAP: usize = 6;
+
+#[derive(Clone, Debug, Serialize)]
+struct MatchDiagnosticCandidate {
+    pixel: Vec2,
+    /// Compact target-to-target similarity used for candidate discovery.
+    appearance_similarity: f64,
+    /// Scale-corrected reference-to-candidate similarities used by latent
+    /// assignment scoring.
+    reference_similarity_9: Option<f64>,
+    reference_similarity_13: Option<f64>,
+    reference_similarity_25: Option<f64>,
+    reference_similarity_combined: Option<f64>,
+    large_patch_similarity_to_initial: Option<f64>,
+    reference_patch_similarity: Option<f64>,
+    selected: bool,
+    initial: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MatchDiagnosticSample {
+    row: usize,
+    split: &'static str,
+    track_key: [i32; 2],
+    camera: usize,
+    reference_pixel: Vec2,
+    selected_pixel: Vec2,
+    predicted_pixel: Option<Vec2>,
+    reprojection_error_px: Option<f64>,
+    local_scale: f64,
+    switched: bool,
+    strongest_unselected_similarity: Option<f64>,
+    candidates: Vec<MatchDiagnosticCandidate>,
+}
+
+#[derive(Serialize)]
+struct MatchDiagnosticCameraManifest<'a> {
+    camera: &'a str,
+    image: String,
+    rows: Vec<MatchDiagnosticSample>,
+}
+
+#[derive(Serialize)]
+struct MatchDiagnosticManifest<'a> {
+    reference_camera: &'a str,
+    patch_side_luma: usize,
+    display_scale: usize,
+    notes: [&'static str; 5],
+    cameras: Vec<MatchDiagnosticCameraManifest<'a>>,
+}
+
+fn diagnostic_leave_one_out_prediction(
+    track: &Track,
+    camera: usize,
+    resolved: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+) -> Option<Vec2> {
+    let others = track
+        .observations
+        .iter()
+        .filter(|observation| observation.camera != camera)
+        .cloned()
+        .collect::<Vec<_>>();
+    if others.len() < 2 {
+        return None;
+    }
+    let triangulated = triangulate(&others, resolved, options)?;
+    resolved[camera]
+        .project(triangulated.point)
+        .filter(|pixel| pixel.iter().all(|value| value.is_finite()))
+        .filter(|&pixel| resolved[camera].contains(pixel))
+}
+
+fn match_diagnostic_distance(first: Vec2, second: Vec2) -> f64 {
+    (first[0] - second[0]).hypot(first[1] - second[1])
+}
+
+fn collect_match_diagnostic_samples(
+    split: &'static str,
+    tracks: &[Track],
+    candidates: &LatentCandidateState,
+    resolved: &[ResolvedCamera],
+    camera_inputs: &[RigCameraInput<'_>],
+    reference_index: usize,
+    options: &RigRefinementOptions,
+    per_camera: &mut [Vec<MatchDiagnosticSample>],
+) {
+    for track in tracks {
+        let Some(reference) = track
+            .observations
+            .iter()
+            .find(|observation| observation.camera == reference_index)
+        else {
+            continue;
+        };
+        let Some(reference_plane) = camera_inputs[reference_index].luminance else {
+            continue;
+        };
+        for observation in track
+            .observations
+            .iter()
+            .filter(|observation| observation.camera != reference_index)
+        {
+            let Some(set) = candidates.observation_candidates(track.key, observation.camera)
+            else {
+                continue;
+            };
+            let selected_index = set
+                .candidates
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    let left_distance = match_diagnostic_distance(left.pixel, observation.pixel);
+                    let right_distance = match_diagnostic_distance(right.pixel, observation.pixel);
+                    left_distance.total_cmp(&right_distance)
+                })
+                .map_or(0, |(index, _)| index);
+            let predicted_pixel = diagnostic_leave_one_out_prediction(
+                track,
+                observation.camera,
+                resolved,
+                options,
+            );
+            let reprojection_error_px = predicted_pixel
+                .map(|predicted| match_diagnostic_distance(predicted, observation.pixel))
+                .filter(|error| error.is_finite());
+            let strongest_unselected_similarity = set
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != selected_index)
+                .map(|(_, candidate)| candidate.appearance_similarity)
+                .max_by(f64::total_cmp);
+            let rendered_candidates = set
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| MatchDiagnosticCandidate {
+                    pixel: candidate.pixel,
+                    appearance_similarity: candidate.appearance_similarity,
+                    reference_similarity_9: candidate.reference_similarity_9,
+                    reference_similarity_13: candidate.reference_similarity_13,
+                    reference_similarity_25: candidate.reference_similarity_25,
+                    reference_similarity_combined: candidate.reference_appearance_similarity(),
+                    large_patch_similarity_to_initial: camera_inputs[observation.camera]
+                        .luminance
+                        .and_then(|target_plane| {
+                            diagnostic_patch_similarity(
+                                target_plane,
+                                set.candidates[0].pixel,
+                                observation.local_scale,
+                                target_plane,
+                                candidate.pixel,
+                                observation.local_scale,
+                            )
+                        }),
+                    reference_patch_similarity: camera_inputs[observation.camera]
+                        .luminance
+                        .and_then(|target_plane| {
+                            diagnostic_patch_similarity(
+                                reference_plane,
+                                reference.pixel,
+                                1.0,
+                                target_plane,
+                                candidate.pixel,
+                                observation.local_scale,
+                            )
+                        }),
+                    selected: index == selected_index,
+                    initial: index == 0,
+                })
+                .collect();
+            per_camera[observation.camera].push(MatchDiagnosticSample {
+                row: 0,
+                split,
+                track_key: track.key,
+                camera: observation.camera,
+                reference_pixel: reference.pixel,
+                selected_pixel: observation.pixel,
+                predicted_pixel,
+                reprojection_error_px,
+                local_scale: observation.local_scale,
+                switched: selected_index != 0,
+                strongest_unselected_similarity,
+                candidates: rendered_candidates,
+            });
+        }
+    }
+}
+
+fn select_match_diagnostic_samples(
+    samples: &[MatchDiagnosticSample],
+) -> Vec<MatchDiagnosticSample> {
+    let mut selected = Vec::<usize>::new();
+    let mut used = HashSet::<usize>::new();
+
+    let mut held_out = (0..samples.len())
+        .filter(|&index| samples[index].split == "held-out")
+        .collect::<Vec<_>>();
+    held_out.sort_by(|&left, &right| {
+        samples[right]
+            .reprojection_error_px
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(
+                &samples[left]
+                    .reprojection_error_px
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
+    });
+    add_match_diagnostic_indices(&mut selected, &mut used, held_out, 12);
+
+    let mut by_error = (0..samples.len()).collect::<Vec<_>>();
+    by_error.sort_by(|&left, &right| {
+        samples[right]
+            .reprojection_error_px
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(
+                &samples[left]
+                    .reprojection_error_px
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
+    });
+    add_match_diagnostic_indices(
+        &mut selected,
+        &mut used,
+        by_error,
+        28.min(MATCH_DIAGNOSTIC_MAX_ROWS),
+    );
+
+    let mut switched = (0..samples.len())
+        .filter(|&index| samples[index].switched)
+        .collect::<Vec<_>>();
+    switched.sort_by(|&left, &right| {
+        samples[right]
+            .reprojection_error_px
+            .unwrap_or(0.0)
+            .total_cmp(&samples[left].reprojection_error_px.unwrap_or(0.0))
+    });
+    add_match_diagnostic_indices(
+        &mut selected,
+        &mut used,
+        switched,
+        40.min(MATCH_DIAGNOSTIC_MAX_ROWS),
+    );
+
+    let mut ambiguous = (0..samples.len()).collect::<Vec<_>>();
+    ambiguous.sort_by(|&left, &right| {
+        samples[right]
+            .strongest_unselected_similarity
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(
+                &samples[left]
+                    .strongest_unselected_similarity
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
+    });
+    add_match_diagnostic_indices(
+        &mut selected,
+        &mut used,
+        ambiguous,
+        52.min(MATCH_DIAGNOSTIC_MAX_ROWS),
+    );
+
+    let mut spatial = (0..samples.len()).collect::<Vec<_>>();
+    spatial.sort_by(|&left, &right| {
+        samples[left].reference_pixel[1]
+            .total_cmp(&samples[right].reference_pixel[1])
+            .then_with(|| {
+                samples[left].reference_pixel[0].total_cmp(&samples[right].reference_pixel[0])
+            })
+    });
+    if !spatial.is_empty() {
+        let remaining = MATCH_DIAGNOSTIC_MAX_ROWS.saturating_sub(selected.len());
+        let distributed = (0..remaining)
+            .map(|index| spatial[index * spatial.len() / remaining.max(1)])
+            .collect();
+        add_match_diagnostic_indices(
+            &mut selected,
+            &mut used,
+            distributed,
+            MATCH_DIAGNOSTIC_MAX_ROWS,
+        );
+    }
+
+    selected
+        .into_iter()
+        .take(MATCH_DIAGNOSTIC_MAX_ROWS)
+        .enumerate()
+        .map(|(row, index)| {
+            let mut sample = samples[index].clone();
+            sample.row = row;
+            sample
+        })
+        .collect()
+}
+
+fn add_match_diagnostic_indices(
+    selected: &mut Vec<usize>,
+    used: &mut HashSet<usize>,
+    indices: Vec<usize>,
+    limit: usize,
+) {
+    for index in indices {
+        if used.insert(index) {
+            selected.push(index);
+            if selected.len() >= limit {
+                break;
+            }
+        }
+    }
+}
+
+fn safe_diagnostic_filename(name: &str) -> String {
+    let safe = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{safe}.png")
+}
+
+fn patch_values(plane: &Plane, sensor_pixel: Vec2, step_luma: f64) -> Vec<Option<f32>> {
+    let radius = (MATCH_DIAGNOSTIC_PATCH_SIDE / 2) as isize;
+    let centre_x = (sensor_pixel[0] - 0.5) * 0.5;
+    let centre_y = (sensor_pixel[1] - 0.5) * 0.5;
+    let mut values = Vec::with_capacity(MATCH_DIAGNOSTIC_PATCH_SIDE.pow(2));
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            values.push(plane.sample(
+                (centre_x + x as f64 * step_luma) as f32,
+                (centre_y + y as f64 * step_luma) as f32,
+            ));
+        }
+    }
+    values
+}
+
+fn diagnostic_patch_similarity(
+    first_plane: &Plane,
+    first_pixel: Vec2,
+    first_step_luma: f64,
+    second_plane: &Plane,
+    second_pixel: Vec2,
+    second_step_luma: f64,
+) -> Option<f64> {
+    let first = patch_values(first_plane, first_pixel, first_step_luma.clamp(0.25, 4.0));
+    let second = patch_values(
+        second_plane,
+        second_pixel,
+        second_step_luma.clamp(0.25, 4.0),
+    );
+    let pairs = first
+        .into_iter()
+        .zip(second)
+        .filter_map(|(first, second)| Some((f64::from(first?), f64::from(second?))))
+        .collect::<Vec<_>>();
+    if pairs.len() < MATCH_DIAGNOSTIC_PATCH_SIDE.pow(2) * 3 / 4 {
+        return None;
+    }
+    let count = pairs.len() as f64;
+    let first_mean = pairs.iter().map(|pair| pair.0).sum::<f64>() / count;
+    let second_mean = pairs.iter().map(|pair| pair.1).sum::<f64>() / count;
+    let mut numerator = 0.0;
+    let mut first_energy = 0.0;
+    let mut second_energy = 0.0;
+    for (first, second) in pairs {
+        let first = first - first_mean;
+        let second = second - second_mean;
+        numerator += first * second;
+        first_energy += first * first;
+        second_energy += second * second;
+    }
+    let denominator = (first_energy * second_energy).sqrt();
+    (denominator > 1.0e-12)
+        .then_some((numerator / denominator).clamp(-1.0, 1.0))
+}
+
+fn draw_patch(
+    image: &mut RgbImage,
+    origin_x: usize,
+    origin_y: usize,
+    plane: &Plane,
+    sensor_pixel: Vec2,
+    step_luma: f64,
+) {
+    let values = patch_values(plane, sensor_pixel, step_luma);
+    let mut finite = values.iter().flatten().copied().collect::<Vec<_>>();
+    finite.sort_by(f32::total_cmp);
+    let low = finite
+        .get(finite.len().saturating_mul(2) / 100)
+        .copied()
+        .unwrap_or(0.0);
+    let high = finite
+        .get(finite.len().saturating_mul(98) / 100)
+        .copied()
+        .unwrap_or(low + 1.0);
+    let span = (high - low).max(1.0e-6);
+    for y in 0..MATCH_DIAGNOSTIC_PATCH_SIDE {
+        for x in 0..MATCH_DIAGNOSTIC_PATCH_SIDE {
+            let shade = values[y * MATCH_DIAGNOSTIC_PATCH_SIDE + x]
+                .map(|value| (((value - low) / span).clamp(0.0, 1.0) * 255.0) as u8)
+                .unwrap_or(0);
+            for dy in 0..MATCH_DIAGNOSTIC_SCALE {
+                for dx in 0..MATCH_DIAGNOSTIC_SCALE {
+                    image.put_pixel(
+                        (origin_x + x * MATCH_DIAGNOSTIC_SCALE + dx) as u32,
+                        (origin_y + y * MATCH_DIAGNOSTIC_SCALE + dy) as u32,
+                        Rgb([shade, shade, shade]),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn draw_border(image: &mut RgbImage, x: usize, y: usize, side: usize, color: Rgb<u8>) {
+    for offset in 0..side {
+        image.put_pixel((x + offset) as u32, y as u32, color);
+        image.put_pixel((x + offset) as u32, (y + side - 1) as u32, color);
+        image.put_pixel(x as u32, (y + offset) as u32, color);
+        image.put_pixel((x + side - 1) as u32, (y + offset) as u32, color);
+    }
+}
+
+fn draw_cross(image: &mut RgbImage, x: isize, y: isize, color: Rgb<u8>) {
+    for offset in -5..=5 {
+        let points = [(x + offset, y), (x, y + offset)];
+        for (px, py) in points {
+            if px >= 0 && py >= 0 && px < image.width() as isize && py < image.height() as isize {
+                image.put_pixel(px as u32, py as u32, color);
+            }
+        }
+    }
+}
+
+fn render_match_diagnostic_camera(
+    path: &Path,
+    reference_plane: &Plane,
+    target_plane: &Plane,
+    samples: &[MatchDiagnosticSample],
+) -> anyhow::Result<()> {
+    let patch_pixels = MATCH_DIAGNOSTIC_PATCH_SIDE * MATCH_DIAGNOSTIC_SCALE;
+    let cell = patch_pixels + MATCH_DIAGNOSTIC_GAP;
+    let candidate_columns = samples
+        .iter()
+        .map(|sample| sample.candidates.len())
+        .max()
+        .unwrap_or(1);
+    let width = MATCH_DIAGNOSTIC_GAP + cell * (1 + candidate_columns);
+    let height = MATCH_DIAGNOSTIC_GAP + cell * samples.len().max(1);
+    let mut image = RgbImage::from_pixel(width as u32, height as u32, Rgb([18, 18, 18]));
+
+    for sample in samples {
+        let y = MATCH_DIAGNOSTIC_GAP + sample.row * cell;
+        let severity = match sample.reprojection_error_px {
+            Some(error) if error > 4.0 => Rgb([255, 55, 55]),
+            Some(error) if error > 2.0 => Rgb([255, 170, 30]),
+            Some(_) => Rgb([45, 210, 90]),
+            None => Rgb([130, 130, 130]),
+        };
+        for stripe_y in y..(y + patch_pixels) {
+            image.put_pixel(1, stripe_y as u32, severity);
+            image.put_pixel(2, stripe_y as u32, severity);
+        }
+
+        let reference_x = MATCH_DIAGNOSTIC_GAP;
+        draw_patch(
+            &mut image,
+            reference_x,
+            y,
+            reference_plane,
+            sample.reference_pixel,
+            1.0,
+        );
+        draw_border(
+            &mut image,
+            reference_x,
+            y,
+            patch_pixels,
+            Rgb([255, 220, 40]),
+        );
+        let patch_centre = (patch_pixels / 2) as isize;
+        draw_cross(
+            &mut image,
+            (reference_x as isize) + patch_centre,
+            (y as isize) + patch_centre,
+            Rgb([255, 220, 40]),
+        );
+
+        for (candidate_index, candidate) in sample.candidates.iter().enumerate() {
+            let x = MATCH_DIAGNOSTIC_GAP + (candidate_index + 1) * cell;
+            let target_step = sample.local_scale.clamp(0.25, 4.0);
+            draw_patch(
+                &mut image,
+                x,
+                y,
+                target_plane,
+                candidate.pixel,
+                target_step,
+            );
+            let border = if candidate.selected {
+                Rgb([45, 255, 100])
+            } else if candidate.initial {
+                Rgb([70, 140, 255])
+            } else {
+                Rgb([100, 100, 100])
+            };
+            draw_border(&mut image, x, y, patch_pixels, border);
+            draw_cross(
+                &mut image,
+                x as isize + patch_centre,
+                y as isize + patch_centre,
+                Rgb([255, 70, 70]),
+            );
+            if let Some(predicted) = sample.predicted_pixel {
+                let display_per_sensor = MATCH_DIAGNOSTIC_SCALE as f64
+                    / (2.0 * target_step);
+                let predicted_x = x as f64
+                    + patch_pixels as f64 * 0.5
+                    + (predicted[0] - candidate.pixel[0]) * display_per_sensor;
+                let predicted_y = y as f64
+                    + patch_pixels as f64 * 0.5
+                    + (predicted[1] - candidate.pixel[1]) * display_per_sensor;
+                draw_cross(
+                    &mut image,
+                    predicted_x.round() as isize,
+                    predicted_y.round() as isize,
+                    Rgb([40, 235, 255]),
+                );
+            }
+        }
+    }
+    image.save(path)?;
+    Ok(())
+}
+
+fn write_latent_match_diagnostics(
+    directory: &Path,
+    cameras: &[RigCameraInput<'_>],
+    reference_index: usize,
+    fit_tracks: &[Track],
+    validation_tracks: &[Track],
+    candidates: &LatentCandidateState,
+    resolved: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+) -> anyhow::Result<RigMatchDiagnosticsReport> {
+    fs::create_dir_all(directory)?;
+    let reference_plane = cameras
+        .get(reference_index)
+        .and_then(|camera| camera.luminance)
+        .ok_or_else(|| anyhow::anyhow!("reference luminance is unavailable"))?;
+    let mut per_camera = vec![Vec::new(); cameras.len()];
+    collect_match_diagnostic_samples(
+        "fit",
+        fit_tracks,
+        candidates,
+        resolved,
+        cameras,
+        reference_index,
+        options,
+        &mut per_camera,
+    );
+    collect_match_diagnostic_samples(
+        "held-out",
+        validation_tracks,
+        candidates,
+        resolved,
+        cameras,
+        reference_index,
+        options,
+        &mut per_camera,
+    );
+
+    let mut camera_manifests = Vec::new();
+    let mut total_samples = 0usize;
+    for (camera_index, camera) in cameras.iter().enumerate() {
+        if camera_index == reference_index || per_camera[camera_index].is_empty() {
+            continue;
+        }
+        let Some(target_plane) = camera.luminance else {
+            continue;
+        };
+        let rows = select_match_diagnostic_samples(&per_camera[camera_index]);
+        let filename = safe_diagnostic_filename(camera.name);
+        render_match_diagnostic_camera(
+            &directory.join(&filename),
+            reference_plane,
+            target_plane,
+            &rows,
+        )?;
+        total_samples += rows.len();
+        camera_manifests.push(MatchDiagnosticCameraManifest {
+            camera: camera.name,
+            image: filename,
+            rows,
+        });
+    }
+    let camera_count = camera_manifests.len();
+    let manifest = MatchDiagnosticManifest {
+        reference_camera: cameras[reference_index].name,
+        patch_side_luma: MATCH_DIAGNOSTIC_PATCH_SIDE,
+        display_scale: MATCH_DIAGNOSTIC_SCALE,
+        notes: [
+            "Each row starts with the yellow-bordered reference patch.",
+            "Target candidates follow: green border is selected, blue is the original match.",
+            "Red cross is the candidate centre; cyan cross is leave-one-camera-out reprojection.",
+            "Left stripe is green below 2 px, amber at 2-4 px, red above 4 px, grey without a 3-view prediction.",
+            "Rows combine worst reprojections, switches, strongest ambiguities, and spatial coverage.",
+        ],
+        cameras: camera_manifests,
+    };
+    fs::write(
+        directory.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(RigMatchDiagnosticsReport {
+        directory: directory.display().to_string(),
+        samples: total_samples,
+        cameras: camera_count,
+        error: None,
+    })
 }
 
 fn factory_model_report(
@@ -4291,11 +4972,23 @@ fn fit_fallback_fundamental_prepared(
     }
     let reference = indices
         .iter()
-        .map(|&index| prepared.get(index).copied().flatten().map(|point| point.reference))
+        .map(|&index| {
+            prepared
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|point| point.reference)
+        })
         .collect::<Option<Vec<_>>>()?;
     let target = indices
         .iter()
-        .map(|&index| prepared.get(index).copied().flatten().map(|point| point.target))
+        .map(|&index| {
+            prepared
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|point| point.target)
+        })
         .collect::<Option<Vec<_>>>()?;
     let (reference, reference_transform) = normalize_epipolar_points(&reference)?;
     let (target, target_transform) = normalize_epipolar_points(&target)?;
@@ -4504,11 +5197,8 @@ fn fallback_epipolar_inliers(
     // Undistortion is by far the most expensive scalar operation in this RANSAC.
     // Every correspondence is immutable for the duration of the consensus test,
     // so normalize each image point once rather than thousands of times.
-    let prepared = prepare_fallback_epipolar_points(
-        correspondences,
-        reference_camera,
-        target_camera,
-    );
+    let prepared =
+        prepare_fallback_epipolar_points(correspondences, reference_camera, target_camera);
     let reference_focal_scale_px = reference_camera.focal_scale_px();
     let target_focal_scale_px = target_camera.focal_scale_px();
     let mut state = 0xD1B5_4A32_D192_ED03u64 ^ correspondences.len() as u64;
@@ -4947,20 +5637,36 @@ fn parameter_specs(
             }
         }
 
-        // Raster offset can be distinguished from rotation by field-dependent
-        // evidence. LatentGraph can safely release it at the same support level
-        // as bearing parameters because repeated-feature identity is jointly
-        // resolved and the observability Jacobian below still rejects a raster
-        // shift that is degenerate with rotation. This matters for narrow-FOV
-        // cameras such as C1: the first real run retained only ~30 fit samples,
-        // enough to estimate a coherent crop/principal-point shift but below the
-        // generic 48-observation threshold, leaving a ~10 px systematic residual.
-        let sensor_min_observations = if options.strategy == RigRefinementStrategy::LatentGraph {
-            bearing_min_observations
-        } else {
-            options.min_camera_observations
-        };
-        if observations[camera] >= sensor_min_observations && options.max_sensor_offset_px > 0.0 {
+        // An image-centre offset can be distinguished from rotation by
+        // field-dependent evidence. LatentGraph releases a *true principal
+        // point* here: K moves but the calibrated Brown distortion centre does
+        // not. The older Sensor parameter means a raster-origin/crop error and
+        // moves both frames; exposing it to LatentGraph conflated two different
+        // metadata corrections and let distortion absorb the difference.
+        let image_center_min_observations =
+            if options.strategy == RigRefinementStrategy::LatentGraph {
+                bearing_min_observations
+            } else {
+                options.min_camera_observations
+            };
+        if options.strategy == RigRefinementStrategy::LatentGraph
+            && observations[camera] >= image_center_min_observations
+            && options.max_principal_point_offset_px > 0.0
+        {
+            for axis in 0..2 {
+                specs.push(ParameterSpec {
+                    camera,
+                    affected_cameras: 1u16 << camera,
+                    kind: ParameterKind::PrincipalPoint(axis),
+                    bound: options.max_principal_point_offset_px,
+                    prior_sigma: options.principal_point_prior_sigma_px,
+                    difference_step: 0.25,
+                    maximum_update: 4.0,
+                });
+            }
+        } else if observations[camera] >= image_center_min_observations
+            && options.max_sensor_offset_px > 0.0
+        {
             for axis in 0..2 {
                 specs.push(ParameterSpec {
                     camera,
@@ -5109,6 +5815,9 @@ fn parameter_name(kind: ParameterKind) -> String {
         ParameterKind::Sensor(0) => "sensor_x".to_owned(),
         ParameterKind::Sensor(1) => "sensor_y".to_owned(),
         ParameterKind::Sensor(axis) => format!("sensor_{axis}"),
+        ParameterKind::PrincipalPoint(0) => "principal_point_x".to_owned(),
+        ParameterKind::PrincipalPoint(1) => "principal_point_y".to_owned(),
+        ParameterKind::PrincipalPoint(axis) => format!("principal_point_{axis}"),
         ParameterKind::FocalScale => "focal_scale".to_owned(),
         ParameterKind::FocalAspect => "focal_aspect".to_owned(),
         ParameterKind::DistortionCenter(0) => "distortion_center_x".to_owned(),
@@ -5483,6 +6192,7 @@ fn filter_observable_parameter_specs(
             || !matches!(
                 spec.kind,
                 ParameterKind::Sensor(_)
+                    | ParameterKind::PrincipalPoint(_)
                     | ParameterKind::FocalScale
                     | ParameterKind::FocalAspect
                     | ParameterKind::DistortionCenter(_)
@@ -5546,8 +6256,14 @@ fn filter_observable_parameter_specs(
 
             let first_is_mirror = matches!(candidates[first].kind, ParameterKind::Mirror);
             let second_is_mirror = matches!(candidates[second].kind, ParameterKind::Mirror);
-            let first_is_sensor = matches!(candidates[first].kind, ParameterKind::Sensor(_));
-            let second_is_sensor = matches!(candidates[second].kind, ParameterKind::Sensor(_));
+            let first_is_sensor = matches!(
+                candidates[first].kind,
+                ParameterKind::Sensor(_) | ParameterKind::PrincipalPoint(_)
+            );
+            let second_is_sensor = matches!(
+                candidates[second].kind,
+                ParameterKind::Sensor(_) | ParameterKind::PrincipalPoint(_)
+            );
             let first_is_focal = matches!(
                 candidates[first].kind,
                 ParameterKind::FocalScale | ParameterKind::FocalAspect
@@ -5727,6 +6443,7 @@ fn refinements_from_parameters(
     let mut mirrors = vec![0.0; camera_count];
     let mut centers = vec![[0.0; 3]; camera_count];
     let mut sensors = vec![[0.0; 2]; camera_count];
+    let mut principal_points = vec![[0.0; 2]; camera_count];
     let mut focal_scales = vec![0.0; camera_count];
     let mut focal_aspects = vec![0.0; camera_count];
     let mut distortion_centers = vec![[0.0; 2]; camera_count];
@@ -5737,6 +6454,7 @@ fn refinements_from_parameters(
             ParameterKind::Mirror => mirrors[spec.camera] = value,
             ParameterKind::Center(axis) => centers[spec.camera][axis] = value,
             ParameterKind::Sensor(axis) => sensors[spec.camera][axis] = value,
+            ParameterKind::PrincipalPoint(axis) => principal_points[spec.camera][axis] = value,
             ParameterKind::FocalScale => focal_scales[spec.camera] = value,
             ParameterKind::FocalAspect => focal_aspects[spec.camera] = value,
             ParameterKind::DistortionCenter(axis) if axis < 2 => {
@@ -5760,6 +6478,8 @@ fn refinements_from_parameters(
                 .then_some(orientations[camera]),
             center_offset_world: (centers[camera] != [0.0; 3]).then_some(centers[camera]),
             sensor_offset_px: (sensors[camera] != [0.0; 2]).then_some(sensors[camera]),
+            principal_point_offset_px: (principal_points[camera] != [0.0; 2])
+                .then_some(principal_points[camera]),
             focal_scale_delta: (focal_scales[camera] != 0.0).then_some(focal_scales[camera]),
             focal_aspect_delta: (focal_aspects[camera] != 0.0).then_some(focal_aspects[camera]),
             distortion_center_offset_px: (distortion_centers[camera] != [0.0; 2])
@@ -5780,6 +6500,7 @@ fn refinement_for_camera_with_override(
     let mut mirror = 0.0;
     let mut center = [0.0; 3];
     let mut sensor = [0.0; 2];
+    let mut principal_point = [0.0; 2];
     let mut focal_scale = 0.0;
     let mut focal_aspect = 0.0;
     let mut distortion_center = [0.0; 2];
@@ -5796,6 +6517,9 @@ fn refinement_for_camera_with_override(
             ParameterKind::Mirror if spec.camera == camera => mirror = value,
             ParameterKind::Center(axis) if spec.camera == camera => center[axis] = value,
             ParameterKind::Sensor(axis) if spec.camera == camera => sensor[axis] = value,
+            ParameterKind::PrincipalPoint(axis) if spec.camera == camera => {
+                principal_point[axis] = value
+            }
             ParameterKind::FocalScale if spec.camera == camera => focal_scale = value,
             ParameterKind::FocalAspect if spec.camera == camera => focal_aspect = value,
             ParameterKind::DistortionCenter(axis) if spec.camera == camera && axis < 2 => {
@@ -5811,6 +6535,7 @@ fn refinement_for_camera_with_override(
             | ParameterKind::Mirror
             | ParameterKind::Center(_)
             | ParameterKind::Sensor(_)
+            | ParameterKind::PrincipalPoint(_)
             | ParameterKind::FocalScale
             | ParameterKind::FocalAspect
             | ParameterKind::DistortionCenter(_)
@@ -5823,6 +6548,7 @@ fn refinement_for_camera_with_override(
         orientation_offset_degrees: (orientation != [0.0; 3]).then_some(orientation),
         center_offset_world: (center != [0.0; 3]).then_some(center),
         sensor_offset_px: (sensor != [0.0; 2]).then_some(sensor),
+        principal_point_offset_px: (principal_point != [0.0; 2]).then_some(principal_point),
         focal_scale_delta: (focal_scale != 0.0).then_some(focal_scale),
         focal_aspect_delta: (focal_aspect != 0.0).then_some(focal_aspect),
         distortion_center_offset_px: (distortion_center != [0.0; 2]).then_some(distortion_center),
@@ -5901,7 +6627,26 @@ fn bundle_track_contribution_with_rays(
     options: &RigRefinementOptions,
     rays: &[crate::geometry::Ray],
 ) -> TrackObjectiveContribution {
-    let Some(triangulated) = triangulate_precomputed(&track.observations, rays, options) else {
+    let point = triangulate_precomputed(&track.observations, rays, options)
+        .map(|triangulated| triangulated.point);
+    fixed_bundle_track_contribution_with_rays(track, cameras, options, rays, point)
+}
+
+/// Evaluate a camera update against scene structure triangulated before the
+/// current bundle pass. Keeping the nuisance point fixed is essential in an
+/// L16's low-parallax geometry: otherwise every scalar camera trial can move
+/// depth immediately and make several physically different camera models look
+/// equivalent. The next staged/latent bundle pass retriangulates after a block
+/// of camera updates, so structure follows the improving rig without absorbing
+/// an individual finite-difference trial itself.
+fn fixed_bundle_track_contribution_with_rays(
+    track: &Track,
+    cameras: &[ResolvedCamera],
+    options: &RigRefinementOptions,
+    rays: &[crate::geometry::Ray],
+    point: Option<Vec3>,
+) -> TrackObjectiveContribution {
+    let Some(point) = point else {
         return TrackObjectiveContribution {
             cost: track_authority_weight(track, options)
                 * track
@@ -5921,10 +6666,10 @@ fn bundle_track_contribution_with_rays(
     let baseline_scale = ray_baseline_scale(rays);
     let mut result = TrackObjectiveContribution::default();
     for (observation, &ray) in track.observations.iter().zip(rays.iter()) {
-        let signed_depth = dot(sub(triangulated.point, ray.origin), ray.direction);
+        let signed_depth = dot(sub(point, ray.origin), ray.direction);
         result.cost += cheirality_penalty(signed_depth, baseline_scale);
         let Some(projected) =
-            project_observation_with_ray(&cameras[observation.camera], ray, triangulated.point)
+            project_observation_with_ray(&cameras[observation.camera], ray, point)
         else {
             result.cost +=
                 invalid_bundle_observation_cost(observation, track.observations.len(), options);
@@ -6097,6 +6842,11 @@ struct IncrementalRigObjective<'a> {
     /// changes rays observed by its affected camera(s); all other expensive
     /// pixel->ray distortion inversions are reused exactly.
     rays_by_track: Vec<Vec<crate::geometry::Ray>>,
+    /// Scene points triangulated once from the cameras at the start of this
+    /// bundle pass. They remain fixed for every coordinate trial and committed
+    /// sweep; the next staged/latent outer pass constructs a new objective and
+    /// retriangulates them.
+    fixed_bundle_points: Vec<Option<Vec3>>,
     contributions: Vec<TrackObjectiveContribution>,
     total_cost: f64,
     total_samples: usize,
@@ -6150,22 +6900,34 @@ impl<'a> IncrementalRigObjective<'a> {
             .collect::<Vec<_>>();
 
         let mut rays_by_track = Vec::with_capacity(tracks.len());
+        let mut fixed_bundle_points = Vec::with_capacity(tracks.len());
         let mut contributions = Vec::with_capacity(tracks.len());
         let mut total_cost = 0.0;
         let mut total_samples = 0usize;
         for track in tracks {
             let mut rays = Vec::with_capacity(track.observations.len());
             fill_observation_rays(&track.observations, &cameras, &mut rays);
-            let contribution = track_contribution_with_rays(
-                track,
-                &cameras,
-                &rays,
-                mode,
-                options,
-            );
+            let fixed_point = matches!(mode, IncrementalObjectiveMode::Bundle)
+                .then(|| {
+                    triangulate_precomputed(&track.observations, &rays, options)
+                        .map(|triangulated| triangulated.point)
+                })
+                .flatten();
+            let contribution = if matches!(mode, IncrementalObjectiveMode::Bundle) {
+                fixed_bundle_track_contribution_with_rays(
+                    track,
+                    &cameras,
+                    options,
+                    &rays,
+                    fixed_point,
+                )
+            } else {
+                track_contribution_with_rays(track, &cameras, &rays, mode, options)
+            };
             total_cost += contribution.cost;
             total_samples += contribution.samples;
             rays_by_track.push(rays);
+            fixed_bundle_points.push(fixed_point);
             contributions.push(contribution);
         }
         let prior_sum = parameters
@@ -6183,6 +6945,7 @@ impl<'a> IncrementalRigObjective<'a> {
             cameras,
             tracks_by_parameter,
             rays_by_track,
+            fixed_bundle_points,
             contributions,
             total_cost,
             total_samples,
@@ -6258,13 +7021,17 @@ impl<'a> IncrementalRigObjective<'a> {
                     *ray = cameras[observation.camera].pixel_to_ray(observation.pixel);
                 }
             }
-            let new = track_contribution_with_rays(
-                track,
-                &cameras,
-                &ray_scratch,
-                self.mode,
-                self.options,
-            );
+            let new = if matches!(self.mode, IncrementalObjectiveMode::Bundle) {
+                fixed_bundle_track_contribution_with_rays(
+                    track,
+                    &cameras,
+                    self.options,
+                    &ray_scratch,
+                    self.fixed_bundle_points[track_index],
+                )
+            } else {
+                track_contribution_with_rays(track, &cameras, &ray_scratch, self.mode, self.options)
+            };
             total_cost += new.cost - old.cost;
             total_samples = total_samples - old.samples + new.samples;
             changed_tracks.push((track_index, new));
@@ -6423,9 +7190,7 @@ fn staged_bundle_optimize_rig<'a>(
     for spec in &mut intrinsic_specs {
         if matches!(
             spec.kind,
-            ParameterKind::Orientation(_)
-                | ParameterKind::Mirror
-                | ParameterKind::Center(_)
+            ParameterKind::Orientation(_) | ParameterKind::Mirror | ParameterKind::Center(_)
         ) {
             spec.maximum_update = 0.0;
         }
@@ -6525,8 +7290,7 @@ fn staged_bundle_optimize_rig<'a>(
         IncrementalObjectiveMode::Bundle,
         Some(timings),
     );
-    timings.final_bearing_polish_seconds +=
-        final_bearing_polish_started.elapsed().as_secs_f64();
+    timings.final_bearing_polish_seconds += final_bearing_polish_started.elapsed().as_secs_f64();
     timings.total_seconds += pass_started.elapsed().as_secs_f64();
     (
         parameters,
@@ -7544,6 +8308,7 @@ fn correction_reports(
             mirror_angle_offset_degrees: refinement.mirror_angle_offset_degrees,
             center_offset_world: refinement.center_offset_world.unwrap_or([0.0; 3]),
             sensor_offset_px: refinement.sensor_offset_px.unwrap_or([0.0; 2]),
+            principal_point_offset_px: refinement.principal_point_offset_px.unwrap_or([0.0; 2]),
             focal_scale_delta: refinement.focal_scale_delta.unwrap_or(0.0),
             focal_aspect_delta: refinement.focal_aspect_delta.unwrap_or(0.0),
             distortion_center_offset_px: refinement.distortion_center_offset_px.unwrap_or([0.0; 2]),
@@ -7882,7 +8647,10 @@ mod tests {
 
     #[test]
     fn latent_graph_is_the_default_strategy() {
-        assert_eq!(RigRefinementStrategy::default(), RigRefinementStrategy::LatentGraph);
+        assert_eq!(
+            RigRefinementStrategy::default(),
+            RigRefinementStrategy::LatentGraph
+        );
         assert_eq!(
             RigRefinementOptions::default().strategy,
             RigRefinementStrategy::LatentGraph,
@@ -8878,6 +9646,162 @@ mod tests {
     }
 
     #[test]
+    fn latent_graph_exposes_true_principal_point_instead_of_raster_offset() {
+        let calibrations = [
+            calibration("B4", [0.0, 0.0, 0.0]),
+            calibration("B2", [80.0, 0.0, 0.0]),
+        ];
+        let states = [state("B4"), state("B2")];
+        let inputs = calibrations
+            .iter()
+            .zip(&states)
+            .map(|(calibration, state)| RigCameraInput {
+                name: &calibration.name,
+                calibration: Some(calibration),
+                state: Some(state),
+                match_evidence_enabled: true,
+                luminance: None,
+            })
+            .collect::<Vec<_>>();
+        let tracks = (0..24)
+            .map(|index| Track {
+                key: [index * 16, index * 8],
+                observations: vec![
+                    TrackObservation {
+                        camera: 0,
+                        pixel: [500.0, 400.0],
+                        bootstrap_residual_proposal: [0.0; 2],
+                        localization_covariance: [[1.0, 0.0], [0.0, 1.0]],
+                        fixed_gauge: true,
+                        confidence: 1.0,
+                        local_scale: 1.0,
+                        structure: 0.1,
+                        depth_reliability: None,
+                        prepared: Default::default(),
+                    },
+                    TrackObservation {
+                        camera: 1,
+                        pixel: [520.0, 400.0],
+                        bootstrap_residual_proposal: [0.0; 2],
+                        localization_covariance: [[1.0, 0.0], [0.0, 1.0]],
+                        fixed_gauge: false,
+                        confidence: 1.0,
+                        local_scale: 1.0,
+                        structure: 0.1,
+                        depth_reliability: None,
+                        prepared: Default::default(),
+                    },
+                ],
+                condition: 1.0,
+                max_ray_angle_degrees: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let track_refs = tracks.iter().collect::<Vec<_>>();
+        let specs = parameter_specs(
+            &inputs,
+            0,
+            &track_refs,
+            &RigRefinementOptions::default(),
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.kind, ParameterKind::PrincipalPoint(_)))
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|spec| !matches!(spec.kind, ParameterKind::Sensor(_)))
+        );
+    }
+
+    #[test]
+    fn fixed_bundle_point_cannot_follow_a_camera_trial() {
+        let calibrations = [
+            calibration("B1", [-80.0, 0.0, 0.0]),
+            calibration("B2", [0.0, 0.0, 0.0]),
+            calibration("B3", [80.0, 0.0, 0.0]),
+        ];
+        let states = [state("B1"), state("B2"), state("B3")];
+        let factory = calibrations
+            .iter()
+            .zip(&states)
+            .map(|(calibration, state)| {
+                ResolvedCamera::new(
+                    calibration,
+                    state,
+                    IntrinsicsMode::Clamp,
+                    &CameraRefinement::default(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let point = [35.0, -20.0, 2_000.0];
+        let track = Track {
+            key: [0, 0],
+            observations: factory
+                .iter()
+                .enumerate()
+                .map(|(camera, resolved)| TrackObservation {
+                    camera,
+                    pixel: resolved.project(point).unwrap(),
+                    bootstrap_residual_proposal: [0.0; 2],
+                    localization_covariance: [[1.0, 0.0], [0.0, 1.0]],
+                    fixed_gauge: camera == 0,
+                    confidence: 1.0,
+                    local_scale: 1.0,
+                    structure: 0.1,
+                    depth_reliability: None,
+                    prepared: Default::default(),
+                })
+                .collect(),
+            condition: 1.0,
+            max_ray_angle_degrees: 1.0,
+        };
+        let factory_rays = track
+            .observations
+            .iter()
+            .map(|observation| factory[observation.camera].pixel_to_ray(observation.pixel))
+            .collect::<Vec<_>>();
+        let options = RigRefinementOptions::default();
+        let frozen_point = triangulate_precomputed(&track.observations, &factory_rays, &options)
+            .unwrap()
+            .point;
+
+        let mut trial = factory.clone();
+        trial[2] = ResolvedCamera::new(
+            &calibrations[2],
+            &states[2],
+            IntrinsicsMode::Clamp,
+            &CameraRefinement {
+                orientation_offset_degrees: Some([0.0, 0.5, 0.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trial_rays = track
+            .observations
+            .iter()
+            .map(|observation| trial[observation.camera].pixel_to_ray(observation.pixel))
+            .collect::<Vec<_>>();
+        let fixed = fixed_bundle_track_contribution_with_rays(
+            &track,
+            &trial,
+            &options,
+            &trial_rays,
+            Some(frozen_point),
+        );
+        let retriangulated =
+            bundle_track_contribution_with_rays(&track, &trial, &options, &trial_rays);
+        assert!(
+            fixed.cost > retriangulated.cost,
+            "a retriangulated nuisance point should absorb part of the camera trial: fixed={}, retriangulated={}",
+            fixed.cost,
+            retriangulated.cost,
+        );
+    }
+
+    #[test]
     fn anisotropic_localization_covariance_weights_the_known_direction_more_strongly() {
         let observation = TrackObservation {
             camera: 0,
@@ -8940,6 +9864,15 @@ mod tests {
             ParameterSpec {
                 camera: 2,
                 affected_cameras: 0b0100,
+                kind: ParameterKind::PrincipalPoint(1),
+                bound: 8.0,
+                prior_sigma: 2.0,
+                difference_step: 0.25,
+                maximum_update: 2.0,
+            },
+            ParameterSpec {
+                camera: 2,
+                affected_cameras: 0b0100,
                 kind: ParameterKind::DistortionRadial(0),
                 bound: 0.1,
                 prior_sigma: 0.02,
@@ -8947,13 +9880,19 @@ mod tests {
                 maximum_update: 0.004,
             },
         ];
-        let parameters = [0.3, -1.25, 0.015];
+        let parameters = [0.3, -1.25, 2.75, 0.015];
         let bulk = refinements_from_parameters(3, &parameters, &specs);
         for camera in 0..3 {
-            let single =
-                refinement_for_camera_with_override(camera, &parameters, &specs, None);
-            assert_eq!(single.orientation_offset_degrees, bulk[camera].orientation_offset_degrees);
+            let single = refinement_for_camera_with_override(camera, &parameters, &specs, None);
+            assert_eq!(
+                single.orientation_offset_degrees,
+                bulk[camera].orientation_offset_degrees
+            );
             assert_eq!(single.sensor_offset_px, bulk[camera].sensor_offset_px);
+            assert_eq!(
+                single.principal_point_offset_px,
+                bulk[camera].principal_point_offset_px
+            );
             assert_eq!(single.distortion_delta, bulk[camera].distortion_delta);
         }
 
@@ -8962,6 +9901,9 @@ mod tests {
         let mut changed = parameters;
         changed[1] = 2.5;
         let changed_bulk = refinements_from_parameters(3, &changed, &specs);
-        assert_eq!(overridden.sensor_offset_px, changed_bulk[2].sensor_offset_px);
+        assert_eq!(
+            overridden.sensor_offset_px,
+            changed_bulk[2].sensor_offset_px
+        );
     }
 }

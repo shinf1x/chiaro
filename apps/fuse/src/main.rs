@@ -9,7 +9,9 @@ use chiaro_fusion::crosstalk::CrosstalkMode;
 use chiaro_fusion::pipeline::{FusionOptions, HotpixelStage, fuse};
 use chiaro_fusion::resolution::ResolutionReconstruction;
 use chiaro_fusion::rig::RigRefinementStrategy;
-use chiaro_fusion::synth::{CanvasMode, CropWindow, OutputColor};
+use chiaro_fusion::synth::{
+    CanvasMode, CropWindow, JointCfaFixtureOptions, JointCfaSnapshotOptions, OutputColor,
+};
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::HighlightRecovery;
 use chiaro_hotpixel_core::scan::mmap_file;
@@ -232,6 +234,36 @@ struct Cli {
     #[arg(long)]
     joint_cfa_legacy_multicamera_detail: bool,
 
+    /// Dump a replayable newline-delimited JSON fixture containing the exact
+    /// Joint-CFA observations for an explicit diagnostic crop. Requires
+    /// --crop so a full-frame run cannot accidentally emit a huge fixture.
+    #[arg(long, value_name = "FILE", requires = "crop")]
+    joint_cfa_fixture: Option<PathBuf>,
+
+    /// Record every Nth output pixel in --joint-cfa-fixture. Use 1 for a
+    /// contiguous visual crop or a larger value for quick statistical tests.
+    #[arg(long, default_value_t = 1, requires = "joint_cfa_fixture")]
+    joint_cfa_fixture_stride: usize,
+
+    /// Save a complete replayable Joint-CFA stage snapshot for an explicit
+    /// crop. The directory contains manifest.json, pixels.ndjson and compact
+    /// binary camera/depth arrays, including physical sensor windows and
+    /// camera-native RGB+alpha guidance tensors for offline Lumen/ResAmp and
+    /// raw-domain resolution experiments, so observation gathering, alignment
+    /// guidance and solver changes can be tested without re-running dense depth.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "crop",
+        conflicts_with = "joint_cfa_fixture"
+    )]
+    joint_cfa_snapshot: Option<PathBuf>,
+
+    /// Record every Nth output pixel in --joint-cfa-snapshot. The saved sensor
+    /// windows are sized for exactly the recorded lattice plus a safety margin.
+    #[arg(long, default_value_t = 1, requires = "joint_cfa_snapshot")]
+    joint_cfa_snapshot_stride: usize,
+
     /// Leave monochrome modules out of the synthesis (they contribute luminance).
     #[arg(long)]
     exclude_mono: bool,
@@ -255,6 +287,12 @@ struct Cli {
     /// them switch between bundle passes.
     #[arg(long, value_enum, default_value = "latent-graph")]
     rig_strategy: RigStrategy,
+
+    /// Write focused LatentGraph match contact sheets and a JSON manifest.
+    /// Each row includes the reference patch, selected target candidate,
+    /// alternatives, and the leave-one-camera-out reprojection.
+    #[arg(long, value_name = "DIR")]
+    rig_match_diagnostics: Option<PathBuf>,
 
     /// Maximum anchor-graph propagation rounds after bootstrap.
     #[arg(long)]
@@ -443,6 +481,10 @@ struct Cli {
     #[arg(long)]
     rig_max_sensor_offset_px: Option<f64>,
 
+    /// Maximum LatentGraph true principal-point correction per image axis.
+    #[arg(long)]
+    rig_max_principal_point_offset_px: Option<f64>,
+
     /// Maximum LatentGraph isotropic focal correction, as percent from factory.
     #[arg(long)]
     rig_max_focal_scale_percent: Option<f64>,
@@ -483,6 +525,10 @@ struct Cli {
     /// One-sigma scale of the factory prior for sensor-raster offsets.
     #[arg(long)]
     rig_sensor_prior_sigma_px: Option<f64>,
+
+    /// One-sigma LatentGraph prior for true principal-point corrections.
+    #[arg(long)]
+    rig_principal_point_prior_sigma_px: Option<f64>,
 
     /// One-sigma LatentGraph focal-scale prior, as percent from factory.
     #[arg(long)]
@@ -555,6 +601,17 @@ struct Cli {
     #[arg(long, value_enum, default_value = "calibration-quadratic-inverse")]
     mirror_angle_model: MirrorAngleModel,
 
+    /// Diagnostic only: reproduce Lumen's apparent movable-mirror t_y matrix-
+    /// index bug. The mathematically correct mirror translation remains the
+    /// default.
+    #[arg(long)]
+    lumen_mirror_translation_compat: bool,
+
+    /// Diagnostic only: reproduce Lumen's CRA-centred radial registration
+    /// warp instead of Chiaro's full Brown distortion convention.
+    #[arg(long)]
+    lumen_cra_registration_compat: bool,
+
     /// Disable the factory mirror-angle optical-center mapping candidate for
     /// A1->B and B4->C image alignment.
     #[arg(long)]
@@ -593,6 +650,8 @@ fn main() -> Result<()> {
             Intrinsics::Clamp => IntrinsicsMode::Clamp,
         },
         mirror_angle_mode: cli.mirror_angle_model.into(),
+        lumen_mirror_translation_compat: cli.lumen_mirror_translation_compat,
+        lumen_cra_registration_compat: cli.lumen_cra_registration_compat,
         angle_optical_center_prior: !cli.no_angle_optical_center_prior,
         hotpixel: cli.hotpixel_rec.clone().map(|rec| HotpixelStage {
             rec,
@@ -609,6 +668,7 @@ fn main() -> Result<()> {
     options.align.refine = !cli.no_refine;
     options.rig_refinement.enabled = !cli.no_refine && !cli.no_rig_refine;
     options.rig_refinement.strategy = cli.rig_strategy.into();
+    options.rig_refinement.match_diagnostics_dir = cli.rig_match_diagnostics.clone();
     if let Some(value) = cli.rig_anchor_rounds {
         options.rig_refinement.anchor_max_rounds = value.min(12);
     }
@@ -767,6 +827,9 @@ fn main() -> Result<()> {
     if let Some(value) = cli.rig_max_sensor_offset_px {
         options.rig_refinement.max_sensor_offset_px = value.max(0.0);
     }
+    if let Some(value) = cli.rig_max_principal_point_offset_px {
+        options.rig_refinement.max_principal_point_offset_px = value.max(0.0);
+    }
     if let Some(value) = cli.rig_max_focal_scale_percent {
         options.rig_refinement.max_focal_scale_delta = (value.max(0.0) / 100.0).min(0.10);
     }
@@ -796,6 +859,9 @@ fn main() -> Result<()> {
     }
     if let Some(value) = cli.rig_sensor_prior_sigma_px {
         options.rig_refinement.sensor_offset_prior_sigma_px = value.max(1.0e-6);
+    }
+    if let Some(value) = cli.rig_principal_point_prior_sigma_px {
+        options.rig_refinement.principal_point_prior_sigma_px = value.max(1.0e-6);
     }
     if let Some(value) = cli.rig_focal_scale_prior_percent {
         options.rig_refinement.focal_scale_prior_sigma = (value.max(1.0e-6) / 100.0).min(0.10);
@@ -861,6 +927,20 @@ fn main() -> Result<()> {
     options.synth.joint_cfa_affine_threshold = cli.joint_cfa_affine_threshold;
     options.synth.joint_cfa_min_application_weight = cli.joint_cfa_min_application_weight;
     options.synth.joint_cfa_owns_color_resolution = !cli.joint_cfa_legacy_multicamera_detail;
+    options.synth.joint_cfa_fixture =
+        cli.joint_cfa_fixture
+            .clone()
+            .map(|path| JointCfaFixtureOptions {
+                path,
+                stride: cli.joint_cfa_fixture_stride.max(1),
+            });
+    options.synth.joint_cfa_snapshot =
+        cli.joint_cfa_snapshot
+            .clone()
+            .map(|path| JointCfaSnapshotOptions {
+                path,
+                stride: cli.joint_cfa_snapshot_stride.max(1),
+            });
     options.synth.highlight_correction = !cli.no_highlight_correction;
     options.synth.threads = cli.threads;
     options.synth.png_level = cli.png_level;
@@ -893,7 +973,23 @@ fn main() -> Result<()> {
         report.synthesis.canvas_height,
         report.synthesis.covered * 100.0,
     );
+    if report.lumen_mirror_translation_compat {
+        println!("mirror translation: Lumen compatibility bug enabled (diagnostic)");
+    }
+    if report.lumen_cra_registration_compat {
+        println!("distortion: Lumen CRA registration compatibility enabled (diagnostic)");
+    }
     let rig = &report.rig_refinement;
+    if let Some(diagnostics) = &rig.match_diagnostics {
+        if let Some(error) = diagnostics.error.as_deref() {
+            eprintln!("rig match diagnostics failed: {error}");
+        } else {
+            println!(
+                "rig match diagnostics: {} samples across {} cameras in {}",
+                diagnostics.samples, diagnostics.cameras, diagnostics.directory
+            );
+        }
+    }
     let rig_strategy = match rig.strategy {
         RigRefinementStrategy::Physical => "physical",
         RigRefinementStrategy::AnchorGraph => "anchor-graph",
@@ -1148,13 +1244,14 @@ fn main() -> Result<()> {
             || correction.mirror_angle_offset_degrees != 0.0
             || correction.center_offset_world != [0.0; 3]
             || correction.sensor_offset_px != [0.0; 2]
+            || correction.principal_point_offset_px != [0.0; 2]
             || correction.focal_scale_delta != 0.0
             || correction.focal_aspect_delta != 0.0
             || correction.distortion_center_offset_px != [0.0; 2]
             || correction.distortion_delta != [0.0; 4]
     }) {
         println!(
-            "  {} {}{rig_strategy} correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, sensor {:+.2},{:+.2} px, focal(s,a) {:+.3},{:+.3}%, dist-centre {:+.2},{:+.2} px, d[k1,k2,p1,p2]=[{:+.5},{:+.5},{:+.5},{:+.5}], mirror {:+.4} deg{}",
+            "  {} {}{rig_strategy} correction: orientation {:+.4},{:+.4},{:+.4} deg, centre {:+.3},{:+.3},{:+.3}, raster {:+.2},{:+.2} px, principal {:+.2},{:+.2} px, focal(s,a) {:+.3},{:+.3}%, dist-centre {:+.2},{:+.2} px, d[k1,k2,p1,p2]=[{:+.5},{:+.5},{:+.5},{:+.5}], mirror {:+.4} deg{}",
             correction.camera,
             if rig.accepted { "" } else { "candidate " },
             correction.orientation_offset_degrees[0],
@@ -1165,6 +1262,8 @@ fn main() -> Result<()> {
             correction.center_offset_world[2],
             correction.sensor_offset_px[0],
             correction.sensor_offset_px[1],
+            correction.principal_point_offset_px[0],
+            correction.principal_point_offset_px[1],
             correction.focal_scale_delta * 100.0,
             correction.focal_aspect_delta * 100.0,
             correction.distortion_center_offset_px[0],
@@ -1443,7 +1542,74 @@ mod tests {
         assert!((cli.joint_cfa_affine_threshold - 0.40).abs() < f32::EPSILON);
         assert!((cli.joint_cfa_min_application_weight - 0.02).abs() < f32::EPSILON);
         assert!(!cli.joint_cfa_legacy_multicamera_detail);
+        assert!(cli.joint_cfa_fixture.is_none());
+        assert_eq!(cli.joint_cfa_fixture_stride, 1);
+        assert!(cli.joint_cfa_snapshot.is_none());
+        assert_eq!(cli.joint_cfa_snapshot_stride, 1);
         assert!(!cli.no_rig_refine);
+        assert!(!cli.lumen_mirror_translation_compat);
+        assert!(!cli.lumen_cra_registration_compat);
+        assert!(cli.rig_match_diagnostics.is_none());
+    }
+
+    #[test]
+    fn joint_cfa_fixture_requires_an_explicit_crop() {
+        assert!(
+            Cli::try_parse_from([
+                "chiaro-fuse",
+                "capture.lri",
+                "--output",
+                "output.png",
+                "--joint-cfa-fixture",
+                "fixture.ndjson",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "chiaro-fuse",
+            "capture.lri",
+            "--output",
+            "output.png",
+            "--crop",
+            "0,0,64,64",
+            "--joint-cfa-fixture",
+            "fixture.ndjson",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.joint_cfa_fixture.as_deref(),
+            Some(std::path::Path::new("fixture.ndjson"))
+        );
+    }
+
+    #[test]
+    fn joint_cfa_snapshot_requires_an_explicit_crop() {
+        assert!(
+            Cli::try_parse_from([
+                "chiaro-fuse",
+                "capture.lri",
+                "--output",
+                "output.png",
+                "--joint-cfa-snapshot",
+                "snapshot",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "chiaro-fuse",
+            "capture.lri",
+            "--output",
+            "output.png",
+            "--crop",
+            "0,0,64,64",
+            "--joint-cfa-snapshot",
+            "snapshot",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.joint_cfa_snapshot.as_deref(),
+            Some(std::path::Path::new("snapshot"))
+        );
     }
 
     #[test]

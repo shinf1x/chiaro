@@ -47,6 +47,22 @@ use crate::{
 const DESCRIPTOR_SIDE: usize = 5;
 const DESCRIPTOR_SAMPLES: usize = DESCRIPTOR_SIDE * DESCRIPTOR_SIDE;
 const DESCRIPTOR_STEP_LUMA: f32 = 1.5;
+const REFERENCE_DESCRIPTOR_SMALL_SIDE: usize = 9;
+const REFERENCE_DESCRIPTOR_SMALL_SAMPLES: usize =
+    REFERENCE_DESCRIPTOR_SMALL_SIDE * REFERENCE_DESCRIPTOR_SMALL_SIDE;
+const REFERENCE_DESCRIPTOR_LARGE_SIDE: usize = 13;
+const REFERENCE_DESCRIPTOR_LARGE_SAMPLES: usize =
+    REFERENCE_DESCRIPTOR_LARGE_SIDE * REFERENCE_DESCRIPTOR_LARGE_SIDE;
+const REFERENCE_DESCRIPTOR_CONTEXT_SIDE: usize = 25;
+const REFERENCE_DESCRIPTOR_CONTEXT_SAMPLES: usize =
+    REFERENCE_DESCRIPTOR_CONTEXT_SIDE * REFERENCE_DESCRIPTOR_CONTEXT_SIDE;
+
+/// The compact descriptor is deliberately permissive because it only creates
+/// a shortlist. Retained alternatives must also have broad cross-camera
+/// contextual agreement, which rejects unrelated texture without demanding
+/// near-identity from the smaller, localization-sensitive supports.
+const REFERENCE_DESCRIPTOR_CONTEXT_MIN_SIMILARITY: f64 = 0.50;
+const REFERENCE_DESCRIPTOR_SHORTLIST_MULTIPLIER: usize = 4;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct LatentMatchRoundReport {
@@ -182,6 +198,23 @@ pub(super) struct LatentCandidate {
     /// Self-similarity in the target camera.  The initially selected
     /// observation has similarity 1.0 by construction.
     pub appearance_similarity: f64,
+    /// Scale-corrected reference-to-candidate similarities on the
+    /// half-resolution luminance planes. The 9x9 and 13x13 supports provide
+    /// assignment evidence; the broader 25x25 support rejects unrelated
+    /// context before an alternative enters the latent graph.
+    pub reference_similarity_9: Option<f64>,
+    pub reference_similarity_13: Option<f64>,
+    pub reference_similarity_25: Option<f64>,
+}
+
+impl LatentCandidate {
+    pub(super) fn reference_appearance_similarity(&self) -> Option<f64> {
+        match (self.reference_similarity_9, self.reference_similarity_13) {
+            (Some(small), Some(large)) => Some(0.5 * (small + large)),
+            (Some(similarity), None) | (None, Some(similarity)) => Some(similarity),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -373,12 +406,24 @@ pub(super) struct LatentCandidateState {
 }
 
 impl LatentCandidateState {
+    pub(super) fn observation_candidates(
+        &self,
+        track_key: [i32; 2],
+        camera: usize,
+    ) -> Option<&LatentObservationCandidates> {
+        self.by_track
+            .get(&track_key)?
+            .iter()
+            .find(|set| set.camera == camera)
+    }
+
     /// Produce an image-only frozen validation track.  The spatial hold-out is
     /// chosen before any rig fitting; within that block we additionally remove
     /// target observations whose original pairwise identity is intrinsically
     /// ambiguous.  This is not geometry-based pruning: it uses only the
-    /// forward/backward match quality and target-side self-similarity that were
-    /// available before the candidate camera existed.
+    /// forward/backward match quality plus target-side and cross-camera
+    /// appearance evidence that were available before the candidate camera
+    /// existed.
     pub(super) fn validation_track(
         &self,
         track: &Track,
@@ -398,6 +443,9 @@ impl LatentCandidateState {
                     set.validation_reliable
                         && set.candidates.iter().skip(1).all(|candidate| {
                             candidate.appearance_similarity <= maximum_alternative_similarity
+                                && candidate.reference_appearance_similarity().is_none_or(
+                                    |similarity| similarity <= maximum_alternative_similarity,
+                                )
                         })
                 })
         });
@@ -1077,6 +1125,164 @@ fn descriptor_similarity(a: &[f32; DESCRIPTOR_SAMPLES], b: &[f32; DESCRIPTOR_SAM
         .clamp(-1.0, 1.0)
 }
 
+#[derive(Clone, Debug)]
+struct ReferenceAppearanceDescriptor {
+    small: Option<[f32; REFERENCE_DESCRIPTOR_SMALL_SAMPLES]>,
+    large: Option<[f32; REFERENCE_DESCRIPTOR_LARGE_SAMPLES]>,
+    context: Option<[f32; REFERENCE_DESCRIPTOR_CONTEXT_SAMPLES]>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReferenceAppearanceSimilarity {
+    small: Option<f64>,
+    large: Option<f64>,
+    context: Option<f64>,
+}
+
+impl ReferenceAppearanceSimilarity {
+    fn combined(self) -> Option<f64> {
+        match (self.small, self.large) {
+            (Some(small), Some(large)) => Some(0.5 * (small + large)),
+            (Some(similarity), None) | (None, Some(similarity)) => Some(similarity),
+            (None, None) => None,
+        }
+    }
+
+    fn passes_gross_mismatch_gate(self) -> bool {
+        self.small.is_some()
+            && self.large.is_some()
+            && self
+                .context
+                .is_some_and(|similarity| similarity >= REFERENCE_DESCRIPTOR_CONTEXT_MIN_SIMILARITY)
+    }
+}
+
+fn normalized_patch_descriptor<const SAMPLES: usize>(
+    plane: &Plane,
+    sensor_pixel: Vec2,
+    step_luma: f32,
+    side: usize,
+) -> Option<[f32; SAMPLES]> {
+    debug_assert_eq!(SAMPLES, side * side);
+    debug_assert_eq!(side % 2, 1);
+    if !step_luma.is_finite() || step_luma <= 0.0 {
+        return None;
+    }
+    let cx = ((sensor_pixel[0] - 0.5) * 0.5) as f32;
+    let cy = ((sensor_pixel[1] - 0.5) * 0.5) as f32;
+    let centre = (side as f32 - 1.0) * 0.5;
+    let mut values = [0.0f32; SAMPLES];
+    let mut sum = 0.0f64;
+    let mut index = 0usize;
+    for y in 0..side {
+        for x in 0..side {
+            let value = plane.sample(
+                cx + (x as f32 - centre) * step_luma,
+                cy + (y as f32 - centre) * step_luma,
+            )?;
+            if !value.is_finite() {
+                return None;
+            }
+            values[index] = value;
+            sum += f64::from(value);
+            index += 1;
+        }
+    }
+    let mean = (sum / SAMPLES as f64) as f32;
+    let mut norm_sq = 0.0f64;
+    for value in &mut values {
+        *value -= mean;
+        norm_sq += f64::from(*value) * f64::from(*value);
+    }
+    if !norm_sq.is_finite() || norm_sq <= 1.0e-10 {
+        return None;
+    }
+    let inverse_norm = (1.0 / norm_sq.sqrt()) as f32;
+    for value in &mut values {
+        *value *= inverse_norm;
+    }
+    Some(values)
+}
+
+fn reference_appearance_descriptor(
+    plane: &Plane,
+    sensor_pixel: Vec2,
+) -> ReferenceAppearanceDescriptor {
+    ReferenceAppearanceDescriptor {
+        small: normalized_patch_descriptor(
+            plane,
+            sensor_pixel,
+            1.0,
+            REFERENCE_DESCRIPTOR_SMALL_SIDE,
+        ),
+        large: normalized_patch_descriptor(
+            plane,
+            sensor_pixel,
+            1.0,
+            REFERENCE_DESCRIPTOR_LARGE_SIDE,
+        ),
+        context: normalized_patch_descriptor(
+            plane,
+            sensor_pixel,
+            1.0,
+            REFERENCE_DESCRIPTOR_CONTEXT_SIDE,
+        ),
+    }
+}
+
+fn normalized_descriptor_similarity<const SAMPLES: usize>(
+    reference: &[f32; SAMPLES],
+    candidate: &[f32; SAMPLES],
+) -> f64 {
+    reference
+        .iter()
+        .zip(candidate)
+        .map(|(&first, &second)| f64::from(first) * f64::from(second))
+        .sum::<f64>()
+        .clamp(-1.0, 1.0)
+}
+
+fn reference_appearance_similarity(
+    reference: &ReferenceAppearanceDescriptor,
+    target: &Plane,
+    target_pixel: Vec2,
+    target_step_luma: f64,
+) -> ReferenceAppearanceSimilarity {
+    let target_step_luma = target_step_luma.clamp(0.25, 4.0) as f32;
+    let small = reference.small.as_ref().and_then(|reference| {
+        let target = normalized_patch_descriptor(
+            target,
+            target_pixel,
+            target_step_luma,
+            REFERENCE_DESCRIPTOR_SMALL_SIDE,
+        )?;
+        Some(normalized_descriptor_similarity(reference, &target))
+    });
+    let large = reference.large.as_ref().and_then(|reference| {
+        let target = normalized_patch_descriptor(
+            target,
+            target_pixel,
+            target_step_luma,
+            REFERENCE_DESCRIPTOR_LARGE_SIDE,
+        )?;
+        Some(normalized_descriptor_similarity(reference, &target))
+    });
+    let context = reference.context.as_ref().and_then(|reference| {
+        let target = normalized_patch_descriptor(
+            target,
+            target_pixel,
+            target_step_luma,
+            REFERENCE_DESCRIPTOR_CONTEXT_SIDE,
+        )?;
+        Some(normalized_descriptor_similarity(reference, &target))
+    });
+    ReferenceAppearanceSimilarity {
+        small,
+        large,
+        context,
+    }
+}
+
 /// Signed target-pixel approximation to the calibrated epipolar-plane error.
 /// The *difference* between candidate and initial errors is used below, so a
 /// capture-wide factory bearing error does not delete the correct alternative.
@@ -1658,12 +1864,28 @@ pub(super) fn build_latent_tracks(
             depth_reliability: None,
             prepared: Default::default(),
         });
+        let reference_descriptor = cameras[reference_index]
+            .luminance
+            .map(|plane| reference_appearance_descriptor(plane, group.reference_pixel));
 
         let mut latent_observations = Vec::new();
         for (camera, correspondence) in group.targets.iter().enumerate() {
             let Some(correspondence) = *correspondence else {
                 continue;
             };
+            let target_plane = cameras[camera].luminance;
+            let base_reference_similarity = reference_descriptor
+                .as_ref()
+                .zip(target_plane)
+                .map(|(reference, target)| {
+                    reference_appearance_similarity(
+                        reference,
+                        target,
+                        correspondence.target_pixel,
+                        f64::from(correspondence.local_scale),
+                    )
+                })
+                .unwrap_or_default();
             let base = LatentCandidate {
                 pixel: correspondence.target_pixel,
                 localization_covariance: correspondence
@@ -1673,6 +1895,9 @@ pub(super) fn build_latent_tracks(
                 local_scale: f64::from(correspondence.local_scale),
                 structure: f64::from(correspondence.structure),
                 appearance_similarity: 1.0,
+                reference_similarity_9: base_reference_similarity.small,
+                reference_similarity_13: base_reference_similarity.large,
+                reference_similarity_25: base_reference_similarity.context,
             };
             let mut candidates = vec![base.clone()];
             let base_descriptor = cameras[camera]
@@ -1726,9 +1951,38 @@ pub(super) fn build_latent_tracks(
                     let score_b = b.0 - 0.01 * b.1.min(24.0);
                     score_b.total_cmp(&score_a)
                 });
-                for (similarity, _, feature) in alternatives
+                let retained_alternatives = options.latent_max_candidates.saturating_sub(1);
+                let shortlist_size =
+                    retained_alternatives.saturating_mul(REFERENCE_DESCRIPTOR_SHORTLIST_MULTIPLIER);
+                let mut reference_ranked = alternatives
                     .into_iter()
-                    .take(options.latent_max_candidates.saturating_sub(1))
+                    .take(shortlist_size)
+                    .filter_map(|(similarity, epipolar_delta, feature)| {
+                        let reference_similarity = reference_descriptor
+                            .as_ref()
+                            .zip(target_plane)
+                            .map(|(reference, target)| {
+                                reference_appearance_similarity(
+                                    reference,
+                                    target,
+                                    feature.pixel,
+                                    base.local_scale,
+                                )
+                            })
+                            .unwrap_or_default();
+                        if !reference_similarity.passes_gross_mismatch_gate() {
+                            return None;
+                        }
+                        let reference_score = reference_similarity.combined()?;
+                        let context_score = reference_similarity.context?;
+                        let rank = similarity + reference_score + context_score
+                            - 0.01 * epipolar_delta.min(24.0);
+                        Some((rank, similarity, reference_similarity, feature))
+                    })
+                    .collect::<Vec<_>>();
+                reference_ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+                for (_, similarity, reference_similarity, feature) in
+                    reference_ranked.into_iter().take(retained_alternatives)
                 {
                     candidates.push(LatentCandidate {
                         pixel: feature.pixel,
@@ -1737,6 +1991,9 @@ pub(super) fn build_latent_tracks(
                         local_scale: base.local_scale,
                         structure: base.structure.min(feature.structure.max(1.0e-6)),
                         appearance_similarity: similarity,
+                        reference_similarity_9: reference_similarity.small,
+                        reference_similarity_13: reference_similarity.large,
+                        reference_similarity_25: reference_similarity.context,
                     });
                 }
             }
@@ -2254,9 +2511,18 @@ fn candidate_score(
         errors.sort_by(f64::total_cmp);
         (!errors.is_empty()).then(|| errors[errors.len() / 2])
     };
-    let appearance = options.latent_appearance_penalty_px
+    let target_self_appearance = options.latent_appearance_penalty_px
         * (1.0 - candidate.appearance_similarity.clamp(-1.0, 1.0));
-    let mut total = appearance;
+    let reference_appearance = candidate
+        .reference_appearance_similarity()
+        .map_or(0.0, |similarity| {
+            options.latent_appearance_penalty_px * (1.0 - similarity.clamp(-1.0, 1.0))
+        });
+    // These are independent measurements: the compact target-side descriptor
+    // discovers repeated local alternatives, while the scale-corrected
+    // reference descriptor asks whether each alternative still represents the
+    // original landmark. Keep both penalties instead of averaging one away.
+    let mut total = target_self_appearance + reference_appearance;
     if let Some(error) = geometry_error {
         total += error.min(options.latent_score_error_cap_px);
     }
@@ -2586,6 +2852,83 @@ mod tests {
         let da = descriptor_for_sensor_pixel(&a, pixel).unwrap();
         let db = descriptor_for_sensor_pixel(&b, pixel).unwrap();
         assert!(descriptor_similarity(&da, &db) > 0.9999);
+    }
+
+    #[test]
+    fn reference_descriptor_is_gain_offset_and_scale_invariant() {
+        let mut reference = Plane::new(80, 80);
+        let mut target = Plane::new(120, 120);
+        let reference_centre = [35.0f32, 33.0f32];
+        let target_centre = [61.0f32, 57.0f32];
+        let pattern = |x: f32, y: f32| {
+            (x * 0.41).sin() + 0.7 * (y * 0.29).cos() + 0.2 * ((x + y) * 0.17).sin()
+        };
+        for y in 0..reference.height {
+            for x in 0..reference.width {
+                reference.data[y * reference.width + x] = pattern(x as f32, y as f32);
+            }
+        }
+        for y in 0..target.height {
+            for x in 0..target.width {
+                let reference_x = reference_centre[0] + (x as f32 - target_centre[0]) * 0.5;
+                let reference_y = reference_centre[1] + (y as f32 - target_centre[1]) * 0.5;
+                target.data[y * target.width + x] = 3.5 * pattern(reference_x, reference_y) + 4.0;
+            }
+        }
+        let reference_pixel = [
+            f64::from(2.0 * reference_centre[0] + 0.5),
+            f64::from(2.0 * reference_centre[1] + 0.5),
+        ];
+        let target_pixel = [
+            f64::from(2.0 * target_centre[0] + 0.5),
+            f64::from(2.0 * target_centre[1] + 0.5),
+        ];
+        let descriptor = reference_appearance_descriptor(&reference, reference_pixel);
+        let correct = reference_appearance_similarity(&descriptor, &target, target_pixel, 2.0);
+        let wrong_scale = reference_appearance_similarity(&descriptor, &target, target_pixel, 1.0);
+        assert!(correct.small.unwrap() > 0.9999);
+        assert!(correct.large.unwrap() > 0.9999);
+        assert!(correct.context.unwrap() > 0.9999);
+        assert!(correct.large.unwrap() > wrong_scale.large.unwrap() + 0.02);
+    }
+
+    #[test]
+    fn reference_descriptor_gate_requires_multiscale_evidence_and_broad_context() {
+        let similarity = |small, large, context| ReferenceAppearanceSimilarity {
+            small: Some(small),
+            large: Some(large),
+            context: Some(context),
+        };
+        assert!(similarity(0.91, 0.86, 0.82).passes_gross_mismatch_gate());
+        assert!(!similarity(0.95, 0.90, 0.20).passes_gross_mismatch_gate());
+        assert!(
+            !ReferenceAppearanceSimilarity {
+                small: Some(0.95),
+                large: None,
+                context: Some(0.90),
+            }
+            .passes_gross_mismatch_gate()
+        );
+    }
+
+    #[test]
+    fn candidate_score_keeps_target_and_reference_appearance_as_independent_evidence() {
+        let candidate = |reference_similarity| LatentCandidate {
+            pixel: [100.0, 100.0],
+            localization_covariance: [[1.0, 0.0], [0.0, 1.0]],
+            confidence: 1.0,
+            local_scale: 1.0,
+            structure: 1.0,
+            appearance_similarity: 0.9,
+            reference_similarity_9: Some(reference_similarity),
+            reference_similarity_13: Some(reference_similarity),
+            reference_similarity_25: Some(reference_similarity),
+        };
+        let options = RigRefinementOptions::default();
+        let strong = candidate_score(&candidate(0.95), None, None, &[], &options);
+        let weak = candidate_score(&candidate(0.70), None, None, &[], &options);
+        let expected_delta = options.latent_appearance_penalty_px * 0.25;
+        assert!((weak.total - strong.total - expected_delta).abs() < 1.0e-12);
     }
 
     #[test]

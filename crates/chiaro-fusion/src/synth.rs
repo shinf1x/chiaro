@@ -23,7 +23,12 @@ use chiaro::lri::NoiseModel;
 use chiaro_hotpixel_core::demosaic::DemosaicMethod;
 use chiaro_hotpixel_core::highlight::{HighlightRecovery, HighlightRecoveryState};
 use chiaro_hotpixel_core::png16::{PngColor, write_png16_streaming_atomic_with_level_profiled};
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use crate::align::{ModuleAlignment, Warp, WarpSample, WarpVisibility};
 use crate::cfa::{
@@ -109,6 +114,15 @@ pub struct SynthOptions {
     pub threads: usize,
     /// PNG deflate level.
     pub png_level: u32,
+    /// Optional diagnostic dump of per-pixel Joint-CFA solver inputs. The
+    /// fixture is intended for small explicit crops and offline Python replay;
+    /// it never changes production reconstruction decisions.
+    pub joint_cfa_fixture: Option<JointCfaFixtureOptions>,
+    /// Optional complete Joint-CFA stage snapshot. Unlike the compact solver
+    /// fixture this also persists the pre-gather camera/depth state required
+    /// to rebuild physical CFA observations without re-running alignment or
+    /// dense depth.
+    pub joint_cfa_snapshot: Option<JointCfaSnapshotOptions>,
 }
 
 impl Default for SynthOptions {
@@ -129,8 +143,1028 @@ impl Default for SynthOptions {
             highlight_correction: true,
             threads: 0,
             png_level: chiaro_hotpixel_core::png16::DEFAULT_DEFLATE_LEVEL,
+            joint_cfa_fixture: None,
+            joint_cfa_snapshot: None,
         }
     }
+}
+
+/// Offline Joint-CFA replay export. The output is newline-delimited JSON: one
+/// header record followed by one pixel record for every `stride`th output
+/// pixel. Pixel records contain the already geometry-filtered, covariance-
+/// adjusted CFA observations consumed by the robust solver.
+#[derive(Clone, Debug)]
+pub struct JointCfaFixtureOptions {
+    pub path: PathBuf,
+    pub stride: usize,
+}
+
+/// Complete, replayable Joint-CFA stage boundary. `path` is a directory
+/// containing a JSON manifest, compact binary tensors and `pixels.ndjson`.
+#[derive(Clone, Debug)]
+pub struct JointCfaSnapshotOptions {
+    pub path: PathBuf,
+    pub stride: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotArray {
+    path: String,
+    dtype: &'static str,
+    shape: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct JointCfaSnapshotWindow {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotWarp {
+    step: usize,
+    columns: usize,
+    rows: usize,
+    points: JointCfaSnapshotArray,
+    confidence: JointCfaSnapshotArray,
+    visibility: JointCfaSnapshotArray,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotMesh {
+    columns: usize,
+    rows: usize,
+    components_per_node: usize,
+    values: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct JointCfaSnapshotNoiseChannel {
+    a: f32,
+    b: f32,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct JointCfaSnapshotNoiseModel {
+    gain: u32,
+    threshold: f32,
+    scale: f32,
+    red: JointCfaSnapshotNoiseChannel,
+    green: JointCfaSnapshotNoiseChannel,
+    blue: JointCfaSnapshotNoiseChannel,
+    panchromatic: JointCfaSnapshotNoiseChannel,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotMosaic {
+    sensor_width: usize,
+    sensor_height: usize,
+    pattern: String,
+    black_q6: f32,
+    white_q6: f32,
+    physical_code_range: f32,
+    window: Option<JointCfaSnapshotWindow>,
+    samples_q6: Option<JointCfaSnapshotArray>,
+    highlight_confidence: Option<JointCfaSnapshotArray>,
+    demosaiced_rgb_q6: Option<JointCfaSnapshotArray>,
+    /// Convenience tensor produced by the exact Rust site-preparation path.
+    /// Last axis: valid, phase_index, value, noise_variance,
+    /// highlight_confidence, response_x, response_y, response_z.
+    prepared_sites: Option<JointCfaSnapshotArray>,
+    vignetting: Option<JointCfaSnapshotMesh>,
+    crosstalk: Option<JointCfaSnapshotMesh>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotNativeGuidance {
+    /// Exact Rust sensor-space sampling boundary used to build dense guidance.
+    /// Last axis: camera_r, camera_g, camera_b, sensor_white_r,
+    /// sensor_white_g, sensor_white_b. Camera RGB is black-subtracted,
+    /// normalised, crosstalk/flat-field corrected, and demosaiced when needed,
+    /// but is still in the module's own camera RGB space (no WB or colour matrix).
+    sensor_rgb_white: Option<JointCfaSnapshotArray>,
+    sensor_layout: [&'static str; 6],
+    /// Dense snapshot-canvas view made with the base alignment warp.
+    /// Last axis: white-balanced camera R, G, B, alpha. Alpha is 1 only where
+    /// the warped source is valid/visible and 0 outside the module footprint.
+    base_view_wb_rgba: JointCfaSnapshotArray,
+    /// Same representation using the exact reconstruction geometry selection
+    /// (resolution warp where locally valid, otherwise the base warp).
+    reconstruction_view_wb_rgba: JointCfaSnapshotArray,
+    view_layout: [&'static str; 4],
+    sensor_rgb_space: &'static str,
+    view_rgb_space: &'static str,
+    module_gain_hint: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotCamera {
+    index: usize,
+    name: String,
+    camera_id: usize,
+    reference: bool,
+    held_out: bool,
+    fusion_enabled: bool,
+    joint_cfa_eligible: bool,
+    mono: bool,
+    magnification: f32,
+    confidence: f32,
+    focus_distance: Option<f64>,
+    alignment_gain: f32,
+    alignment_offset: f32,
+    alignment_initialised_from: String,
+    color_calibrated: bool,
+    wb_gains: [f32; 3],
+    forward_xyz: [[f32; 3]; 3],
+    response_base: Option<CameraResponseBase>,
+    gain_field_columns: usize,
+    gain_field_rows: usize,
+    gain_field_gains: Vec<[f32; 3]>,
+    noise_model: Option<JointCfaSnapshotNoiseModel>,
+    mosaic: JointCfaSnapshotMosaic,
+    native_guidance: JointCfaSnapshotNativeGuidance,
+    base_warp: JointCfaSnapshotWarp,
+    resolution_warp: Option<JointCfaSnapshotWarp>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotDepth {
+    columns: usize,
+    rows: usize,
+    step: usize,
+    near_depth: f64,
+    far_depth: f64,
+    depth: JointCfaSnapshotArray,
+    confidence: JointCfaSnapshotArray,
+    provenance: JointCfaSnapshotArray,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotConstants {
+    support_radius_output_px: f32,
+    support_radius_search_multiplier: f32,
+    sensor_window_extra_margin_px: usize,
+    prior_weight: f32,
+    weak_visible_min_confidence: f32,
+    normal_visible_min_confidence: f32,
+    unknown_visibility_min_confidence: f32,
+    unknown_visibility_scale: f32,
+    minimum_camera_consistency: f32,
+    weak_geometry_min_consistency: f32,
+    solver_min_cameras: usize,
+    solver_min_observations: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaSnapshotManifest {
+    kind: &'static str,
+    version: u32,
+    pixels_file: &'static str,
+    canvas_width: usize,
+    canvas_height: usize,
+    crop: [f32; 4],
+    scale: f32,
+    stride: usize,
+    output_color: &'static str,
+    exposure: f32,
+    prepared_site_layout: [&'static str; 8],
+    warp_visibility_codes: [&'static str; 4],
+    depth_provenance_codes: [&'static str; 4],
+    feather_px: f32,
+    demosaic: String,
+    highlight_correction: bool,
+    joint_cfa_solve_flat: bool,
+    production_lattice: usize,
+    affine_threshold: f32,
+    min_application_weight: f32,
+    owns_color_resolution: bool,
+    include_mono: bool,
+    resolution_reconstruction: String,
+    constants: JointCfaSnapshotConstants,
+    depth: Option<JointCfaSnapshotDepth>,
+    cameras: Vec<JointCfaSnapshotCamera>,
+}
+
+#[derive(serde::Serialize)]
+struct JointCfaFixtureCamera<'a> {
+    index: usize,
+    name: &'a str,
+    camera_id: usize,
+    reference: bool,
+    held_out: bool,
+    mono: bool,
+    calibrated: bool,
+    magnification: f32,
+}
+
+#[derive(serde::Serialize)]
+struct JointCfaFixtureHeader<'a> {
+    kind: &'static str,
+    version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_manifest: Option<&'static str>,
+    canvas_width: usize,
+    canvas_height: usize,
+    crop: [f32; 4],
+    scale: f32,
+    stride: usize,
+    prior_weight: f32,
+    production_lattice: usize,
+    affine_threshold: f32,
+    min_application_weight: f32,
+    color: &'static str,
+    exposure: f32,
+    cameras: Vec<JointCfaFixtureCamera<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct JointCfaFixtureSceneDepth {
+    depth: f64,
+    confidence: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct JointCfaFixtureCameraState {
+    camera_index: usize,
+    status: &'static str,
+    mapped_sensor_xy: Option<[f32; 2]>,
+    inverse_warp_jacobian: Option<[f32; 4]>,
+    local_geometry_confidence: f32,
+    centre_visibility: &'static str,
+    effective_geometry_confidence: f32,
+    weak_visible_geometry: bool,
+    sensor_radius: usize,
+    camera_luminance: Option<f32>,
+    camera_xyz: Option<[f32; 3]>,
+    edge_weight: f32,
+    chroma_weight: f32,
+    detail_weight: f32,
+    focus_weight: f32,
+    camera_consistency: f32,
+    accepted_observations: usize,
+}
+
+impl JointCfaFixtureCameraState {
+    fn new(camera_index: usize) -> Self {
+        Self {
+            camera_index,
+            status: "not_evaluated",
+            mapped_sensor_xy: None,
+            inverse_warp_jacobian: None,
+            local_geometry_confidence: 0.0,
+            centre_visibility: "unknown",
+            effective_geometry_confidence: 0.0,
+            weak_visible_geometry: false,
+            sensor_radius: 0,
+            camera_luminance: None,
+            camera_xyz: None,
+            edge_weight: 0.0,
+            chroma_weight: 0.0,
+            detail_weight: 0.0,
+            focus_weight: 0.0,
+            camera_consistency: 0.0,
+            accepted_observations: 0,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JointCfaFixturePixel<'a> {
+    kind: &'static str,
+    u: usize,
+    v: usize,
+    reference_xy: [f32; 2],
+    prior_xyz: [f32; 3],
+    reference_luminance: Option<f32>,
+    reference_structure: Option<[f32; 3]>,
+    scene_depth: Option<JointCfaFixtureSceneDepth>,
+    preserve_baseline_luminance: bool,
+    structure_magnitude: f32,
+    structure_weight: f32,
+    requested_mode: JointCfaSolveMode,
+    status: &'static str,
+    production_would_solve: bool,
+    production_reused_lattice: bool,
+    production_xyz: [f32; 3],
+    reference_solve_xyz: [f32; 3],
+    reference_application_weight: f32,
+    reference_chroma_application_weight: f32,
+    report: Option<crate::cfa::JointCfaSolveReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_states: Option<Vec<JointCfaFixtureCameraState>>,
+    observations: &'a [CfaObservation],
+}
+
+struct JointCfaFixtureSink {
+    writer: BufWriter<File>,
+    error: Option<String>,
+}
+
+fn snapshot_safe_component(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if out.is_empty() {
+        out.push_str("camera");
+    }
+    out
+}
+
+fn snapshot_array(
+    root: &Path,
+    relative: impl AsRef<Path>,
+    dtype: &'static str,
+    shape: Vec<usize>,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+) -> Result<JointCfaSnapshotArray> {
+    let relative = relative.as_ref();
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = BufWriter::new(File::create(&path)?);
+    write(&mut writer)?;
+    writer.flush()?;
+    Ok(JointCfaSnapshotArray {
+        path: relative.to_string_lossy().replace('\\', "/"),
+        dtype,
+        shape,
+    })
+}
+
+fn snapshot_write_f32(
+    writer: &mut BufWriter<File>,
+    values: impl IntoIterator<Item = f32>,
+) -> Result<()> {
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn snapshot_write_f64(
+    writer: &mut BufWriter<File>,
+    values: impl IntoIterator<Item = f64>,
+) -> Result<()> {
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn snapshot_write_u16(
+    writer: &mut BufWriter<File>,
+    values: impl IntoIterator<Item = u16>,
+) -> Result<()> {
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn snapshot_visibility_code(value: WarpVisibility) -> u8 {
+    match value {
+        WarpVisibility::Unknown => 0,
+        WarpVisibility::Visible => 1,
+        WarpVisibility::Occluded => 2,
+        WarpVisibility::Boundary => 3,
+    }
+}
+
+fn snapshot_visibility_name(value: WarpVisibility) -> &'static str {
+    match value {
+        WarpVisibility::Unknown => "unknown",
+        WarpVisibility::Visible => "visible",
+        WarpVisibility::Occluded => "occluded",
+        WarpVisibility::Boundary => "boundary",
+    }
+}
+
+fn snapshot_depth_provenance_code(value: DepthProvenance) -> u8 {
+    match value {
+        DepthProvenance::Unsupported => 0,
+        DepthProvenance::Global => 1,
+        DepthProvenance::Measured => 2,
+        DepthProvenance::Regularized => 3,
+    }
+}
+
+fn snapshot_noise_model(model: NoiseModel) -> JointCfaSnapshotNoiseModel {
+    let channel = |value: chiaro::lri::NoiseChannelModel| JointCfaSnapshotNoiseChannel {
+        a: value.a,
+        b: value.b,
+    };
+    JointCfaSnapshotNoiseModel {
+        gain: model.gain,
+        threshold: model.threshold,
+        scale: model.scale,
+        red: channel(model.red),
+        green: channel(model.green),
+        blue: channel(model.blue),
+        panchromatic: channel(model.panchromatic),
+    }
+}
+
+fn snapshot_warp(
+    root: &Path,
+    camera_dir: &Path,
+    label: &str,
+    warp: &Warp,
+) -> Result<JointCfaSnapshotWarp> {
+    let points = snapshot_array(
+        root,
+        camera_dir.join(format!("{label}_points.f32le")),
+        "<f4",
+        vec![warp.rows, warp.columns, 2],
+        |writer| {
+            snapshot_write_f32(
+                writer,
+                warp.points.iter().flat_map(|point| point.iter().copied()),
+            )
+        },
+    )?;
+    let confidence = snapshot_array(
+        root,
+        camera_dir.join(format!("{label}_confidence.f32le")),
+        "<f4",
+        vec![warp.rows, warp.columns],
+        |writer| snapshot_write_f32(writer, warp.confidence.iter().copied()),
+    )?;
+    let visibility = snapshot_array(
+        root,
+        camera_dir.join(format!("{label}_visibility.u8")),
+        "|u1",
+        vec![warp.rows, warp.columns],
+        |writer| {
+            let bytes = warp
+                .visibility
+                .iter()
+                .copied()
+                .map(snapshot_visibility_code)
+                .collect::<Vec<_>>();
+            writer.write_all(&bytes)?;
+            Ok(())
+        },
+    )?;
+    Ok(JointCfaSnapshotWarp {
+        step: warp.step,
+        columns: warp.columns,
+        rows: warp.rows,
+        points,
+        confidence,
+        visibility,
+    })
+}
+
+fn snapshot_sensor_window(
+    source: &SynthSource<'_>,
+    crop: CropWindow,
+    width: usize,
+    height: usize,
+    scale: f32,
+    stride: usize,
+) -> Option<JointCfaSnapshotWindow> {
+    // A complete snapshot is an offline research boundary, not only a dump of
+    // cameras admitted by the production Joint-CFA colour solve. Export sensor
+    // windows for *all* modules that geometrically overlap the explicit crop,
+    // including uncalibrated/rejected Bayer cameras (e.g. C2/C3/C4) and mono
+    // cameras (notably C6). This is required for Lumen/ResAmp-style experiments
+    // where a camera can be useful as registration/detail evidence even when it
+    // is intentionally excluded from production colour reconstruction.
+    let stride = stride.max(1);
+    let mut min_x = source.mosaic.width as isize;
+    let mut min_y = source.mosaic.height as isize;
+    let mut max_x = -1isize;
+    let mut max_y = -1isize;
+    // Keep both the physical gather and the ±1.5-reference-pixel local
+    // structure probe inside the exported sensor window. Four extra physical
+    // pixels cover stride-2 CFA interpolation/demosaic footprints and leave a
+    // small amount of room for offline support experiments.
+    for v in (0..height).step_by(stride) {
+        let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
+        for u in (0..width).step_by(stride) {
+            let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
+            let Some(geometry) = reconstruction_geometry_at(source, rx, ry) else {
+                continue;
+            };
+            if !geometry.q[0].is_finite() || !geometry.q[1].is_finite() {
+                continue;
+            }
+            let gather_radius = geometry.inverse.source_radius(1.65 * 1.5, scale);
+            let structure_radius = geometry.inverse.source_radius(1.5 * scale, scale);
+            let radius = gather_radius.max(structure_radius) as isize
+                + JOINT_CFA_SNAPSHOT_EXTRA_SENSOR_MARGIN as isize;
+            let cx = geometry.q[0].round() as isize;
+            let cy = geometry.q[1].round() as isize;
+            min_x = min_x.min(cx - radius);
+            min_y = min_y.min(cy - radius);
+            max_x = max_x.max(cx + radius);
+            max_y = max_y.max(cy + radius);
+        }
+    }
+    if max_x < min_x || max_y < min_y {
+        return None;
+    }
+    let sensor_max_x = source.mosaic.width.saturating_sub(1) as isize;
+    let sensor_max_y = source.mosaic.height.saturating_sub(1) as isize;
+    if max_x < 0 || max_y < 0 || min_x > sensor_max_x || min_y > sensor_max_y {
+        return None;
+    }
+    min_x = min_x.clamp(0, sensor_max_x);
+    min_y = min_y.clamp(0, sensor_max_y);
+    max_x = max_x.clamp(0, sensor_max_x);
+    max_y = max_y.clamp(0, sensor_max_y);
+    if max_x < min_x || max_y < min_y {
+        return None;
+    }
+    Some(JointCfaSnapshotWindow {
+        x: min_x as usize,
+        y: min_y as usize,
+        width: (max_x - min_x + 1) as usize,
+        height: (max_y - min_y + 1) as usize,
+    })
+}
+
+fn snapshot_mosaic(
+    root: &Path,
+    camera_dir: &Path,
+    source: &SynthSource<'_>,
+    window: Option<JointCfaSnapshotWindow>,
+    response_base: Option<&CameraResponseBase>,
+) -> Result<JointCfaSnapshotMosaic> {
+    let mosaic = source.mosaic;
+    let samples_q6 = window
+        .map(|window| {
+            snapshot_array(
+                root,
+                camera_dir.join("samples_q6.u16le"),
+                "<u2",
+                vec![window.height, window.width],
+                |writer| {
+                    for y in window.y..window.y + window.height {
+                        let start = y * mosaic.width + window.x;
+                        snapshot_write_u16(
+                            writer,
+                            mosaic.samples[start..start + window.width].iter().copied(),
+                        )?;
+                    }
+                    Ok(())
+                },
+            )
+        })
+        .transpose()?;
+    let highlight_confidence = window
+        .map(|window| {
+            snapshot_array(
+                root,
+                camera_dir.join("highlight_confidence.u8"),
+                "|u1",
+                vec![window.height, window.width],
+                |writer| {
+                    for y in window.y..window.y + window.height {
+                        for x in window.x..window.x + window.width {
+                            let index = y * mosaic.width + x;
+                            writer.write_all(&[source
+                                .highlight
+                                .confidence
+                                .get(index)
+                                .copied()
+                                .unwrap_or(255)])?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        })
+        .transpose()?;
+    let demosaiced_rgb_q6 = match (window, mosaic.demosaiced_rgb.as_ref()) {
+        (Some(window), Some(rgb)) => Some(snapshot_array(
+            root,
+            camera_dir.join("demosaiced_rgb_q6.u16le"),
+            "<u2",
+            vec![window.height, window.width, 3],
+            |writer| {
+                for y in window.y..window.y + window.height {
+                    for x in window.x..window.x + window.width {
+                        let start = (y * mosaic.width + x) * 3;
+                        snapshot_write_u16(writer, rgb[start..start + 3].iter().copied())?;
+                    }
+                }
+                Ok(())
+            },
+        )?),
+        _ => None,
+    };
+    let prepared_sites = match (window, response_base) {
+        (Some(window), Some(response_base)) => Some(snapshot_array(
+            root,
+            camera_dir.join("prepared_sites.f32le"),
+            "<f4",
+            vec![window.height, window.width, 8],
+            |writer| {
+                for y in window.y..window.y + window.height {
+                    for x in window.x..window.x + window.width {
+                        if let Some(site) = prepare_joint_cfa_site(source, response_base, x, y) {
+                            snapshot_write_f32(
+                                writer,
+                                [
+                                    1.0,
+                                    site.phase.index() as f32,
+                                    site.value,
+                                    site.noise_variance,
+                                    f32::from(site.highlight_confidence),
+                                    site.response[0],
+                                    site.response[1],
+                                    site.response[2],
+                                ],
+                            )?;
+                        } else {
+                            snapshot_write_f32(writer, [0.0; 8])?;
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?),
+        _ => None,
+    };
+    let vignetting = mosaic.vignetting.as_ref().map(|mesh| JointCfaSnapshotMesh {
+        columns: mesh.columns,
+        rows: mesh.rows,
+        components_per_node: 1,
+        values: mesh.gains.clone(),
+    });
+    let crosstalk = mosaic.crosstalk.as_ref().map(|mesh| JointCfaSnapshotMesh {
+        columns: mesh.columns,
+        rows: mesh.rows,
+        components_per_node: 16,
+        values: mesh.matrices.clone(),
+    });
+    Ok(JointCfaSnapshotMosaic {
+        sensor_width: mosaic.width,
+        sensor_height: mosaic.height,
+        pattern: mosaic.pattern.as_str().to_owned(),
+        black_q6: mosaic.black_q6,
+        white_q6: mosaic.white_q6,
+        physical_code_range: mosaic.physical_code_range,
+        window,
+        samples_q6,
+        highlight_confidence,
+        demosaiced_rgb_q6,
+        prepared_sites,
+        vignetting,
+        crosstalk,
+    })
+}
+
+fn snapshot_write_native_sensor_rgb_white(
+    root: &Path,
+    camera_dir: &Path,
+    source: &SynthSource<'_>,
+    window: Option<JointCfaSnapshotWindow>,
+) -> Result<Option<JointCfaSnapshotArray>> {
+    window
+        .map(|window| {
+            snapshot_array(
+                root,
+                camera_dir.join("native_sensor_rgb_white.f32le"),
+                "<f4",
+                vec![window.height, window.width, 6],
+                |writer| {
+                    for y in window.y..window.y + window.height {
+                        for x in window.x..window.x + window.width {
+                            let (rgb, white) = source
+                                .mosaic
+                                .sample_rgb_with_white_at_sensor(x, y)
+                                .unwrap_or(([0.0; 3], [0.0; 3]));
+                            snapshot_write_f32(
+                                writer,
+                                [rgb[0], rgb[1], rgb[2], white[0], white[1], white[2]],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        })
+        .transpose()
+}
+
+#[inline]
+fn snapshot_wb_rgba_at(source: &SynthSource<'_>, q: [f32; 2]) -> [f32; 4] {
+    let Some((rgb, _white)) = source.mosaic.sample_rgb_with_white(q[0], q[1]) else {
+        return [0.0; 4];
+    };
+    [
+        rgb[0] * source.color.wb_gains[0],
+        rgb[1] * source.color.wb_gains[1],
+        rgb[2] * source.color.wb_gains[2],
+        1.0,
+    ]
+}
+
+fn snapshot_write_native_view(
+    root: &Path,
+    camera_dir: &Path,
+    relative_name: &str,
+    source: &SynthSource<'_>,
+    crop: CropWindow,
+    scale: f32,
+    width: usize,
+    height: usize,
+    reconstruction_geometry: bool,
+) -> Result<JointCfaSnapshotArray> {
+    snapshot_array(
+        root,
+        camera_dir.join(relative_name),
+        "<f4",
+        vec![height, width, 4],
+        |writer| {
+            for v in 0..height {
+                let ry = crop.y + (v as f32 + 0.5) / scale - 0.5;
+                for u in 0..width {
+                    let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
+                    let rgba = if reconstruction_geometry {
+                        let base_sample = source_base_warp_sample(source, rx, ry);
+                        select_reconstruction_warp_sample(
+                            &source.alignment.warp,
+                            source.resolution_warp,
+                            source.reference,
+                            rx,
+                            ry,
+                            base_sample,
+                        )
+                        .and_then(|(_, sample)| sample.mapped)
+                        .map(|q| snapshot_wb_rgba_at(source, q))
+                        .unwrap_or([0.0; 4])
+                    } else {
+                        let sample = source_base_warp_sample(source, rx, ry);
+                        if !source.reference && sample.visibility.blocks_sampling() {
+                            [0.0; 4]
+                        } else {
+                            sample
+                                .mapped
+                                .map(|q| snapshot_wb_rgba_at(source, q))
+                                .unwrap_or([0.0; 4])
+                        }
+                    };
+                    snapshot_write_f32(writer, rgba)?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn snapshot_native_guidance(
+    root: &Path,
+    camera_dir: &Path,
+    source: &SynthSource<'_>,
+    window: Option<JointCfaSnapshotWindow>,
+    crop: CropWindow,
+    scale: f32,
+    width: usize,
+    height: usize,
+) -> Result<JointCfaSnapshotNativeGuidance> {
+    let sensor_rgb_white =
+        snapshot_write_native_sensor_rgb_white(root, camera_dir, source, window)?;
+    let base_view_wb_rgba = snapshot_write_native_view(
+        root,
+        camera_dir,
+        "native_base_view_wb_rgba.f32le",
+        source,
+        crop,
+        scale,
+        width,
+        height,
+        false,
+    )?;
+    let reconstruction_view_wb_rgba = snapshot_write_native_view(
+        root,
+        camera_dir,
+        "native_reconstruction_view_wb_rgba.f32le",
+        source,
+        crop,
+        scale,
+        width,
+        height,
+        true,
+    )?;
+    Ok(JointCfaSnapshotNativeGuidance {
+        sensor_rgb_white,
+        sensor_layout: [
+            "camera_r",
+            "camera_g",
+            "camera_b",
+            "sensor_white_r",
+            "sensor_white_g",
+            "sensor_white_b",
+        ],
+        base_view_wb_rgba,
+        reconstruction_view_wb_rgba,
+        view_layout: ["wb_camera_r", "wb_camera_g", "wb_camera_b", "alpha"],
+        sensor_rgb_space: "linear_camera_rgb_pre_wb",
+        view_rgb_space: "linear_camera_rgb_white_balanced",
+        // Lux applies its exposure/module gain only after the tele cache and
+        // immediately before sqrt-domain ResAmp.  Chiaro's alignment gain is
+        // the closest capture-specific equivalent available at this boundary;
+        // export it as a hint instead of baking it into the tensor.
+        module_gain_hint: source.alignment.gain,
+    })
+}
+
+fn write_joint_cfa_snapshot_static(
+    snapshot: &JointCfaSnapshotOptions,
+    crop: CropWindow,
+    scale: f32,
+    width: usize,
+    height: usize,
+    sources: &[SynthSource<'_>],
+    depth_map: Option<&DenseDepthMap>,
+    color: &ColorPipeline,
+    options: &SynthOptions,
+    camera_response_bases: &[Option<CameraResponseBase>],
+) -> Result<()> {
+    std::fs::create_dir_all(&snapshot.path)?;
+    let stride = snapshot.stride.max(1);
+    let mut cameras = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        let camera_dir = PathBuf::from("cameras").join(format!(
+            "{:02}_{}",
+            index,
+            snapshot_safe_component(&source.alignment.name)
+        ));
+        let window = snapshot_sensor_window(source, crop, width, height, scale, stride);
+        let response_base = camera_response_bases.get(index).and_then(Option::as_ref);
+        let mosaic = snapshot_mosaic(&snapshot.path, &camera_dir, source, window, response_base)?;
+        let native_guidance = snapshot_native_guidance(
+            &snapshot.path,
+            &camera_dir,
+            source,
+            window,
+            crop,
+            scale,
+            width,
+            height,
+        )?;
+        let base_warp = snapshot_warp(
+            &snapshot.path,
+            &camera_dir,
+            "base_warp",
+            &source.alignment.warp,
+        )?;
+        let resolution_warp = source
+            .resolution_warp
+            .map(|value| snapshot_warp(&snapshot.path, &camera_dir, "resolution_warp", &value.warp))
+            .transpose()?;
+        cameras.push(JointCfaSnapshotCamera {
+            index,
+            name: source.alignment.name.clone(),
+            camera_id: source.camera_id,
+            reference: source.reference,
+            held_out: source.held_out,
+            fusion_enabled: source.fusion_enabled,
+            joint_cfa_eligible: !source.held_out
+                && source.fusion_enabled
+                && !source.mosaic.is_mono()
+                && source.color.calibrated,
+            mono: source.mosaic.is_mono(),
+            magnification: source.magnification,
+            confidence: source.confidence,
+            focus_distance: source.focus_distance,
+            alignment_gain: source.alignment.gain,
+            alignment_offset: source.alignment.offset,
+            alignment_initialised_from: source.alignment.report.initialised_from.to_owned(),
+            color_calibrated: source.color.calibrated,
+            wb_gains: source.color.wb_gains,
+            forward_xyz: source.color.forward,
+            response_base: response_base.copied(),
+            gain_field_columns: source.gain_field.columns,
+            gain_field_rows: source.gain_field.rows,
+            gain_field_gains: source.gain_field.gains.clone(),
+            noise_model: source.noise_model.map(snapshot_noise_model),
+            mosaic,
+            native_guidance,
+            base_warp,
+            resolution_warp,
+        });
+    }
+    let depth = depth_map
+        .map(|map| -> Result<JointCfaSnapshotDepth> {
+            let depth = snapshot_array(
+                &snapshot.path,
+                "depth/depth.f64le",
+                "<f8",
+                vec![map.rows, map.columns],
+                |writer| {
+                    snapshot_write_f64(
+                        writer,
+                        map.nodes.iter().map(|node| node.depth.unwrap_or(f64::NAN)),
+                    )
+                },
+            )?;
+            let confidence = snapshot_array(
+                &snapshot.path,
+                "depth/confidence.f32le",
+                "<f4",
+                vec![map.rows, map.columns],
+                |writer| snapshot_write_f32(writer, map.nodes.iter().map(|node| node.confidence)),
+            )?;
+            let provenance = snapshot_array(
+                &snapshot.path,
+                "depth/provenance.u8",
+                "|u1",
+                vec![map.rows, map.columns],
+                |writer| {
+                    let bytes = map
+                        .nodes
+                        .iter()
+                        .map(|node| snapshot_depth_provenance_code(node.provenance))
+                        .collect::<Vec<_>>();
+                    writer.write_all(&bytes)?;
+                    Ok(())
+                },
+            )?;
+            Ok(JointCfaSnapshotDepth {
+                columns: map.columns,
+                rows: map.rows,
+                step: map.step,
+                near_depth: map.near_depth,
+                far_depth: map.far_depth,
+                depth,
+                confidence,
+                provenance,
+            })
+        })
+        .transpose()?;
+    let manifest = JointCfaSnapshotManifest {
+        kind: "chiaro_joint_cfa_snapshot",
+        version: 3,
+        pixels_file: "pixels.ndjson",
+        canvas_width: width,
+        canvas_height: height,
+        crop: [crop.x, crop.y, crop.width, crop.height],
+        scale,
+        stride,
+        output_color: match options.color {
+            OutputColor::Linear => "linear",
+            OutputColor::Display => "display",
+        },
+        exposure: color.exposure,
+        prepared_site_layout: [
+            "valid",
+            "phase_index",
+            "value",
+            "noise_variance",
+            "highlight_confidence",
+            "response_x",
+            "response_y",
+            "response_z",
+        ],
+        warp_visibility_codes: ["unknown", "visible", "occluded", "boundary"],
+        depth_provenance_codes: ["unsupported", "global", "measured", "regularized"],
+        feather_px: options.feather_px,
+        demosaic: format!("{:?}", options.demosaic),
+        highlight_correction: options.highlight_correction,
+        joint_cfa_solve_flat: options.joint_cfa_solve_flat,
+        production_lattice: options.joint_cfa_lattice.clamp(1, 4),
+        affine_threshold: options.joint_cfa_affine_threshold.clamp(0.0, 1.0),
+        min_application_weight: options.joint_cfa_min_application_weight.clamp(0.0, 1.0),
+        owns_color_resolution: options.joint_cfa_owns_color_resolution,
+        include_mono: options.include_mono,
+        resolution_reconstruction: format!("{:?}", options.resolution_reconstruction),
+        constants: JointCfaSnapshotConstants {
+            support_radius_output_px: 1.65,
+            support_radius_search_multiplier: 1.5,
+            sensor_window_extra_margin_px: JOINT_CFA_SNAPSHOT_EXTRA_SENSOR_MARGIN,
+            prior_weight: JOINT_CFA_PRIOR_WEIGHT,
+            weak_visible_min_confidence: 0.08,
+            normal_visible_min_confidence: 0.35,
+            unknown_visibility_min_confidence: 0.05,
+            unknown_visibility_scale: 0.35,
+            minimum_camera_consistency: 0.10,
+            weak_geometry_min_consistency: 0.55,
+            solver_min_cameras: 2,
+            solver_min_observations: 3,
+        },
+        depth,
+        cameras,
+    };
+    let manifest_path = snapshot.path.join("manifest.json");
+    let mut writer = BufWriter::new(File::create(&manifest_path)?);
+    serde_json::to_writer_pretty(&mut writer, &manifest)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// The part of the reference raster that is rendered, in reference pixels.
@@ -805,12 +1839,12 @@ impl JointCfaCounters {
             .fetch_add(local.insufficient_samples, Relaxed);
         self.solver_rejected
             .fetch_add(local.solver_rejected, Relaxed);
-        self.lattice_reused
-            .fetch_add(local.lattice_reused, Relaxed);
+        self.lattice_reused.fetch_add(local.lattice_reused, Relaxed);
         self.constant_solved
             .fetch_add(local.constant_solved, Relaxed);
         self.affine_solved.fetch_add(local.affine_solved, Relaxed);
-        self.site_cache_hits.fetch_add(local.site_cache_hits, Relaxed);
+        self.site_cache_hits
+            .fetch_add(local.site_cache_hits, Relaxed);
         self.site_cache_misses
             .fetch_add(local.site_cache_misses, Relaxed);
         self.reconstructed.fetch_add(local.reconstructed, Relaxed);
@@ -836,6 +1870,8 @@ impl JointCfaCounters {
 }
 
 const JOINT_CFA_SITE_CACHE_SLOTS: usize = 1024;
+const JOINT_CFA_PRIOR_WEIGHT: f32 = 0.025;
+const JOINT_CFA_SNAPSHOT_EXTRA_SENSOR_MARGIN: usize = 4;
 
 #[derive(Clone, Copy)]
 struct JointCfaPreparedSite {
@@ -924,8 +1960,8 @@ fn prepare_joint_cfa_site(
     let offset = source.alignment.offset;
     let code_range = source.mosaic.physical_code_range;
     let value = (gain * (sample.value - offset)).max(0.0);
-    let corrected_variance = corrected_noise_variance(&sample, source.noise_model, code_range)
-        * gain.powi(2);
+    let corrected_variance =
+        corrected_noise_variance(&sample, source.noise_model, code_range) * gain.powi(2);
     let mut dependencies = [NoiseDependency::default(); 16];
     for (target, component) in dependencies
         .iter_mut()
@@ -1423,6 +2459,78 @@ pub fn synthesize(
     }
     let width = (crop.width * scale).round().max(1.0) as usize;
     let height = (crop.height * scale).round().max(1.0) as usize;
+    if options.joint_cfa_fixture.is_some() && options.joint_cfa_snapshot.is_some() {
+        bail!("use either Joint-CFA fixture or Joint-CFA snapshot export, not both");
+    }
+    if let Some(snapshot) = options.joint_cfa_snapshot.as_ref() {
+        std::fs::create_dir_all(&snapshot.path)?;
+        match std::fs::remove_file(snapshot.path.join("COMPLETE")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let snapshot_fixture =
+        options
+            .joint_cfa_snapshot
+            .as_ref()
+            .map(|snapshot| JointCfaFixtureOptions {
+                path: snapshot.path.join("pixels.ndjson"),
+                stride: snapshot.stride.max(1),
+            });
+    let fixture_export = snapshot_fixture
+        .as_ref()
+        .or(options.joint_cfa_fixture.as_ref());
+    let fixture_sink = if let Some(fixture) = fixture_export {
+        if let Some(parent) = fixture.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = File::create(&fixture.path)?;
+        let mut sink = JointCfaFixtureSink {
+            writer: BufWriter::new(file),
+            error: None,
+        };
+        let header = JointCfaFixtureHeader {
+            kind: "joint_cfa_fixture_header",
+            version: 2,
+            snapshot_manifest: options.joint_cfa_snapshot.as_ref().map(|_| "manifest.json"),
+            canvas_width: width,
+            canvas_height: height,
+            crop: [crop.x, crop.y, crop.width, crop.height],
+            scale,
+            stride: fixture.stride.max(1),
+            prior_weight: JOINT_CFA_PRIOR_WEIGHT,
+            production_lattice: options.joint_cfa_lattice.clamp(1, 4),
+            affine_threshold: options.joint_cfa_affine_threshold.clamp(0.0, 1.0),
+            min_application_weight: options.joint_cfa_min_application_weight.clamp(0.0, 1.0),
+            color: match options.color {
+                OutputColor::Linear => "linear",
+                OutputColor::Display => "display",
+            },
+            exposure: color.exposure,
+            cameras: sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| JointCfaFixtureCamera {
+                    index,
+                    name: &source.alignment.name,
+                    camera_id: source.camera_id,
+                    reference: source.reference,
+                    held_out: source.held_out,
+                    mono: source.mosaic.is_mono(),
+                    calibrated: source.color.calibrated,
+                    magnification: source.magnification,
+                })
+                .collect(),
+        };
+        serde_json::to_writer(&mut sink.writer, &header)?;
+        sink.writer.write_all(b"\n")?;
+        Some(Mutex::new(sink))
+    } else {
+        None
+    };
     let covered = std::sync::atomic::AtomicUsize::new(0);
     let edge_checked = std::sync::atomic::AtomicUsize::new(0);
     let edge_rejected = std::sync::atomic::AtomicUsize::new(0);
@@ -1443,6 +2551,20 @@ pub fn synthesize(
         .iter()
         .map(|source| camera_response_base(&source.color))
         .collect::<Vec<_>>();
+    if let Some(snapshot) = options.joint_cfa_snapshot.as_ref() {
+        write_joint_cfa_snapshot_static(
+            snapshot,
+            crop,
+            scale,
+            width,
+            height,
+            sources,
+            depth_map,
+            color,
+            options,
+            &camera_response_bases,
+        )?;
+    }
     let source_to_usable = sources
         .iter()
         .map(|source| {
@@ -1467,6 +2589,9 @@ pub fn synthesize(
             let mut local_resolution_counters = LocalResolutionCounters::default();
             let mut local_joint_cfa_counters = LocalJointCfaCounters::default();
             let mut joint_cfa_scratch = JointCfaScratch::default();
+            let mut fixture_joint_cfa_scratch = JointCfaScratch::default();
+            let mut fixture_camera_states = Vec::<JointCfaFixtureCameraState>::new();
+            let mut fixture_buffer = Vec::<u8>::new();
             let joint_cfa_lattice = options.joint_cfa_lattice.clamp(1, 4);
             let mut joint_cfa_anchors =
                 vec![None::<JointCfaAnchor>; width.div_ceil(joint_cfa_lattice)];
@@ -1493,8 +2618,7 @@ pub fn synthesize(
             // band-local log-luminance plane instead of performing four full
             // warped photometric lookups at every output pixel. Diagnostics
             // keep the historical exact path.
-            let reference_structure_band = (!has_held_out
-                && !options.joint_cfa_solve_flat)
+            let reference_structure_band = (!has_held_out && !options.joint_cfa_solve_flat)
                 .then(|| {
                     reference_band_source.map(|source| {
                         ReferenceLogLuminanceBand::build(
@@ -1583,12 +2707,14 @@ pub fn synthesize(
                         let source_index = *source_index;
                         let prepared_source =
                             source.reference.then_some(reference_prepared).flatten();
-                        let warp_sample = prepared_source.map(|sample| sample.warp_sample).unwrap_or_else(|| {
-                            base_warp_scanlines[source_index]
-                                .as_mut()
-                                .map(|sampler| sampler.next())
-                                .unwrap_or_else(|| source_base_warp_sample(source, rx, ry))
-                        });
+                        let warp_sample = prepared_source
+                            .map(|sample| sample.warp_sample)
+                            .unwrap_or_else(|| {
+                                base_warp_scanlines[source_index]
+                                    .as_mut()
+                                    .map(|sampler| sampler.next())
+                                    .unwrap_or_else(|| source_base_warp_sample(source, rx, ry))
+                            });
                         let high_frequency_geometry = high_frequency_geometry_weight(
                             depth_map.is_some(),
                             scene_depth_node,
@@ -2052,9 +3178,8 @@ pub fn synthesize(
                         // gate and a tiny visually-negligible blend threshold.
                         // Validation and explicit diagnostic mode still run the
                         // historical full per-pixel affine solve.
-                        let min_application_weight = options
-                            .joint_cfa_min_application_weight
-                            .clamp(0.0, 1.0);
+                        let min_application_weight =
+                            options.joint_cfa_min_application_weight.clamp(0.0, 1.0);
                         let wants_joint_estimate = structure_gate.is_some_and(|gate| {
                             gate.application_weight >= min_application_weight
                                 || validation_sample
@@ -2069,8 +3194,7 @@ pub fn synthesize(
                             || structure_gate.is_some_and(|gate| {
                                 gate.application_weight
                                     >= options.joint_cfa_affine_threshold.clamp(0.0, 1.0)
-                            })
-                        {
+                            }) {
                             JointCfaSolveMode::Affine
                         } else {
                             JointCfaSolveMode::Constant
@@ -2104,10 +3228,7 @@ pub fn synthesize(
                             local_joint_cfa_counters.lattice_reused += 1;
                             let gate = structure_gate.expect("lattice reuse has a structure gate");
                             Some(anchor.estimate.reapplied_luminance_at(
-                                [
-                                    (u - anchor.u) as f32,
-                                    (v - anchor.v) as f32,
-                                ],
+                                [(u - anchor.u) as f32, (v - anchor.v) as f32],
                                 baseline_xyz,
                                 gate.application_weight,
                                 baseline_only_luminance,
@@ -2134,6 +3255,7 @@ pub fn synthesize(
                                 requested_mode,
                                 options,
                                 &mut joint_cfa_scratch,
+                                None,
                             );
                             local_joint_cfa_counters.weak_geometry_rescued_cameras +=
                                 joint_cfa_scratch.weak_geometry_rescued_cameras;
@@ -2151,11 +3273,8 @@ pub fn synthesize(
                                         && !options.joint_cfa_solve_flat
                                         && joint_cfa_lattice > 1
                                     {
-                                        joint_cfa_anchors[block_index] = Some(JointCfaAnchor {
-                                            u,
-                                            v,
-                                            estimate,
-                                        });
+                                        joint_cfa_anchors[block_index] =
+                                            Some(JointCfaAnchor { u, v, estimate });
                                     }
                                     Some(estimate)
                                 }
@@ -2181,7 +3300,8 @@ pub fn synthesize(
                             // but perform no new observations/IRLS work. Keep
                             // solver-work means tied to actual solves.
                             if !reused_estimate {
-                                local_joint_cfa_counters.observations += estimate.report.observations;
+                                local_joint_cfa_counters.observations +=
+                                    estimate.report.observations;
                                 local_joint_cfa_counters.cameras += estimate.report.cameras;
                                 local_joint_cfa_counters.phase_spread_micro +=
                                     (estimate.report.phase_spread.min(16.0) * 1_000_000.0) as usize;
@@ -2189,18 +3309,12 @@ pub fn synthesize(
                                 local_joint_cfa_counters.residual_micro +=
                                     (estimate.report.weighted_residual.min(64.0) * 1_000_000.0)
                                         as usize;
-                                local_joint_cfa_counters.in_sample_baseline_micro += (estimate
-                                    .report
-                                    .in_sample_baseline_loss
-                                    .min(1_000.0)
-                                    * 1_000_000.0)
-                                    as usize;
-                                local_joint_cfa_counters.in_sample_affine_micro += (estimate
-                                    .report
-                                    .in_sample_affine_loss
-                                    .min(1_000.0)
-                                    * 1_000_000.0)
-                                    as usize;
+                                local_joint_cfa_counters.in_sample_baseline_micro +=
+                                    (estimate.report.in_sample_baseline_loss.min(1_000.0)
+                                        * 1_000_000.0) as usize;
+                                local_joint_cfa_counters.in_sample_affine_micro +=
+                                    (estimate.report.in_sample_affine_loss.min(1_000.0)
+                                        * 1_000_000.0) as usize;
                             }
                             local_joint_cfa_counters.application_weight_micro +=
                                 (estimate.application_weight * 1_000_000.0) as usize;
@@ -2216,6 +3330,128 @@ pub fn synthesize(
                                 blended = estimate.xyz;
                             }
                         }
+                        if let Some(fixture) = fixture_export {
+                            let stride = fixture.stride.max(1);
+                            if u % stride == 0 && v % stride == 0 {
+                                let gate = structure_gate.unwrap_or(JointCfaStructureGate {
+                                    magnitude: 0.0,
+                                    application_weight: 0.0,
+                                });
+                                if joint_candidate {
+                                    let fixture_result = joint_cfa_at(
+                                        sources,
+                                        &camera_response_bases,
+                                        &source_to_usable,
+                                        &reconstruction_geometries,
+                                        rx,
+                                        ry,
+                                        scale,
+                                        baseline_xyz,
+                                        reference_structure,
+                                        reference_luminance,
+                                        scene_depth,
+                                        baseline_only_luminance,
+                                        gate.application_weight,
+                                        validation_sample,
+                                        requested_mode,
+                                        options,
+                                        &mut fixture_joint_cfa_scratch,
+                                        if options.joint_cfa_snapshot.is_some() {
+                                            Some(&mut fixture_camera_states)
+                                        } else {
+                                            None
+                                        },
+                                    );
+                                    let (
+                                        status,
+                                        expected_xyz,
+                                        application_weight,
+                                        chroma_weight,
+                                        report,
+                                    ) = match fixture_result {
+                                        Ok(estimate) => (
+                                            "solved",
+                                            estimate.xyz,
+                                            estimate.application_weight,
+                                            estimate.chroma_application_weight,
+                                            Some(estimate.report),
+                                        ),
+                                        Err(JointCfaFailure::InsufficientGeometry) => {
+                                            ("insufficient_geometry", baseline_xyz, 0.0, 0.0, None)
+                                        }
+                                        Err(JointCfaFailure::InsufficientSamples) => {
+                                            ("insufficient_samples", baseline_xyz, 0.0, 0.0, None)
+                                        }
+                                        Err(JointCfaFailure::SolverRejected) => {
+                                            ("solver_rejected", baseline_xyz, 0.0, 0.0, None)
+                                        }
+                                    };
+                                    let record = JointCfaFixturePixel {
+                                        kind: "joint_cfa_pixel",
+                                        u,
+                                        v,
+                                        reference_xy: [rx, ry],
+                                        prior_xyz: baseline_xyz,
+                                        reference_luminance,
+                                        reference_structure,
+                                        scene_depth: scene_depth.map(|(depth, confidence)| {
+                                            JointCfaFixtureSceneDepth { depth, confidence }
+                                        }),
+                                        preserve_baseline_luminance: baseline_only_luminance,
+                                        structure_magnitude: gate.magnitude,
+                                        structure_weight: gate.application_weight,
+                                        requested_mode,
+                                        status,
+                                        production_would_solve: wants_joint_estimate,
+                                        production_reused_lattice: reused_estimate,
+                                        production_xyz: blended,
+                                        reference_solve_xyz: expected_xyz,
+                                        reference_application_weight: application_weight,
+                                        reference_chroma_application_weight: chroma_weight,
+                                        report,
+                                        camera_states: options
+                                            .joint_cfa_snapshot
+                                            .as_ref()
+                                            .map(|_| fixture_camera_states.clone()),
+                                        observations: &fixture_joint_cfa_scratch.observations,
+                                    };
+                                    serde_json::to_writer(&mut fixture_buffer, &record)
+                                        .expect("serialize Joint-CFA fixture pixel");
+                                    fixture_buffer.push(b'\n');
+                                } else {
+                                    let record = JointCfaFixturePixel {
+                                        kind: "joint_cfa_pixel",
+                                        u,
+                                        v,
+                                        reference_xy: [rx, ry],
+                                        prior_xyz: baseline_xyz,
+                                        reference_luminance,
+                                        reference_structure,
+                                        scene_depth: scene_depth.map(|(depth, confidence)| {
+                                            JointCfaFixtureSceneDepth { depth, confidence }
+                                        }),
+                                        preserve_baseline_luminance: baseline_only_luminance,
+                                        structure_magnitude: gate.magnitude,
+                                        structure_weight: gate.application_weight,
+                                        requested_mode,
+                                        status: "not_candidate",
+                                        production_would_solve: false,
+                                        production_reused_lattice: false,
+                                        production_xyz: blended,
+                                        reference_solve_xyz: baseline_xyz,
+                                        reference_application_weight: 0.0,
+                                        reference_chroma_application_weight: 0.0,
+                                        report: None,
+                                        camera_states: None,
+                                        observations: &[],
+                                    };
+                                    serde_json::to_writer(&mut fixture_buffer, &record)
+                                        .expect("serialize Joint-CFA fixture pixel");
+                                    fixture_buffer.push(b'\n');
+                                }
+                            }
+                        }
+
                         if validation_sample {
                             evaluate_held_out_cfa(
                                 sources,
@@ -2242,6 +3478,16 @@ pub fn synthesize(
                     }
                 }
             }
+            if !fixture_buffer.is_empty()
+                && let Some(sink) = fixture_sink.as_ref()
+            {
+                let mut sink = sink.lock().expect("Joint-CFA fixture sink poisoned");
+                if sink.error.is_none() {
+                    if let Err(error) = sink.writer.write_all(&fixture_buffer) {
+                        sink.error = Some(error.to_string());
+                    }
+                }
+            }
             for (global, local) in source_counters.iter().zip(&local_source_counters) {
                 global.merge(local);
             }
@@ -2256,6 +3502,23 @@ pub fn synthesize(
             edge_rejected.fetch_add(band_edge_rejected, std::sync::atomic::Ordering::Relaxed);
         },
     )?;
+    if let Some(sink) = fixture_sink.as_ref() {
+        let mut sink = sink.lock().expect("Joint-CFA fixture sink poisoned");
+        if sink.error.is_none() {
+            if let Err(error) = sink.writer.flush() {
+                sink.error = Some(error.to_string());
+            }
+        }
+        if let Some(error) = sink.error.as_ref() {
+            bail!("write Joint-CFA fixture: {error}");
+        }
+    }
+    if let Some(snapshot) = options.joint_cfa_snapshot.as_ref() {
+        std::fs::write(
+            snapshot.path.join("COMPLETE"),
+            b"chiaro-joint-cfa-snapshot-v3\n",
+        )?;
+    }
 
     let mut modules = usable
         .iter()
@@ -2410,9 +3673,7 @@ pub fn synthesize(
             JointCfaReconstructionReport {
                 lattice_size: options.joint_cfa_lattice.clamp(1, 4),
                 affine_threshold: options.joint_cfa_affine_threshold.clamp(0.0, 1.0),
-                min_application_weight: options
-                    .joint_cfa_min_application_weight
-                    .clamp(0.0, 1.0),
+                min_application_weight: options.joint_cfa_min_application_weight.clamp(0.0, 1.0),
                 owns_color_resolution: options.joint_cfa_owns_color_resolution,
                 luminance_only_output: true,
                 attempted_pixels: attempted,
@@ -2448,16 +3709,14 @@ pub fn synthesize(
                     site_cache_hits,
                     site_cache_hits + site_cache_misses,
                 ),
-                solver_avoided_fraction: fraction(
-                    structure_skipped + lattice_reused,
-                    attempted,
-                ),
+                solver_avoided_fraction: fraction(structure_skipped + lattice_reused, attempted),
                 weak_geometry_rescued_cameras: joint_cfa_counters
                     .weak_geometry_rescued_cameras
                     .load(std::sync::atomic::Ordering::Relaxed),
                 weak_geometry_rescued_per_solve: joint_cfa_counters
                     .weak_geometry_rescued_cameras
-                    .load(std::sync::atomic::Ordering::Relaxed) as f32
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as f32
                     / solver_attempted.max(1) as f32,
                 reconstructed_pixels: reconstructed,
                 reconstructed_fraction: fraction(reconstructed, attempted),
@@ -2879,11 +4138,14 @@ fn joint_cfa_at(
     solver_mode: JointCfaSolveMode,
     options: &SynthOptions,
     scratch: &mut JointCfaScratch,
+    mut camera_states: Option<&mut Vec<JointCfaFixtureCameraState>>,
 ) -> Result<JointCfaEstimate, JointCfaFailure> {
     const SUPPORT_RADIUS: f32 = 1.65;
-    const PRIOR_WEIGHT: f32 = 0.025;
     scratch.observations.clear();
     scratch.weak_geometry_rescued_cameras = 0;
+    if let Some(states) = camera_states.as_mut() {
+        (**states).clear();
+    }
     if scratch.observations.capacity() < sources.len() * 12 {
         scratch
             .observations
@@ -2892,12 +4154,27 @@ fn joint_cfa_at(
     let mut geometry_camera_mask = 0_u32;
     let mut sample_camera_mask = 0_u32;
     for (camera_index, source) in sources.iter().enumerate() {
-        if source.held_out
-            || !source.fusion_enabled
-            || source.mosaic.is_mono()
-            || !source.color.calibrated
-        {
-            continue;
+        let mut camera_state = JointCfaFixtureCameraState::new(camera_index);
+        macro_rules! reject_camera {
+            ($status:expr) => {{
+                camera_state.status = $status;
+                if let Some(states) = camera_states.as_mut() {
+                    (**states).push(camera_state.clone());
+                }
+                continue;
+            }};
+        }
+        if source.held_out {
+            reject_camera!("held_out");
+        }
+        if !source.fusion_enabled {
+            reject_camera!("fusion_disabled");
+        }
+        if source.mosaic.is_mono() {
+            reject_camera!("mono");
+        }
+        if !source.color.calibrated {
+            reject_camera!("uncalibrated");
         }
         let geometry = source_to_usable
             .get(camera_index)
@@ -2905,7 +4182,7 @@ fn joint_cfa_at(
             .and_then(|index| reconstruction_geometries.get(index).copied().flatten())
             .or_else(|| reconstruction_geometry_at(source, rx, ry));
         let Some(geometry) = geometry else {
-            continue;
+            reject_camera!("no_geometry");
         };
         let warp = geometry.warp;
         let centre_visibility = if source.reference {
@@ -2913,6 +4190,15 @@ fn joint_cfa_at(
         } else {
             geometry.visibility
         };
+        camera_state.mapped_sensor_xy = Some(geometry.q);
+        camera_state.inverse_warp_jacobian = Some([
+            geometry.inverse.xx,
+            geometry.inverse.xy,
+            geometry.inverse.yx,
+            geometry.inverse.yy,
+        ]);
+        camera_state.local_geometry_confidence = geometry.local_confidence;
+        camera_state.centre_visibility = snapshot_visibility_name(centre_visibility);
         let mut geometry_confidence = geometry.local_confidence * source.confidence;
         // Do not discard a physically visible coordinate merely because its
         // dense-depth confidence is below the historical 0.35 threshold. A
@@ -2924,7 +4210,8 @@ fn joint_cfa_at(
         let weak_visible_geometry = match centre_visibility {
             WarpVisibility::Visible => {
                 if geometry_confidence < 0.08 {
-                    continue;
+                    camera_state.effective_geometry_confidence = geometry_confidence;
+                    reject_camera!("geometry_confidence_low");
                 }
                 geometry_confidence < 0.35
             }
@@ -2933,18 +4220,24 @@ fn joint_cfa_at(
                 // independently verified is still useful evidence, but never
                 // with the authority of an explicitly visible observation.
                 if geometry_confidence < 0.05 {
-                    continue;
+                    camera_state.effective_geometry_confidence = geometry_confidence;
+                    reject_camera!("unknown_geometry_confidence_low");
                 }
                 geometry_confidence *= 0.35;
                 false
             }
-            WarpVisibility::Occluded | WarpVisibility::Boundary => continue,
+            WarpVisibility::Occluded | WarpVisibility::Boundary => {
+                reject_camera!("centre_visibility_blocked");
+            }
         };
+        camera_state.effective_geometry_confidence = geometry_confidence;
+        camera_state.weak_visible_geometry = weak_visible_geometry;
         let q = geometry.q;
         let inverse = geometry.inverse;
         let radius = inverse.source_radius(SUPPORT_RADIUS * 1.5, scale);
+        camera_state.sensor_radius = radius;
         if radius == 0 {
-            continue;
+            reject_camera!("zero_sensor_radius");
         }
         let centre_x = q[0].round() as isize;
         let centre_y = q[1].round() as isize;
@@ -2955,17 +4248,19 @@ fn joint_cfa_at(
             source.magnification,
             source.reference,
         );
+        camera_state.focus_weight = focus_weight;
         // Evaluate colour/detail agreement once per camera at the requested
         // output location. This both amortises the expensive demosaic/colour
         // path and makes the gate spatially coherent: an individual raw CFA
         // site can no longer validate its own chroma excursion.
-        let Some(camera_photometric) =
-            source_photometric_at_mapped(source, q[0], q[1], options)
+        let Some(camera_photometric) = source_photometric_at_mapped(source, q[0], q[1], options)
         else {
-            continue;
+            reject_camera!("no_photometric_sample");
         };
         let camera_luminance = Some(camera_photometric.0);
         let camera_color = camera_photometric.1;
+        camera_state.camera_luminance = camera_luminance;
+        camera_state.camera_xyz = camera_color;
         let camera_edge_weight = edge_consistency_weight(
             reference_luminance,
             camera_luminance.unwrap_or_default(),
@@ -2986,21 +4281,19 @@ fn joint_cfa_at(
             // falsely reject exactly the cameras rescued by local residual
             // registration.
             let sample_structure = camera_luminance.and_then(|centre| {
-                source_log_luminance_structure_from_geometry(
-                    source,
-                    geometry,
-                    centre,
-                    options,
-                )
+                source_log_luminance_structure_from_geometry(source, geometry, centre, options)
             });
             detail_consistency_weight(reference_structure, sample_structure, false)
         } else {
             1.0
         };
-        let camera_consistency =
-            camera_edge_weight * camera_chroma_weight * camera_detail_weight;
+        camera_state.edge_weight = camera_edge_weight;
+        camera_state.chroma_weight = camera_chroma_weight;
+        camera_state.detail_weight = camera_detail_weight;
+        let camera_consistency = camera_edge_weight * camera_chroma_weight * camera_detail_weight;
+        camera_state.camera_consistency = camera_consistency;
         if !camera_consistency.is_finite() || camera_consistency < 0.10 {
-            continue;
+            reject_camera!("camera_consistency_low");
         }
         if weak_visible_geometry {
             // A weak physical coordinate earns admission only when colour,
@@ -3009,7 +4302,7 @@ fn joint_cfa_at(
             // confidence, so this can add coverage without allowing a rescued
             // camera to dominate a well-constrained solve.
             if camera_consistency < 0.55 {
-                continue;
+                reject_camera!("weak_geometry_consistency_low");
             }
             scratch.weak_geometry_rescued_cameras += 1;
         }
@@ -3018,11 +4311,12 @@ fn joint_cfa_at(
             .get(camera_index)
             .and_then(Option::as_ref)
         else {
-            continue;
+            reject_camera!("no_response_base");
         };
         if camera_index < u32::BITS as usize {
             geometry_camera_mask |= 1_u32 << camera_index;
         }
+        let observation_start = scratch.observations.len();
         for sy in centre_y - radius as isize..=centre_y + radius as isize {
             if sy < 0 || sy >= source.mosaic.height as isize {
                 continue;
@@ -3124,6 +4418,15 @@ fn joint_cfa_at(
                 }
             }
         }
+        camera_state.accepted_observations = scratch.observations.len() - observation_start;
+        camera_state.status = if camera_state.accepted_observations > 0 {
+            "admitted"
+        } else {
+            "no_accepted_sites"
+        };
+        if let Some(states) = camera_states.as_mut() {
+            (**states).push(camera_state);
+        }
     }
     if geometry_camera_mask.count_ones() < 2 {
         return Err(JointCfaFailure::InsufficientGeometry);
@@ -3135,7 +4438,7 @@ fn joint_cfa_at(
     let mut estimate = solve_joint_xyz_mode_with_scratch(
         &scratch.observations,
         prior_xyz,
-        PRIOR_WEIGHT,
+        JOINT_CFA_PRIOR_WEIGHT,
         solver_mode,
         &mut scratch.solver,
     )
@@ -3389,13 +4692,18 @@ fn evaluate_held_out_cfa(
             (target_reference[0] - rx) * scale,
             (target_reference[1] - ry) * scale,
         ];
-        let (joint_xyz, solver_supported) = joint_estimate
-            .map_or((target_baseline, false), |joint| {
+        let (joint_xyz, solver_supported) =
+            joint_estimate.map_or((target_baseline, false), |joint| {
                 // Held-out validation scores the raw solved field, not the
                 // production luminance-only application. This keeps solver
                 // diagnostics sensitive to colour fit without contaminating
                 // rendered pixels with high-frequency chroma.
-                (joint.fitted_xyz_at(output_offset).map(|value| value.max(0.0)), true)
+                (
+                    joint
+                        .fitted_xyz_at(output_offset)
+                        .map(|value| value.max(0.0)),
+                    true,
+                )
             });
         let baseline_prediction = dot3(response, target_baseline);
         let joint_cfa_prediction = dot3(response, joint_xyz);
@@ -3821,11 +5129,10 @@ fn source_photometric_at_sensor(
     } else {
         let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
         let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
-        let mut xyz = source.color.xyz_for_output(
-            matched_rgb,
-            matched_white,
-            options.highlight_correction,
-        );
+        let mut xyz =
+            source
+                .color
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
         for channel in 0..3 {
             xyz[channel] *= field[channel];
         }
@@ -3854,11 +5161,10 @@ fn source_photometric_at_mapped(
     } else {
         let matched_rgb = rgb.map(|value| (gain * (value - offset)).max(0.0));
         let matched_white = sensor_white.map(|value| (gain * (value - offset)).max(0.0));
-        let mut xyz = source.color.xyz_for_output(
-            matched_rgb,
-            matched_white,
-            options.highlight_correction,
-        );
+        let mut xyz =
+            source
+                .color
+                .xyz_for_output(matched_rgb, matched_white, options.highlight_correction);
         for channel in 0..3 {
             xyz[channel] *= field[channel];
         }
@@ -3982,8 +5288,7 @@ impl ReferenceLogLuminanceBand {
             for u in 0..width {
                 let rx = crop.x + (u as f32 + 0.5) / scale - 0.5;
                 if let Some(luminance) = source_luminance(source, rx, ry, options) {
-                    values[local_v * width + u] =
-                        (1.0 + 64.0 * luminance.max(0.0)).ln();
+                    values[local_v * width + u] = (1.0 + 64.0 * luminance.max(0.0)).ln();
                 }
             }
         }
@@ -4021,13 +5326,7 @@ impl ReferenceLogLuminanceBand {
     }
 
     #[inline]
-    fn structure(
-        &self,
-        u: usize,
-        v: usize,
-        centre_luminance: f32,
-        scale: f32,
-    ) -> Option<[f32; 3]> {
+    fn structure(&self, u: usize, v: usize, centre_luminance: f32, scale: f32) -> Option<[f32; 3]> {
         const RADIUS: f32 = 1.5;
         let delta = RADIUS * scale;
         let x = u as f32;

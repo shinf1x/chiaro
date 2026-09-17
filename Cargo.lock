@@ -563,6 +563,7 @@ dependencies = [
  "chiaro",
  "chiaro-hotpixel-core",
  "chiaro-proto",
+ "image",
  "serde",
  "serde_json",
  "tempfile",
